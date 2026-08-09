@@ -1,4 +1,4 @@
-<!-- doc-id: contributing; lang: ru; translation-of: CONTRIBUTING.md; revision: 2 -->
+<!-- doc-id: contributing; lang: ru; translation-of: CONTRIBUTING.md; revision: 3 -->
 
 # Участие в разработке Nodavo
 
@@ -38,6 +38,8 @@ Signed-off-by: Your Name <your.email@example.com>
 ```
 
 Используйте `git commit -s`. Sign-off подтверждает право передать вклад под лицензией репозитория. Прочитайте полный текст [Developer Certificate of Origin 1.1](DCO); CI проверяет каждый коммит pull request и отклоняет подпись, не совпадающую с данными автора коммита.
+
+Доверенные боты обновления зависимостей освобождены от DCO: они не могут подтверждать авторские права, а их автоматически созданные изменения можно независимо проверить. Это исключение не распространяется на коммиты людей в любых других pull request.
 
 ## Требования к ревью
 

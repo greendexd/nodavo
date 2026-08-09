@@ -1,4 +1,4 @@
-<!-- doc-id: contributing; lang: en; revision: 2 -->
+<!-- doc-id: contributing; lang: en; revision: 3 -->
 
 # Contributing to Nodavo
 
@@ -38,6 +38,8 @@ Signed-off-by: Your Name <your.email@example.com>
 ```
 
 Use `git commit -s`. The sign-off certifies that you have the right to submit the contribution under the repository license. Read the complete [Developer Certificate of Origin 1.1](DCO); CI checks every pull request commit and rejects sign-offs that do not match the commit author identity.
+
+Trusted dependency-update bots are exempt because they cannot assert contributor rights and their changes are independently generated and reviewable. Human-authored commits in any other pull request are not exempt.
 
 ## Review expectations
 
