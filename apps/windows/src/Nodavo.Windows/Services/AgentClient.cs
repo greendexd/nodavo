@@ -312,7 +312,7 @@ internal sealed class AgentClient
 }
 
 internal sealed class AgentProtocolException(string code)
-    : InvalidDataException("The Nodavo agent rejected the request.")
+    : Exception("The Nodavo agent rejected the request.")
 {
     internal string Code { get; } = code;
 }
