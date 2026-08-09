@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 4 -->
+<!-- doc-id: security-model; lang: en; revision: 5 -->
 
 # Security model
 
@@ -78,6 +78,8 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Names are normalized and rejected for traversal, reserved-device paths, dangerous ambiguity, and invalid encoding.
 - Symlinks, junctions, reparse points, sparse files, and special files are rejected in 1.0 unless separately specified and tested.
 - Data is written to private staging, checked with BLAKE3, then atomically finalized.
+- The receive executor admits one queue-selected transfer to a staging owner at a time. It accepts only nonempty bounded chunks at the exact next offset, advances public filename-free progress only after the staging write is acknowledged, and refuses completion until every declared file byte is present.
+- Explicit cancellation discards only the matching active transfer. A wrong identifier, parallel manifest, offset gap/overlap, incomplete completion, or staging failure is rejected without advancing receive state.
 - Existing files are never overwritten silently.
 - Received files are not executed or automatically opened.
 - Per-peer quotas, cancellation, backpressure, and rate limits limit denial of service.

@@ -14,12 +14,14 @@ use uuid::Uuid;
 
 mod fs_staging;
 mod queue;
+mod receiver;
 
 pub use fs_staging::FileSystemStagingArea;
 pub use queue::{
     MAX_ACTIVE_TRANSFERS, MAX_QUEUED_TRANSFERS, QueueEffect, QueuedTransfer, TransferQueue,
     TransferQueueState,
 };
+pub use receiver::{ActiveReceiveSnapshot, TransferReceiver};
 
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_MANIFEST_ENTRIES: usize = 10_000;
@@ -45,6 +47,18 @@ impl TransferId {
     #[must_use]
     pub const fn from_uuid(value: Uuid) -> Self {
         Self(value)
+    }
+
+    /// Restores an identifier from its authenticated 16-byte wire form.
+    #[must_use]
+    pub const fn from_bytes(value: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(value))
+    }
+
+    /// Returns the stable 16-byte wire form without formatting it for logs.
+    #[must_use]
+    pub const fn as_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
     }
 }
 
@@ -318,6 +332,8 @@ pub enum TransferError {
     InvalidChunk,
     #[error("file chunks must be written once in ascending contiguous order")]
     NonSequentialChunk,
+    #[error("the transfer cannot complete before every declared file byte is present")]
+    IncompleteTransfer,
     #[error("the requested transfer is not active in this staging area")]
     TransferNotActive,
     #[error("destination already exists")]

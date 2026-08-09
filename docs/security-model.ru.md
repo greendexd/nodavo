@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 4 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 5 -->
 
 # Модель безопасности
 
@@ -78,6 +78,8 @@ Private keys по возможности non-exportable и хранятся че
 - Имена нормализуются и отклоняются при traversal, reserved-device paths, dangerous ambiguity и invalid encoding.
 - Symlinks, junctions, reparse points, sparse/special files отклоняются в 1.0 без отдельной спецификации и тестов.
 - Данные пишутся в private staging, проверяются BLAKE3 и атомарно finalizes.
+- Receive executor допускает к одному staging owner только одну выбранную очередью передачу. Он принимает лишь непустые ограниченные chunks строго со следующего ожидаемого offset, продвигает публичный прогресс без имён файлов только после подтверждённой staging write и запрещает completion, пока не получен каждый объявленный байт файлов.
+- Явная cancellation удаляет только совпадающую active transfer. Неверный identifier, параллельный manifest, gap/overlap offset, преждевременный completion или staging failure отклоняются без продвижения receive state.
 - Существующие файлы не перезаписываются молча.
 - Полученные файлы не запускаются и не открываются автоматически.
 - Per-peer quotas, cancellation, backpressure и rate limits ограничивают DoS.
