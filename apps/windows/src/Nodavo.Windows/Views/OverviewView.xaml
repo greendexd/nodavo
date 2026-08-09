@@ -1,0 +1,50 @@
+<UserControl
+    x:Class="Nodavo.Windows.Views.OverviewView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer>
+        <StackPanel MaxWidth="760" Padding="32" Spacing="20" HorizontalAlignment="Stretch">
+            <StackPanel Spacing="4">
+                <TextBlock x:Uid="OverviewTitle" Style="{StaticResource TitleTextBlockStyle}" />
+                <TextBlock x:Uid="OverviewSubtitle" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+            </StackPanel>
+
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="16">
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <FontIcon FontSize="28" Glyph="{Binding StatusGlyph}" />
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock x:Uid="ConnectionHeading" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding StatusText}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </StackPanel>
+                    <Grid ColumnSpacing="24" RowSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock x:Uid="PeerLabel" FontWeight="SemiBold" />
+                        <TextBlock Grid.Column="1" Text="{Binding PeerText}" TextWrapping="Wrap" />
+                        <TextBlock x:Uid="InputOwnerLabel" Grid.Row="1" FontWeight="SemiBold" />
+                        <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding InputOwnerText}" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <Button x:Uid="RefreshButton" Click="RefreshButton_Click" />
+                <Button x:Uid="EmergencyStopButton" Click="EmergencyStopButton_Click" />
+            </StackPanel>
+
+            <InfoBar
+                x:Uid="PreAlphaNotice"
+                IsClosable="False"
+                IsOpen="True"
+                Severity="Informational" />
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

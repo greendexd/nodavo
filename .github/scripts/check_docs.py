@@ -26,6 +26,21 @@ PAIRS = (
     ("docs/clean-room-policy.md", "docs/clean-room-policy.ru.md"),
     ("docs/privacy.md", "docs/privacy.ru.md"),
     ("docs/glossary.md", "docs/glossary.ru.md"),
+    ("spikes/macos-input/README.md", "spikes/macos-input/README.ru.md"),
+    ("spikes/macos-clipboard/README.md", "spikes/macos-clipboard/README.ru.md"),
+    ("apps/macos/README.md", "apps/macos/README.ru.md"),
+    ("apps/windows/README.md", "apps/windows/README.ru.md"),
+    ("docs/building.md", "docs/building.ru.md"),
+    ("docs/protocol.md", "docs/protocol.ru.md"),
+    (
+        "docs/adr/0003-first-contact-pairing-bootstrap.md",
+        "docs/adr/0003-first-contact-pairing-bootstrap.ru.md",
+    ),
+    ("spikes/windows-input/README.md", "spikes/windows-input/README.ru.md"),
+    (
+        "spikes/windows-clipboard/README.md",
+        "spikes/windows-clipboard/README.ru.md",
+    ),
 )
 
 META_RE = re.compile(

@@ -1,0 +1,40 @@
+[package]
+name = "nodavo-platform-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Windows input, display, session, and clipboard boundary for Nodavo"
+publish = false
+
+[dependencies]
+nodavo-input = { path = "../nodavo-input" }
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tokio.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

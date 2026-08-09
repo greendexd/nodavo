@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="ProductName" xml:space="preserve"><value>Nodavo</value></data>
+  <data name="AppDescription" xml:space="preserve"><value>Local-first software KVM for macOS and Windows</value></data>
+  <data name="NavigationOverview.Content" xml:space="preserve"><value>Overview</value></data>
+  <data name="NavigationDevices.Content" xml:space="preserve"><value>Devices</value></data>
+  <data name="NavigationLayout.Content" xml:space="preserve"><value>Layout</value></data>
+  <data name="NavigationTransfers.Content" xml:space="preserve"><value>Transfers</value></data>
+  <data name="NavigationSettings.Content" xml:space="preserve"><value>Settings</value></data>
+  <data name="OverviewTitle.Text" xml:space="preserve"><value>Local workspace</value></data>
+  <data name="OverviewSubtitle.Text" xml:space="preserve"><value>Current status of the per-user Nodavo agent on this PC.</value></data>
+  <data name="ConnectionHeading.Text" xml:space="preserve"><value>Connection</value></data>
+  <data name="PeerLabel.Text" xml:space="preserve"><value>Peer</value></data>
+  <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Input owner</value></data>
+  <data name="RefreshButton.Content" xml:space="preserve"><value>Refresh status</value></data>
+  <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Emergency stop</value></data>
+  <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha shell</value></data>
+  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Pairing and reconnect are pre-alpha. Input, clipboard, and files are not available yet.</value></data>
+  <data name="DevicesTitle.Text" xml:space="preserve"><value>Devices</value></data>
+  <data name="DevicesSubtitle.Text" xml:space="preserve"><value>Pair directly on your local network and confirm the same six-digit code on both computers.</value></data>
+  <data name="PairingListen.Content" xml:space="preserve"><value>Wait for another device</value></data>
+  <data name="PairingEndpoint.Header" xml:space="preserve"><value>Other computer</value></data>
+  <data name="PairingEndpoint.PlaceholderText" xml:space="preserve"><value>192.168.1.20:44310 or mdns:Nodavo-Mac</value></data>
+  <data name="PairingConnect.Content" xml:space="preserve"><value>Connect</value></data>
+  <data name="PairingPermissionsHeading.Text" xml:space="preserve"><value>Permissions granted to the other device</value></data>
+  <data name="PairingAllowInput.Content" xml:space="preserve"><value>Control this PC with its mouse and keyboard</value></data>
+  <data name="PairingAllowClipboardRead.Content" xml:space="preserve"><value>Read clipboard content from this PC</value></data>
+  <data name="PairingAllowClipboardWrite.Content" xml:space="preserve"><value>Write clipboard content to this PC</value></data>
+  <data name="PairingAllowFiles.Content" xml:space="preserve"><value>Send files to this PC</value></data>
+  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>All permissions start off. Your selection is bound to the confirmed code and signed trust. Changing it currently requires pairing again.</value></data>
+  <data name="PairingPeerLabel.Text" xml:space="preserve"><value>Device</value></data>
+  <data name="PairingCodeLabel.Text" xml:space="preserve"><value>Does this code match on both computers?</value></data>
+  <data name="PairingConfirm.Content" xml:space="preserve"><value>Codes match</value></data>
+  <data name="PairingCancel.Content" xml:space="preserve"><value>Cancel</value></data>
+  <data name="PairingPreAlpha.Title" xml:space="preserve"><value>Pre-alpha pairing</value></data>
+  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Pairing-time permissions and pinned trust are implemented. Post-pair changes, trusted-device list, input, clipboard, and files are not available yet.</value></data>
+  <data name="PairingIdleTitle" xml:space="preserve"><value>Ready to pair</value></data>
+  <data name="PairingIdleMessage" xml:space="preserve"><value>Choose listening mode on one computer and connect from the other.</value></data>
+  <data name="PairingCancelled" xml:space="preserve"><value>Pairing was cancelled. Local input remains on this PC.</value></data>
+  <data name="PairingWaitingTitle" xml:space="preserve"><value>Finding the other computer</value></data>
+  <data name="PairingWaitingMessage" xml:space="preserve"><value>Keep Nodavo open on both computers. No trust is created until both codes are confirmed.</value></data>
+  <data name="PairingWaitingProgress" xml:space="preserve"><value>Waiting for a protected pairing link…</value></data>
+  <data name="PairingCompareTitle" xml:space="preserve"><value>Compare the code</value></data>
+  <data name="PairingCompareMessage" xml:space="preserve"><value>Confirm only when the device name and all six digits match on both computers.</value></data>
+  <data name="PairingConfirmingTitle" xml:space="preserve"><value>Waiting for confirmation</value></data>
+  <data name="PairingConfirmingMessage" xml:space="preserve"><value>The other computer must also confirm the same code.</value></data>
+  <data name="PairingConfirmingProgress" xml:space="preserve"><value>Committing signed device trust…</value></data>
+  <data name="PairingCancellingProgress" xml:space="preserve"><value>Cancelling pairing and restoring local ownership…</value></data>
+  <data name="PairingPairedTitle" xml:space="preserve"><value>Device paired</value></data>
+  <data name="PairingPairedMessage" xml:space="preserve"><value>Signed trust and the selected permissions were stored.</value></data>
+  <data name="PairingFailedTitle" xml:space="preserve"><value>Pairing did not finish</value></data>
+  <data name="PairingFailed" xml:space="preserve"><value>Check that both agents are running on the same local network, then try again.</value></data>
+  <data name="PairingRejected" xml:space="preserve"><value>The agent rejected the request or another pairing session is already active.</value></data>
+  <data name="PairingDeclined" xml:space="preserve"><value>The other computer declined or did not confirm the code.</value></data>
+  <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Enter an IP address with port or a valid mDNS instance.</value></data>
+  <data name="PairingTimedOut" xml:space="preserve"><value>The other computer did not respond before the protected pairing deadline.</value></data>
+  <data name="LayoutTitle.Text" xml:space="preserve"><value>Layout</value></data>
+  <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Display arrangement and edge switching are under implementation.</value></data>
+  <data name="TransfersTitle.Text" xml:space="preserve"><value>Transfers</value></data>
+  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>The safe file-transfer queue is under implementation.</value></data>
+  <data name="UnavailableBadge.Title" xml:space="preserve"><value>Not available in this build</value></data>
+  <data name="UnavailableBadge.Message" xml:space="preserve"><value>This screen does not perform an action yet.</value></data>
+  <data name="SettingsTitle.Text" xml:space="preserve"><value>Settings</value></data>
+  <data name="PrivacyHeading.Text" xml:space="preserve"><value>Privacy</value></data>
+  <data name="TelemetryLabel.Text" xml:space="preserve"><value>Telemetry</value></data>
+  <data name="DisabledValue.Text" xml:space="preserve"><value>Disabled</value></data>
+  <data name="CloudAccountLabel.Text" xml:space="preserve"><value>Cloud account</value></data>
+  <data name="NotRequiredValue.Text" xml:space="preserve"><value>Not required</value></data>
+  <data name="SafetyHeading.Text" xml:space="preserve"><value>Safety</value></data>
+  <data name="SafetyScope.Text" xml:space="preserve"><value>Nodavo runs in the current user session. Windows login, UAC secure desktop, and privileged unattended control are intentionally unsupported.</value></data>
+  <data name="StatusChecking" xml:space="preserve"><value>Checking agent…</value></data>
+  <data name="StatusStarting" xml:space="preserve"><value>Agent is starting…</value></data>
+  <data name="StatusReady" xml:space="preserve"><value>Agent ready</value></data>
+  <data name="StatusPairing" xml:space="preserve"><value>Pairing in progress</value></data>
+  <data name="StatusConnected" xml:space="preserve"><value>Connected</value></data>
+  <data name="StatusStopping" xml:space="preserve"><value>Agent is stopping…</value></data>
+  <data name="StatusAgentUnavailable" xml:space="preserve"><value>Agent is not running</value></data>
+  <data name="StatusAgentTimeout" xml:space="preserve"><value>Agent did not respond</value></data>
+  <data name="StatusAgentAccessDenied" xml:space="preserve"><value>Agent access denied</value></data>
+  <data name="StatusFailed" xml:space="preserve"><value>Invalid agent response</value></data>
+  <data name="NoPeer" xml:space="preserve"><value>No peer connected</value></data>
+  <data name="InputOwnerLocal" xml:space="preserve"><value>This PC</value></data>
+  <data name="InputOwnerRemote" xml:space="preserve"><value>Remote peer</value></data>
+</root>

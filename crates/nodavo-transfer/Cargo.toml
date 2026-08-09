@@ -1,0 +1,22 @@
+[package]
+name = "nodavo-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Validated manifests and streaming file-transfer contracts for Nodavo"
+publish = false
+
+[dependencies]
+blake3.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

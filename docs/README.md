@@ -1,4 +1,4 @@
-<!-- doc-id: docs-index; lang: en; revision: 2 -->
+<!-- doc-id: docs-index; lang: en; revision: 4 -->
 
 # Nodavo documentation
 
@@ -18,8 +18,8 @@ Nodavo is currently a documentation-first pre-alpha project. These documents def
 - [Security model](security-model.md) — threats, pairing, trust, input, clipboard, files, and updates.
 - [Clean-room policy](clean-room-policy.md) — rules preventing incompatible source reuse.
 - [Technical glossary](glossary.md) — consistent English/Russian terms used by the project.
-- `protocol.md` — will be added during M1 after the M0 feasibility gates pass.
-- `building.md` — will be added with the first buildable workspace.
+- [Building](building.md) — current development prerequisites and build commands.
+- [Peer protocol](protocol.md) — current pre-alpha envelope, channels, limits, and compatibility rules.
 
 ## Decisions
 

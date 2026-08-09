@@ -1,16 +1,55 @@
 [workspace]
 resolver = "2"
-members = []
+members = ["crates/*"]
+default-members = ["crates/nodavo-agent"]
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/greendexd/nodavo"
+rust-version = "1.96"
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+bitflags = { version = "2", features = ["serde"] }
+blake3 = "1"
+bytes = { version = "1", features = ["serde"] }
+core-foundation = "0.10"
+core-graphics = { version = "0.25", features = ["highsierra"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "serde", "zeroize"] }
+macos-accessibility-client = "0.0.2"
+mdns-sd = { version = "0.20.3", default-features = false }
+minicbor = { version = "2", features = ["alloc", "derive", "std"] }
+postcard = { version = "1", features = ["alloc"] }
+quinn = "0.11.11"
+rand = "0.9"
+rcgen = "0.14.8"
+rustls = "0.23"
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+unicode-normalization = "0.1"
+windows = "0.62.2"
+zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "warn"
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

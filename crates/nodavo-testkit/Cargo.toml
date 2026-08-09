@@ -1,0 +1,20 @@
+[package]
+name = "nodavo-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Deterministic virtual adapters for internal Nodavo tests"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+nodavo-clipboard = { path = "../nodavo-clipboard" }
+nodavo-input = { path = "../nodavo-input" }
+nodavo-session = { path = "../nodavo-session" }
+nodavo-transfer = { path = "../nodavo-transfer" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

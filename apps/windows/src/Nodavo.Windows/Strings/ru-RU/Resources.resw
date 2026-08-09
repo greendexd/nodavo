@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="ProductName" xml:space="preserve"><value>Nodavo</value></data>
+  <data name="AppDescription" xml:space="preserve"><value>Локальный программный KVM для macOS и Windows</value></data>
+  <data name="NavigationOverview.Content" xml:space="preserve"><value>Обзор</value></data>
+  <data name="NavigationDevices.Content" xml:space="preserve"><value>Устройства</value></data>
+  <data name="NavigationLayout.Content" xml:space="preserve"><value>Расположение</value></data>
+  <data name="NavigationTransfers.Content" xml:space="preserve"><value>Передачи</value></data>
+  <data name="NavigationSettings.Content" xml:space="preserve"><value>Настройки</value></data>
+  <data name="OverviewTitle.Text" xml:space="preserve"><value>Локальное рабочее пространство</value></data>
+  <data name="OverviewSubtitle.Text" xml:space="preserve"><value>Текущее состояние пользовательского агента Nodavo на этом ПК.</value></data>
+  <data name="ConnectionHeading.Text" xml:space="preserve"><value>Подключение</value></data>
+  <data name="PeerLabel.Text" xml:space="preserve"><value>Устройство</value></data>
+  <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Источник ввода</value></data>
+  <data name="RefreshButton.Content" xml:space="preserve"><value>Обновить статус</value></data>
+  <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Аварийно отключить</value></data>
+  <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha оболочка</value></data>
+  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Сопряжение и переподключение находятся на стадии pre-alpha. Ввод, буфер и файлы пока недоступны.</value></data>
+  <data name="DevicesTitle.Text" xml:space="preserve"><value>Устройства</value></data>
+  <data name="DevicesSubtitle.Text" xml:space="preserve"><value>Соедините компьютеры напрямую в локальной сети и подтвердите одинаковый шестизначный код на обоих.</value></data>
+  <data name="PairingListen.Content" xml:space="preserve"><value>Ждать другое устройство</value></data>
+  <data name="PairingEndpoint.Header" xml:space="preserve"><value>Другой компьютер</value></data>
+  <data name="PairingEndpoint.PlaceholderText" xml:space="preserve"><value>192.168.1.20:44310 или mdns:Nodavo-Mac</value></data>
+  <data name="PairingConnect.Content" xml:space="preserve"><value>Подключиться</value></data>
+  <data name="PairingPermissionsHeading.Text" xml:space="preserve"><value>Разрешения для другого устройства</value></data>
+  <data name="PairingAllowInput.Content" xml:space="preserve"><value>Управлять этим ПК его мышью и клавиатурой</value></data>
+  <data name="PairingAllowClipboardRead.Content" xml:space="preserve"><value>Читать содержимое буфера этого ПК</value></data>
+  <data name="PairingAllowClipboardWrite.Content" xml:space="preserve"><value>Записывать содержимое в буфер этого ПК</value></data>
+  <data name="PairingAllowFiles.Content" xml:space="preserve"><value>Отправлять файлы на этот ПК</value></data>
+  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>Все разрешения изначально выключены. Выбор привязывается к подтверждённому коду и подписанному доверию. Пока для изменения требуется повторное сопряжение.</value></data>
+  <data name="PairingPeerLabel.Text" xml:space="preserve"><value>Устройство</value></data>
+  <data name="PairingCodeLabel.Text" xml:space="preserve"><value>Этот код совпадает на обоих компьютерах?</value></data>
+  <data name="PairingConfirm.Content" xml:space="preserve"><value>Коды совпадают</value></data>
+  <data name="PairingCancel.Content" xml:space="preserve"><value>Отмена</value></data>
+  <data name="PairingPreAlpha.Title" xml:space="preserve"><value>Pre-alpha сопряжение</value></data>
+  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Разрешения при сопряжении и закреплённое доверие реализованы. Изменение после сопряжения, список устройств, ввод, буфер и файлы пока недоступны.</value></data>
+  <data name="PairingIdleTitle" xml:space="preserve"><value>Готово к сопряжению</value></data>
+  <data name="PairingIdleMessage" xml:space="preserve"><value>На одном компьютере включите ожидание, а со второго выполните подключение.</value></data>
+  <data name="PairingCancelled" xml:space="preserve"><value>Сопряжение отменено. Локальный ввод остаётся на этом ПК.</value></data>
+  <data name="PairingWaitingTitle" xml:space="preserve"><value>Поиск другого компьютера</value></data>
+  <data name="PairingWaitingMessage" xml:space="preserve"><value>Оставьте Nodavo открытым на обоих компьютерах. Доверие не создаётся до подтверждения обоих кодов.</value></data>
+  <data name="PairingWaitingProgress" xml:space="preserve"><value>Ожидание защищённого соединения сопряжения…</value></data>
+  <data name="PairingCompareTitle" xml:space="preserve"><value>Сравните код</value></data>
+  <data name="PairingCompareMessage" xml:space="preserve"><value>Подтверждайте, только если имя устройства и все шесть цифр совпадают на обоих компьютерах.</value></data>
+  <data name="PairingConfirmingTitle" xml:space="preserve"><value>Ожидание подтверждения</value></data>
+  <data name="PairingConfirmingMessage" xml:space="preserve"><value>Другой компьютер тоже должен подтвердить этот код.</value></data>
+  <data name="PairingConfirmingProgress" xml:space="preserve"><value>Сохранение подписанного доверия устройства…</value></data>
+  <data name="PairingCancellingProgress" xml:space="preserve"><value>Отмена сопряжения и возврат локального управления…</value></data>
+  <data name="PairingPairedTitle" xml:space="preserve"><value>Устройство сопряжено</value></data>
+  <data name="PairingPairedMessage" xml:space="preserve"><value>Подписанное доверие и выбранные разрешения сохранены.</value></data>
+  <data name="PairingFailedTitle" xml:space="preserve"><value>Сопряжение не завершено</value></data>
+  <data name="PairingFailed" xml:space="preserve"><value>Проверьте, что оба агента запущены в одной локальной сети, и повторите попытку.</value></data>
+  <data name="PairingRejected" xml:space="preserve"><value>Агент отклонил запрос или уже выполняется другое сопряжение.</value></data>
+  <data name="PairingDeclined" xml:space="preserve"><value>Другой компьютер отклонил запрос или не подтвердил код.</value></data>
+  <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Введите IP-адрес с портом или корректный экземпляр mDNS.</value></data>
+  <data name="PairingTimedOut" xml:space="preserve"><value>Другой компьютер не ответил до завершения защищённого тайм-аута сопряжения.</value></data>
+  <data name="LayoutTitle.Text" xml:space="preserve"><value>Расположение</value></data>
+  <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Расположение дисплеев и переход через край ещё разрабатываются.</value></data>
+  <data name="TransfersTitle.Text" xml:space="preserve"><value>Передачи</value></data>
+  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>Безопасная очередь передачи файлов ещё разрабатывается.</value></data>
+  <data name="UnavailableBadge.Title" xml:space="preserve"><value>Недоступно в этой сборке</value></data>
+  <data name="UnavailableBadge.Message" xml:space="preserve"><value>Этот экран пока не выполняет действий.</value></data>
+  <data name="SettingsTitle.Text" xml:space="preserve"><value>Настройки</value></data>
+  <data name="PrivacyHeading.Text" xml:space="preserve"><value>Конфиденциальность</value></data>
+  <data name="TelemetryLabel.Text" xml:space="preserve"><value>Телеметрия</value></data>
+  <data name="DisabledValue.Text" xml:space="preserve"><value>Выключена</value></data>
+  <data name="CloudAccountLabel.Text" xml:space="preserve"><value>Облачная учётная запись</value></data>
+  <data name="NotRequiredValue.Text" xml:space="preserve"><value>Не требуется</value></data>
+  <data name="SafetyHeading.Text" xml:space="preserve"><value>Безопасность</value></data>
+  <data name="SafetyScope.Text" xml:space="preserve"><value>Nodavo работает в сеансе текущего пользователя. Экран входа Windows, защищённый рабочий стол UAC и привилегированное управление без присутствия пользователя намеренно не поддерживаются.</value></data>
+  <data name="StatusChecking" xml:space="preserve"><value>Проверка агента…</value></data>
+  <data name="StatusStarting" xml:space="preserve"><value>Агент запускается…</value></data>
+  <data name="StatusReady" xml:space="preserve"><value>Агент готов</value></data>
+  <data name="StatusPairing" xml:space="preserve"><value>Выполняется сопряжение</value></data>
+  <data name="StatusConnected" xml:space="preserve"><value>Подключено</value></data>
+  <data name="StatusStopping" xml:space="preserve"><value>Агент останавливается…</value></data>
+  <data name="StatusAgentUnavailable" xml:space="preserve"><value>Агент не запущен</value></data>
+  <data name="StatusAgentTimeout" xml:space="preserve"><value>Агент не ответил</value></data>
+  <data name="StatusAgentAccessDenied" xml:space="preserve"><value>Доступ к агенту запрещён</value></data>
+  <data name="StatusFailed" xml:space="preserve"><value>Некорректный ответ агента</value></data>
+  <data name="NoPeer" xml:space="preserve"><value>Нет подключённого устройства</value></data>
+  <data name="InputOwnerLocal" xml:space="preserve"><value>Этот ПК</value></data>
+  <data name="InputOwnerRemote" xml:space="preserve"><value>Удалённое устройство</value></data>
+</root>

@@ -12,3 +12,8 @@ Use sequential names such as `0001-transport-quic.md` and include:
 - consequences;
 - references and provenance.
 
+## Accepted decisions
+
+- [ADR-0001: Bounded canonical CBOR peer protocol](0001-bounded-cbor-protocol.md)
+- [ADR-0002: Isolated platform FFI boundary](0002-platform-ffi-boundary.md)
+- [ADR-0003: First-contact pairing bootstrap](0003-first-contact-pairing-bootstrap.md) ([Русский](0003-first-contact-pairing-bootstrap.ru.md))

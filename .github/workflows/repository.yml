@@ -1,16 +1,19 @@
 name: Repository checks
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
 
 permissions:
   contents: read
 
 jobs:
-  validate:
+  repository:
+    name: Documentation and repository policy
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -35,3 +38,56 @@ jobs:
             fi
           done
           exit "$failed"
+
+  rust-macos:
+    name: Rust formatting and macOS check
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Install the repository Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Check the Rust workspace on macOS
+        run: cargo check --workspace --locked
+
+  swift-macos:
+    name: Swift packages on macOS
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Build the macOS application shell
+        run: swift build --package-path apps/macos
+      - name: Build the macOS feasibility programs
+        run: |
+          swift build --package-path spikes/macos-input
+          swift build --package-path spikes/macos-clipboard
+
+  rust-windows-x64:
+    name: Rust check on Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+      - name: Install the repository Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --profile minimal
+      - name: Check the Rust workspace for Windows x64
+        run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
+      - name: Install .NET 8 for the WinUI shell
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore Windows App SDK packages
+        run: dotnet restore apps/windows/Nodavo.Windows.sln -p:Platform=x64
+      - name: Compile the WinUI 3 shell for Windows x64
+        run: dotnet build apps/windows/Nodavo.Windows.sln --no-restore --configuration Release -p:Platform=x64
+
+# Feature, fuzz, stress, security, upgrade, and release matrices intentionally
+# remain separate 1.0 gates. This workflow only proves that the pre-alpha
+# foundation still formats and compiles; it does not qualify a release.

@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 2 -->
+<!-- doc-id: security-model; lang: en; revision: 4 -->
 
 # Security model
 
@@ -29,7 +29,9 @@ Physical compromise of either paired machine, kernel compromise, malicious firmw
 ## Trust establishment
 
 - mDNS discovery provides location only, never identity.
-- Initial pairing uses an ephemeral encrypted channel and a short authentication string shown on both devices.
+- An explicit pairing attempt first exchanges only bounded, short-lived TLS certificate metadata over an unauthenticated TCP preflight at the discovered or manually entered location. The metadata is public and never creates trust.
+- Each side pins the exact received ephemeral certificate before opening the initial TLS 1.3 QUIC channel. Protected application data is never accepted on the preflight connection.
+- The short authentication string binds the QUIC TLS exporter, roles, nonces, both persistent identities, both persistent certificates, grants, and protocol version, and is shown on both devices.
 - The user must confirm the match on both sides.
 - Devices then exchange persistent Ed25519 identities.
 - Future connections require mutual proof of pinned identities.
@@ -38,15 +40,27 @@ Physical compromise of either paired machine, kernel compromise, malicious firmw
 
 Private keys are non-exportable where practical and stored with macOS Keychain and Windows DPAPI/CNG. Trust records distinguish input, clipboard, and file capabilities.
 
+The current pre-alpha agent also contains an explicitly development-only, versioned file fallback for local two-process work. Unix directories are restricted to mode `0700`, files to `0600`, decoding is bounded, and atomic replacement is used, but this fallback does not satisfy the production Keychain/DPAPI requirement and must not ship as stable storage.
+
 ## Session security
 
-- QUIC with TLS 1.3; no plaintext compatibility mode.
+- QUIC with TLS 1.3; no plaintext application/session compatibility mode. The first-contact TCP preflight carries only untrusted ephemeral certificate metadata and cannot authorize input, clipboard, files, or persistent trust.
 - Version and capability negotiation is authenticated.
 - Replay-resistant session identifiers and monotonically checked sequences.
 - Bounded messages, timeouts, rate limits, and connection quotas.
 - A single ownership lease controls remote input routing.
 - Emergency disconnect is processed locally and cannot depend on the peer.
 - Lock, sleep, timeout, and disconnect release all keys/buttons and revoke the active lease.
+
+## Input capture and injection
+
+- Native capture starts in non-suppressing mode. Suppression is permitted only while an authenticated, authorized focus lease is actively routing local input to the peer.
+- macOS requires the user-granted Accessibility trust boundary. Windows remains inside the current interactive user's default input desktop; login, Session 0, UAC secure desktop, and privileged unattended control are rejected.
+- Nodavo injection carries a private process tag where the platform supports one. Capture rejects that tag and every event the OS reports as injected, preventing synthetic feedback loops.
+- Keyboard usages, modifiers, media keys, pointer buttons, normalized motion, and line/precise scrolling are validated before injection. Native codes never cross the peer protocol directly.
+- The injector tracks every accepted key/button press. Emergency stop, focus loss, lock, sleep, tap/hook disable, timeout, and transport failure synchronously request deterministic release and local-ownership restoration before successful acknowledgement.
+- A disabled or timed-out capture hook fails closed: suppression stops, local ownership is restored, and the remote session cannot continue silently.
+- Input payloads and pairing codes are excluded from logs, crash metadata, and telemetry.
 
 ## Clipboard security
 
@@ -73,6 +87,8 @@ Private keys are non-exportable where practical and stored with macOS Keychain a
 - macOS uses a user-owned Unix domain socket with restrictive permissions and peer credential checks.
 - Windows uses a named pipe with an ACL limited to the current user and validates the peer process context.
 - UI requests are capability checked; the UI does not directly read private network keys.
+
+The current pre-alpha Unix socket authenticates only the owning user credential, and the Windows pipe authenticates the same SID/session. That blocks cross-user and remote clients but does not yet distinguish the signed Nodavo UI from another process already running as the same user. Signed-client or launch-bound authentication is therefore a stable-release gate; sensitive local requests remain narrowly bounded and release storage must not expose network private keys to the UI.
 
 ## Updates and supply chain
 

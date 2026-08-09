@@ -1,0 +1,38 @@
+<UserControl
+    x:Class="Nodavo.Windows.Views.SettingsView"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ScrollViewer>
+        <StackPanel MaxWidth="760" Padding="32" Spacing="20" HorizontalAlignment="Stretch">
+            <TextBlock x:Uid="SettingsTitle" Style="{StaticResource TitleTextBlockStyle}" />
+
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock x:Uid="PrivacyHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <Grid ColumnSpacing="24" RowSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock x:Uid="TelemetryLabel" />
+                        <TextBlock x:Uid="DisabledValue" Grid.Column="1" FontWeight="SemiBold" />
+                        <TextBlock x:Uid="CloudAccountLabel" Grid.Row="1" />
+                        <TextBlock x:Uid="NotRequiredValue" Grid.Row="1" Grid.Column="1" FontWeight="SemiBold" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="12">
+                    <TextBlock x:Uid="SafetyHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock x:Uid="SafetyScope" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    <Button x:Uid="EmergencyStopButton" Click="EmergencyStopButton_Click" HorizontalAlignment="Left" />
+                </StackPanel>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

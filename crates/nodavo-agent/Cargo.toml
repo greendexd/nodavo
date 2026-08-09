@@ -1,0 +1,38 @@
+[package]
+name = "nodavo-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Per-user Nodavo session agent"
+publish = false
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+nodavo-discovery = { path = "../nodavo-discovery" }
+nodavo-identity = { path = "../nodavo-identity" }
+nodavo-input = { path = "../nodavo-input" }
+nodavo-local-ipc = { path = "../nodavo-local-ipc" }
+nodavo-protocol = { path = "../nodavo-protocol" }
+nodavo-session = { path = "../nodavo-session" }
+nodavo-transport = { path = "../nodavo-transport" }
+rand.workspace = true
+rcgen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+nodavo-platform-windows = { path = "../nodavo-platform-windows" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nodavo-platform-macos = { path = "../nodavo-platform-macos" }
+
+[lints]
+workspace = true

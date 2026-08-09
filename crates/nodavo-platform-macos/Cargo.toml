@@ -1,0 +1,30 @@
+[package]
+name = "nodavo-platform-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "macOS platform adapter for Nodavo"
+publish = false
+
+[dependencies]
+bytes.workspace = true
+nodavo-clipboard = { path = "../nodavo-clipboard" }
+nodavo-input = { path = "../nodavo-input" }
+nodavo-protocol = { path = "../nodavo-protocol" }
+thiserror.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
+core-graphics.workspace = true
+macos-accessibility-client.workspace = true
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

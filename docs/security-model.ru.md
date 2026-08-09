@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 2 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 4 -->
 
 # Модель безопасности
 
@@ -29,7 +29,9 @@ Physical compromise paired-машины, kernel compromise, malicious firmware �
 ## Установление доверия
 
 - mDNS discovery сообщает только расположение, но не identity.
-- Initial pairing использует ephemeral encrypted channel и short authentication string на обоих устройствах.
+- Явная pairing attempt сначала обменивается только ограниченными краткоживущими метаданными TLS-сертификата через неаутентифицированный TCP preflight по обнаруженному или введённому вручную адресу. Эти metadata публичны и никогда не создают trust.
+- Каждая сторона закрепляет точный полученный ephemeral certificate до открытия первоначального QUIC-канала с TLS 1.3. Защищённые application data никогда не принимаются через preflight connection.
+- Short authentication string связывает QUIC TLS exporter, роли, nonce обеих сторон, оба persistent identities, оба persistent certificates, grants и версию протокола и показывается на обоих устройствах.
 - Пользователь подтверждает совпадение с обеих сторон.
 - Устройства обмениваются persistent Ed25519 identities.
 - Будущие подключения требуют mutual proof pinned identities.
@@ -38,15 +40,27 @@ Physical compromise paired-машины, kernel compromise, malicious firmware �
 
 Private keys по возможности non-exportable и хранятся через macOS Keychain и Windows DPAPI/CNG. Trust records разделяют input, clipboard и file capabilities.
 
+Текущий pre-alpha agent также содержит явно предназначенный только для разработки versioned file fallback для локальной работы с двумя процессами. На Unix каталоги ограничены режимом `0700`, файлы — `0600`, decoding ограничен, а replacement выполняется атомарно, но этот fallback не выполняет production-требование Keychain/DPAPI и не должен попадать в stable storage.
+
 ## Безопасность сессии
 
-- QUIC с TLS 1.3; plaintext compatibility mode отсутствует.
+- QUIC с TLS 1.3; plaintext compatibility mode для application/session data отсутствует. TCP preflight первого контакта переносит только untrusted metadata временного сертификата и не может разрешить input, clipboard, files или persistent trust.
 - Version/capability negotiation аутентифицирован.
 - Replay-resistant session IDs и монотонная проверка sequences.
 - Bounded messages, timeouts, rate limits и connection quotas.
 - Единственный ownership lease управляет remote input routing.
 - Emergency disconnect выполняется локально и не зависит от peer.
 - Lock, sleep, timeout и disconnect освобождают keys/buttons и отзывают active lease.
+
+## Захват и эмуляция ввода
+
+- Native capture запускается без подавления. Suppression разрешается только при активной аутентифицированной и разрешённой focus lease, которая действительно маршрутизирует локальный ввод на peer.
+- macOS требует выданное пользователем Accessibility trust. Windows остаётся внутри default input desktop интерактивного текущего пользователя; login, Session 0, UAC secure desktop и privileged unattended control отклоняются.
+- Инъекция Nodavo использует приватную process tag, если платформа это поддерживает. Capture отклоняет эту tag и все события, отмеченные OS как injected, предотвращая synthetic feedback loop.
+- Keyboard usages, modifiers, media keys, pointer buttons, normalized motion и line/precise scrolling проверяются до injection. Native codes не передаются напрямую через peer protocol.
+- Injector отслеживает каждое принятое нажатие key/button. Emergency stop, потеря focus, lock, sleep, отключение tap/hook, timeout и transport failure синхронно запрашивают детерминированное освобождение и возврат local ownership до успешного acknowledgement.
+- Отключённый или просроченный capture hook работает fail-closed: suppression прекращается, local ownership возвращается, а remote session не может незаметно продолжиться.
+- Input payloads и pairing codes не попадают в logs, crash metadata или telemetry.
 
 ## Безопасность буфера
 
@@ -73,6 +87,8 @@ Private keys по возможности non-exportable и хранятся че
 - macOS использует user-owned Unix domain socket с restrictive permissions и peer credential checks.
 - Windows использует named pipe с ACL текущего пользователя и проверкой peer process context.
 - UI requests проходят capability checks; UI не читает private network keys напрямую.
+
+Текущий pre-alpha Unix socket аутентифицирует только credential владельца, а Windows pipe — тот же SID/session. Это блокирует cross-user и remote clients, но пока не отличает подписанный UI Nodavo от другого процесса, уже работающего от того же пользователя. Поэтому signed-client или launch-bound authentication остаётся stable-release gate; чувствительные локальные запросы должны быть узко ограничены, а release storage не должно открывать UI приватные сетевые ключи.
 
 ## Обновления и supply chain
 

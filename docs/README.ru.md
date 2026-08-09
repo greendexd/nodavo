@@ -1,4 +1,4 @@
-<!-- doc-id: docs-index; lang: ru; translation-of: README.md; revision: 2 -->
+<!-- doc-id: docs-index; lang: ru; translation-of: README.md; revision: 4 -->
 
 # Документация Nodavo
 
@@ -18,8 +18,8 @@ Nodavo пока является documentation-first pre-alpha проектом.
 - [Модель безопасности](security-model.ru.md) — угрозы, pairing, доверие, ввод, буфер, файлы и обновления.
 - [Политика чистой реализации](clean-room-policy.ru.md) — правила против несовместимого заимствования исходников.
 - [Технический глоссарий](glossary.ru.md) — единые английские и русские термины проекта.
-- `protocol.ru.md` — появится на M1 после прохождения M0 feasibility gates.
-- `building.ru.md` — появится вместе с первым собираемым workspace.
+- [Сборка](building.ru.md) — текущие требования и команды для разработки.
+- [Протокол между устройствами](protocol.ru.md) — текущий pre-alpha envelope, каналы, лимиты и правила совместимости.
 
 ## Решения
 

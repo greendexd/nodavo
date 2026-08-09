@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 1 -->
+<!-- doc-id: changelog; lang: en; revision: 8 -->
 
 # Changelog
 
@@ -10,5 +10,22 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 
 - Initial bilingual repository and product documentation.
 - Product plan, architecture, roadmap, security model, privacy policy, and clean-room policy.
+- Pre-alpha peer-protocol documentation with channel separation, bounded canonical CBOR, current tags, freshness rules, and compatibility constraints.
 - Community contribution and issue-reporting templates.
+- Rust workspace foundations for bounded protocol messages, semantic input, session safety, device identity and pairing, discovery, QUIC/TLS transport, clipboard synchronization, file-transfer validation, local IPC, signed-update verification, and deterministic virtual adapters.
+- Per-user Rust agent with bounded private-socket IPC, explicit pairing-time capability grants, ephemeral first-contact pairing, bilateral short-code confirmation, signed trust persistence, restart-safe pinned mutual-TLS reconnect, revocation, status, self-check, shutdown, and emergency stop.
+- Authenticated symmetric peer-session runtime with protocol/capability negotiation, independent input sequence lanes, same-link bidirectional focus leases, datagram/pointer fallback, bounded command ingress, and restore-before-ack safety recovery.
+- Bilingual SwiftUI macOS menu-bar shell for agent status, emergency stop, manual/listening pairing, explicit per-capability selection, and short-code confirmation.
+- macOS manual focus controls plus a wired native capture/injection bridge with default-off suppression, bounded coalescing, non-evictable key/button events, priority lifecycle recovery, and synchronous forced-release acknowledgement.
+- Owned macOS and Windows input runtimes with synthetic-event suppression, HID/media/button/motion/scroll translation, lifecycle recovery, deterministic forced release, plus input/clipboard feasibility programs. The Windows runtime is not yet wired to the agent or runtime-tested on Windows.
+- Windows input, display, session-safety, clipboard, and current-user DPAPI boundaries, plus a protected same-user named-pipe server API; the Rust agent does not yet host that pipe.
+- Bilingual WinUI 3 shell source with bounded status, emergency stop, manual/listening pairing, explicit per-capability selection, and short-code confirmation clients. It has received XML/source validation only, not Windows compile or runtime validation.
+- Windows agent startup source with a same-user/session validated named-pipe server and DPAPI-protected identity/trust persistence; it cross-checks for Windows x64 but still needs Windows runtime validation.
+- Bounded FIFO transfer scheduling with deterministic pause/resume/cancel effects, plus filesystem-backed private staging with durable progress journals, exact-offset restart resume, torn-tail truncation, per-file BLAKE3 verification, persisted-state discard, and no-overwrite finalization.
+- Compile-only repository checks for bilingual documentation, Rust formatting and macOS/Windows builds, the WinUI 3 x64 project, and macOS Swift packages.
 
+### Not yet available
+
+- A usable or released macOS ↔ Windows application. Pairing and reconnect run, but input, focus, clipboard, and files are not yet joined into an end-to-end peer session.
+- Proven Windows agent/WinUI build and runtime behavior; installers, signing, updater installation, macOS production credential-store integration, peer clipboard/file queue orchestration, stale-state cleanup, and ARM64 validation are also missing.
+- Full security, fuzz, stress, compatibility, upgrade, accessibility, and real-device test matrices; these remain release gates for feature-complete 1.0.

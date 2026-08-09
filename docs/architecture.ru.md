@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 1 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 3 -->
 
 # Архитектура
 
@@ -16,7 +16,7 @@ flowchart TB
         MUI["SwiftUI menu-bar app"]
         MA["Rust session agent"]
         MAP["CGEventTap / CGEvent / NSPasteboard"]
-        MUI <-->|"authenticated UDS"| MA
+        MUI <-->|"private user UDS<br/>для release нужен client auth"| MA
         MA <--> MAP
     end
 
@@ -24,7 +24,7 @@ flowchart TB
         WUI["WinUI 3 tray app"]
         WA["Rust session agent"]
         WAP["Raw Input / hooks / SendInput / Win32 Clipboard + OLE"]
-        WUI <-->|"ACL-protected named pipe"| WA
+        WUI <-->|"same-user/session named pipe<br/>для release нужен client auth"| WA
         WA <--> WAP
     end
 
@@ -71,19 +71,22 @@ Platform и transport boundaries используют dependency injection, чт
 - Text/Unicode fallback обслуживает layout-sensitive ввод и будущий IME.
 - Pointer coordinates нормализуются на display и преобразуются с учётом scale целевого экрана.
 - Event содержит session, origin, sequence и capability context.
+- Каждый input event также содержит ненулевой identifier активной focus lease. Control, reliable input и replaceable input используют отдельные sequence lanes, поэтому overtaking датаграммы не может сделать release клавиши устаревшим.
 - Injected events маркируются или подавляются и не возвращаются в capture.
 - Единственный focus ownership lease предотвращает одновременные routing loops.
+- Capture suppression по умолчанию выключен и включается только при forwarding под этой lease. Обычный возврат focus сохраняет authenticated connection готовым для управления в обратную сторону.
 
 При disconnect, timeout, lock, sleep, crash или emergency stop обе стороны освобождают tracked keys/buttons и возвращают локальный cursor ownership.
 
 ## Discovery и pairing
 
 1. mDNS публикует минимальную несекретную service record.
-2. Peer открывает untrusted QUIC-сессию с временной identity.
-3. Оба UI показывают одинаковую short authentication string.
-4. Пользователь подтверждает совпадение на обеих машинах.
-5. Устройства обмениваются persistent public identities и явными capability grants.
-6. Будущие сессии требуют взаимного доказательства pinned identities.
+2. Ограниченный неаутентифицированный TCP preflight обменивается по этому адресу только краткоживущими метаданными временного сертификата.
+3. Каждая сторона закрепляет точные metadata до установления временной QUIC-сессии pairing с TLS 1.3.
+4. Оба UI показывают одинаковую short authentication string, связанную с TLS exporter и полным role-ordered transcript постоянного trust.
+5. Пользователь подтверждает совпадение на обеих машинах.
+6. Устройства обмениваются persistent public identities и явными capability grants.
+7. Будущие сессии требуют mutual proof pinned identities.
 
 Private keys хранятся в macOS Keychain и Windows DPAPI/CNG-backed storage. Discovery metadata никогда не используется как identity proof.
 
@@ -91,7 +94,7 @@ Private keys хранятся в macOS Keychain и Windows DPAPI/CNG-backed stor
 
 Clipboard synchronization использует revisions и content addressing для предотвращения loops. Контент передаётся только при включённой capability. Планируемые типы: UTF-8 text, HTML, PNG/BMP и file lists.
 
-Файлы пишутся в private staging directory, ограничиваются quota, проверяются против traversal и unsafe links, хэшируются BLAKE3 и атомарно перемещаются после выбора destination policy. Полученный контент не открывается автоматически.
+Файлы пишутся в private staging directory, ограничиваются quota, проверяются против traversal/unsafe links и хэшируются BLAKE3. Ограниченный durable-журнал хранит только точные contiguous offsets; возобновление после перезапуска требует тот же аутентифицированный manifest и обрезает недолговечный tail. Финальная публикация отказывается перезаписывать существующее назначение. Полученный контент не открывается автоматически.
 
 Finder ↔ Explorer drag/drop является M0 research gate. Если native drag APIs нельзя сделать надёжными и безопасными, 1.0 предложит явную transfer queue вместо имитации drag/drop.
 
@@ -102,4 +105,3 @@ Agent 1.0 по умолчанию работает в user session. Privileged W
 ## Наблюдаемость
 
 Локальные structured logs содержат категории событий, timings, bounded error codes и ephemeral correlation IDs, но не keystrokes, clipboard data, file contents, private filenames, keys и stable network identifiers. Crash reporting и telemetry остаются выключенными до explicit opt-in.
-

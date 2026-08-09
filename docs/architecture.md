@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 1 -->
+<!-- doc-id: architecture; lang: en; revision: 3 -->
 
 # Architecture
 
@@ -16,7 +16,7 @@ flowchart TB
         MUI["SwiftUI menu-bar app"]
         MA["Rust session agent"]
         MAP["CGEventTap / CGEvent / NSPasteboard"]
-        MUI <-->|"authenticated UDS"| MA
+        MUI <-->|"private user UDS<br/>release client auth required"| MA
         MA <--> MAP
     end
 
@@ -24,7 +24,7 @@ flowchart TB
         WUI["WinUI 3 tray app"]
         WA["Rust session agent"]
         WAP["Raw Input / hooks / SendInput / Win32 Clipboard + OLE"]
-        WUI <-->|"ACL-protected named pipe"| WA
+        WUI <-->|"same-user/session named pipe<br/>release client auth required"| WA
         WA <--> WAP
     end
 
@@ -71,19 +71,22 @@ When QUIC datagrams are unavailable, pointer motion falls back to a short-lived 
 - Text/Unicode fallback handles layout-sensitive entry and future IME support.
 - Pointer coordinates are normalized per display and transformed using the destination display scale.
 - Every event includes session, origin, sequence, and capability context.
+- Every input event also includes the active nonzero focus-lease identifier. Control, reliable input, and replaceable input have independent sequence lanes so datagram overtaking cannot invalidate a key release.
 - Injected events are tagged or suppressed so they cannot re-enter capture.
 - A single focus ownership lease prevents simultaneous routing loops.
+- Capture suppression is off by default and can turn on only while forwarding under that lease. Ordinary focus return keeps the authenticated connection ready for reverse-direction control.
 
 On disconnect, timeout, lock, sleep, crash, or emergency stop, both sides release all tracked keys/buttons and restore local cursor ownership.
 
 ## Discovery and pairing
 
 1. mDNS publishes a minimal, non-sensitive service record.
-2. A peer opens an untrusted QUIC session with an ephemeral identity.
-3. Both UIs display the same short authentication string.
-4. The user confirms the match on both devices.
-5. Devices exchange persistent public identities and explicit capability grants.
-6. Future sessions require mutual proof of the pinned identities.
+2. A bounded unauthenticated TCP preflight exchanges only short-lived ephemeral certificate metadata at that location.
+3. Each side pins the exact metadata before establishing a temporary TLS 1.3 QUIC pairing session.
+4. Both UIs display the same short authentication string, bound to the TLS exporter and complete role-ordered persistent trust transcript.
+5. The user confirms the match on both devices.
+6. Devices exchange persistent public identities and explicit capability grants.
+7. Future sessions require mutual proof of the pinned identities.
 
 Private keys are stored in macOS Keychain and Windows DPAPI/CNG-backed storage. Discovery metadata is never accepted as identity proof.
 
@@ -91,7 +94,7 @@ Private keys are stored in macOS Keychain and Windows DPAPI/CNG-backed storage. 
 
 Clipboard synchronization is revisioned and content-addressed to prevent loops. Content is transferred only when its capability is enabled. Planned types are UTF-8 text, HTML, PNG/BMP, and file lists.
 
-Files are written to a private staging directory, bounded by quotas, validated against traversal and unsafe links, hashed with BLAKE3, and atomically finalized after explicit destination policy. Received content is never auto-opened.
+Files are written to a private staging directory, bounded by quotas, validated against traversal and unsafe links, and hashed with BLAKE3. A bounded durable progress journal records only exact contiguous offsets; restart resume requires the same authenticated manifest and truncates any non-durable tail. Final publication refuses existing destinations. Received content is never auto-opened.
 
 Finder ↔ Explorer drag/drop is an M0 research gate. If native drag APIs cannot be made reliable and safe, 1.0 will expose an explicit transfer queue rather than simulate misleading drag/drop.
 
@@ -102,4 +105,3 @@ The default 1.0 agent runs in the user session. A privileged Windows service is 
 ## Observability
 
 Local structured logs contain event categories, timings, bounded error codes, and ephemeral correlation IDs—not keystrokes, clipboard data, file contents, private filenames, keys, or stable network identifiers. Crash reporting and telemetry remain disabled until explicit opt-in.
-

@@ -1,0 +1,20 @@
+[package]
+name = "nodavo-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bytes.workspace = true
+nodavo-identity = { path = "../nodavo-identity" }
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

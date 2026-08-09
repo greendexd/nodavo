@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Nodavo mark">
+  <defs>
+    <linearGradient id="g" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5B8CFF" />
+      <stop offset="1" stop-color="#6C4DDB" />
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="56" fill="url(#g)" />
+  <path d="M58 94h112l-20-20 14-14 44 44-44 44-14-14 20-20H58V94Z" fill="white" />
+  <path d="M198 162H86l20 20-14 14-44-44 44-44 14 14-20 20h112v20Z" fill="white" opacity=".82" />
+</svg>
