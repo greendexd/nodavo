@@ -1,0 +1,86 @@
+name: Bug report (English)
+description: Report a reproducible Nodavo defect. Pre-alpha planning issues are welcome too.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you. Never attach secrets, real clipboard contents, private filenames, pairing codes, or unsanitized logs. Report vulnerabilities through Private Vulnerability Reporting instead.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Optional during planning; use a commit SHA once code exists.
+      placeholder: v0.0.0, commit SHA, or not applicable
+  - type: dropdown
+    id: direction
+    attributes:
+      label: Direction
+      options:
+        - macOS → Windows
+        - Windows → macOS
+        - Both directions
+        - Documentation or planning
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS versions, CPU architectures, display layout, network type, and relevant permissions.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Discovery and pairing
+        - Mouse or trackpad
+        - Keyboard or layout
+        - Clipboard
+        - Files
+        - Permissions
+        - Installer or update
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: "1. ...\n2. ...\n3. ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Optional. Remove personal paths, IP addresses, filenames, and content.
+      render: text
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: I removed secrets and private content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

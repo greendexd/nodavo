@@ -1,0 +1,38 @@
+name: Предложение функции (Русский)
+description: Опишите пользовательскую проблему или ограниченную возможность продукта.
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Проблема пользователя
+      description: Сначала опишите проблему, а не реализацию.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Желаемый результат
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Ограничения security, privacy, платформы или совместимости
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Рассмотренные альтернативы
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Подтверждение
+      options:
+        - label: Я проверил roadmap и существующие issues.
+          required: true
+        - label: Я не выдаю планируемую функцию за уже реализованную.
+          required: true
+

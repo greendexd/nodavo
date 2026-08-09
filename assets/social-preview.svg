@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Nodavo — One motion. Every machine.</title>
+  <desc id="desc">Social preview for the Nodavo open-source software KVM project.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111936"/>
+      <stop offset="0.6" stop-color="#090e20"/>
+      <stop offset="1" stop-color="#050713"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.18" cy="0.5" r="0.55">
+      <stop offset="0" stop-color="#6d5efc" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#6d5efc" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="92" y1="160" x2="430" y2="480" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" rx="42" fill="url(#background)"/>
+  <rect width="1280" height="640" rx="42" fill="url(#halo)"/>
+  <circle cx="1180" cy="78" r="190" fill="#22d3ee" opacity="0.035"/>
+  <circle cx="1110" cy="590" r="260" fill="#8b5cf6" opacity="0.04"/>
+
+  <g transform="translate(70 92) scale(.88)">
+    <path d="M199 181 C256 181 249 331 313 331" fill="none" stroke="url(#line)" stroke-width="20" stroke-linecap="round"/>
+    <rect x="80" y="98" width="178" height="132" rx="28" fill="#0d1430" stroke="url(#line)" stroke-width="13"/>
+    <path d="M131 256h76M169 230v26" stroke="#a6b7ff" stroke-width="12" stroke-linecap="round"/>
+    <rect x="254" y="282" width="178" height="132" rx="28" fill="#0d1430" stroke="url(#line)" stroke-width="13"/>
+    <path d="M305 440h76M343 414v26" stroke="#70e7f4" stroke-width="12" stroke-linecap="round"/>
+    <path d="M239 218l75 45-34 10 17 38-24 11-17-39-27 21z" fill="#f8fafc" stroke="#111936" stroke-width="7" stroke-linejoin="round"/>
+  </g>
+
+  <text x="535" y="264" fill="#f8fafc" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="112" font-weight="750" letter-spacing="-4">Nodavo</text>
+  <text x="542" y="340" fill="#a9b7d6" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="38" font-weight="520">One motion. Every machine.</text>
+  <text x="542" y="414" fill="#7181a5" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="27">Secure · Local-first · Open source</text>
+  <rect x="542" y="454" width="478" height="4" rx="2" fill="url(#line)" opacity="0.8"/>
+</svg>
+
