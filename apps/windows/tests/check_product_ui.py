@@ -324,6 +324,12 @@ assert "NODAVO_WINDOWS_AUTH_SIGNER_CERT_SHA256" in package_script
 assert "NODAVO_WINDOWS_AUTH_PACKAGE_FAMILY_NAME" in package_script
 assert "NODAVO_WINDOWS_AUTH_PUBLISHER" in package_script
 assert "windows-ui-auth=$mode" in package_script
+assert "Add-Type -TypeDefinition @'" in package_script
+assert "'@ -PassThru" in package_script
+assert "$winTrustType.GetMethod(" in package_script
+assert "[Nodavo.WindowsPackaging.WinTrust]::" not in package_script, (
+    "a helper type compiled inside a function must be invoked through its returned Type object"
+)
 for property_name in (
     "NodavoAgentServerAuthMode",
     "NodavoAgentServerAuthPackageNameBase64",

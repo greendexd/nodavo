@@ -23,6 +23,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$WinTrustErrorSuccess = 0
+$WinTrustCertificateUntrustedRoot = -2146762487 # CERT_E_UNTRUSTEDROOT (0x800B0109)
 
 function Fail([string] $Message) {
     throw "package-windows: $Message"
@@ -461,8 +463,9 @@ function ConvertTo-ChainAllowlist([string] $Value) {
 }
 
 function Get-WinTrustSignatureStatus([string] $Path, [bool] $HashOnly) {
-    if ($null -eq ('Nodavo.WindowsPackaging.WinTrust' -as [type])) {
-        Add-Type -TypeDefinition @'
+    $winTrustType = 'Nodavo.WindowsPackaging.WinTrust' -as [type]
+    if ($null -eq $winTrustType) {
+        $compiledTypes = @(Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
@@ -570,12 +573,22 @@ namespace Nodavo.WindowsPackaging
         }
     }
 }
-'@
+'@ -PassThru)
+        $winTrustType = $compiledTypes | Where-Object {
+            $_.FullName -ceq 'Nodavo.WindowsPackaging.WinTrust'
+        } | Select-Object -First 1
     }
-    return [Nodavo.WindowsPackaging.WinTrust]::VerifyEmbeddedSignature(
-        $Path,
-        $HashOnly
+    if ($null -eq $winTrustType) {
+        Fail "WinVerifyTrust helper type did not load"
+    }
+    $method = $winTrustType.GetMethod(
+        'VerifyEmbeddedSignature',
+        [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::Static
     )
+    if ($null -eq $method) {
+        Fail "WinVerifyTrust helper method did not load"
+    }
+    return [int] $method.Invoke($null, [object[]] @($Path, $HashOnly))
 }
 
 function Get-AppxSignedCms([string] $BundlePath) {
@@ -639,8 +652,7 @@ function Assert-DevelopmentSignature(
     # normal policy call must fail for one reason only: the freshly generated
     # self-signed root was intentionally not installed into a trust store.
     $trustStatus = Get-WinTrustSignatureStatus $BundlePath $false
-    if ($trustStatus -ne
-        [Nodavo.WindowsPackaging.WinTrust]::CertificateUntrustedRoot) {
+    if ($trustStatus -ne $WinTrustCertificateUntrustedRoot) {
         $statusHex = '0x{0:X8}' -f ($trustStatus -band 0xFFFFFFFFL)
         Fail "development Authenticode policy returned unexpected status: $statusHex"
     }
@@ -649,7 +661,7 @@ function Assert-DevelopmentSignature(
     # certificate-store trust. CMS verification below then proves that the
     # validated subject was signed by the exact generated certificate.
     $hashStatus = Get-WinTrustSignatureStatus $BundlePath $true
-    if ($hashStatus -ne [Nodavo.WindowsPackaging.WinTrust]::ErrorSuccess) {
+    if ($hashStatus -ne $WinTrustErrorSuccess) {
         $statusHex = '0x{0:X8}' -f ($hashStatus -band 0xFFFFFFFFL)
         Fail "development Authenticode hash verification failed: $statusHex"
     }
@@ -710,16 +722,16 @@ function Assert-AuthenticodeSignature(
     [bool] $IsDevelopment
 ) {
     $expectedTrustStatus = if ($IsDevelopment) {
-        [Nodavo.WindowsPackaging.WinTrust]::CertificateUntrustedRoot
+        $WinTrustCertificateUntrustedRoot
     }
     else {
-        [Nodavo.WindowsPackaging.WinTrust]::ErrorSuccess
+        $WinTrustErrorSuccess
     }
     if ((Get-WinTrustSignatureStatus $Path $false) -ne $expectedTrustStatus) {
         Fail "Windows executable Authenticode policy status does not match the selected package mode"
     }
     $hashStatus = Get-WinTrustSignatureStatus $Path $true
-    if ($hashStatus -ne [Nodavo.WindowsPackaging.WinTrust]::ErrorSuccess) {
+    if ($hashStatus -ne $WinTrustErrorSuccess) {
         Fail "Windows executable Authenticode subject-integrity verification failed"
     }
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
