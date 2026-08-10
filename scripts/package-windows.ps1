@@ -273,20 +273,213 @@ function Invoke-PersonalCertificateStoreDeltaCleanup([string[]] $BeforeThumbprin
     }
 }
 
+function Get-WinTrustSignatureStatus([string] $Path, [bool] $HashOnly) {
+    if ($null -eq ('Nodavo.WindowsPackaging.WinTrust' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace Nodavo.WindowsPackaging
+{
+    public static class WinTrust
+    {
+        public const int ErrorSuccess = 0;
+        public const int CertificateUntrustedRoot = unchecked((int)0x800B0109);
+
+        private const uint WtdUiNone = 2;
+        private const uint WtdRevokeNone = 0;
+        private const uint WtdChoiceFile = 1;
+        private const uint WtdStateActionIgnore = 0;
+        private const uint WtdRevocationCheckNone = 0x00000010;
+        private const uint WtdHashOnlyFlag = 0x00000200;
+        private const uint WtdCacheOnlyUrlRetrieval = 0x00001000;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WinTrustFileInfo
+        {
+            public uint cbStruct;
+            [MarshalAs(UnmanagedType.LPWStr)]
+            public string pcwszFilePath;
+            public IntPtr hFile;
+            public IntPtr pgKnownSubject;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WinTrustData
+        {
+            public uint cbStruct;
+            public IntPtr pPolicyCallbackData;
+            public IntPtr pSipClientData;
+            public uint dwUIChoice;
+            public uint fdwRevocationChecks;
+            public uint dwUnionChoice;
+            public IntPtr pFile;
+            public uint dwStateAction;
+            public IntPtr hWVTStateData;
+            public IntPtr pwszURLReference;
+            public uint dwProvFlags;
+            public uint dwUIContext;
+            public IntPtr pSignatureSettings;
+        }
+
+        [DllImport("wintrust.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+        private static extern int WinVerifyTrust(
+            IntPtr hwnd,
+            ref Guid actionId,
+            IntPtr trustData);
+
+        public static int VerifyEmbeddedSignature(string filePath, bool hashOnly)
+        {
+            var fileInfo = new WinTrustFileInfo
+            {
+                cbStruct = (uint)Marshal.SizeOf<WinTrustFileInfo>(),
+                pcwszFilePath = filePath,
+                hFile = IntPtr.Zero,
+                pgKnownSubject = IntPtr.Zero,
+            };
+            IntPtr fileInfoPointer = Marshal.AllocHGlobal(
+                Marshal.SizeOf<WinTrustFileInfo>());
+            IntPtr trustDataPointer = IntPtr.Zero;
+            bool fileInfoMarshaled = false;
+            try
+            {
+                Marshal.StructureToPtr(fileInfo, fileInfoPointer, false);
+                fileInfoMarshaled = true;
+                var trustData = new WinTrustData
+                {
+                    cbStruct = (uint)Marshal.SizeOf<WinTrustData>(),
+                    dwUIChoice = WtdUiNone,
+                    fdwRevocationChecks = WtdRevokeNone,
+                    dwUnionChoice = WtdChoiceFile,
+                    pFile = fileInfoPointer,
+                    dwStateAction = WtdStateActionIgnore,
+                    dwProvFlags = WtdRevocationCheckNone |
+                        WtdCacheOnlyUrlRetrieval |
+                        (hashOnly ? WtdHashOnlyFlag : 0),
+                };
+                trustDataPointer = Marshal.AllocHGlobal(
+                    Marshal.SizeOf<WinTrustData>());
+                Marshal.StructureToPtr(trustData, trustDataPointer, false);
+
+                var actionId = new Guid(
+                    "00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+                return WinVerifyTrust(
+                    new IntPtr(-1),
+                    ref actionId,
+                    trustDataPointer);
+            }
+            finally
+            {
+                if (trustDataPointer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(trustDataPointer);
+                }
+                if (fileInfoMarshaled)
+                {
+                    Marshal.DestroyStructure<WinTrustFileInfo>(fileInfoPointer);
+                }
+                Marshal.FreeHGlobal(fileInfoPointer);
+            }
+        }
+    }
+}
+'@
+    }
+    return [Nodavo.WindowsPackaging.WinTrust]::VerifyEmbeddedSignature(
+        $Path,
+        $HashOnly
+    )
+}
+
+function Get-AppxSignedCms([string] $BundlePath) {
+    Add-Type -AssemblyName System.Security.Cryptography.Pkcs
+    $archive = [IO.Compression.ZipFile]::OpenRead($BundlePath)
+    try {
+        $signatureEntries = @($archive.Entries | Where-Object {
+            $_.FullName -ieq 'AppxSignature.p7x'
+        })
+        if ($signatureEntries.Count -ne 1) {
+            Fail "development package must contain exactly one AppxSignature.p7x"
+        }
+
+        $stream = $signatureEntries[0].Open()
+        try {
+            $buffer = [IO.MemoryStream]::new()
+            try {
+                $stream.CopyTo($buffer)
+                $signatureBytes = $buffer.ToArray()
+            }
+            finally {
+                $buffer.Dispose()
+            }
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    if ($signatureBytes.Length -le 4 -or
+        $signatureBytes[0] -ne 0x50 -or
+        $signatureBytes[1] -ne 0x4B -or
+        $signatureBytes[2] -ne 0x43 -or
+        $signatureBytes[3] -ne 0x58) {
+        Fail "development AppxSignature.p7x has an invalid PKCX header"
+    }
+    $cmsBytes = [byte[]]::new($signatureBytes.Length - 4)
+    [Array]::Copy($signatureBytes, 4, $cmsBytes, 0, $cmsBytes.Length)
+    $cms = [Security.Cryptography.Pkcs.SignedCms]::new()
+    try {
+        $cms.Decode($cmsBytes)
+        if ($cms.Detached) {
+            Fail "development package signature must not be detached"
+        }
+        $cms.CheckSignature($true)
+    }
+    catch {
+        Fail "development PKCS#7 signature verification failed: $($_.Exception.Message)"
+    }
+    return $cms
+}
+
 function Assert-DevelopmentSignature(
     [string] $BundlePath,
     [Security.Cryptography.X509Certificates.X509Certificate2] $ExpectedCertificate
 ) {
-    $signature = Get-AuthenticodeSignature -LiteralPath $BundlePath
-    if ($signature.Status -notin @(
-        [System.Management.Automation.SignatureStatus]::Valid,
-        [System.Management.Automation.SignatureStatus]::NotTrusted
-    )) {
-        Fail "development Authenticode integrity verification failed: $($signature.Status)"
+    # WinVerifyTrust's Authenticode provider validates the package subject. The
+    # normal policy call must fail for one reason only: the freshly generated
+    # self-signed root was intentionally not installed into a trust store.
+    $trustStatus = Get-WinTrustSignatureStatus $BundlePath $false
+    if ($trustStatus -ne
+        [Nodavo.WindowsPackaging.WinTrust]::CertificateUntrustedRoot) {
+        $statusHex = '0x{0:X8}' -f ($trustStatus -band 0xFFFFFFFFL)
+        Fail "development Authenticode policy returned unexpected status: $statusHex"
     }
-    if ($null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne $ExpectedCertificate.Thumbprint) {
-        Fail "development package signer does not match the generated certificate"
+
+    # WTD_HASH_ONLY_FLAG separates subject-integrity validation from Windows
+    # certificate-store trust. CMS verification below then proves that the
+    # validated subject was signed by the exact generated certificate.
+    $hashStatus = Get-WinTrustSignatureStatus $BundlePath $true
+    if ($hashStatus -ne [Nodavo.WindowsPackaging.WinTrust]::ErrorSuccess) {
+        $statusHex = '0x{0:X8}' -f ($hashStatus -band 0xFFFFFFFFL)
+        Fail "development Authenticode hash verification failed: $statusHex"
+    }
+
+    $cms = Get-AppxSignedCms $BundlePath
+    if ($cms.SignerInfos.Count -ne 1) {
+        Fail "development package must contain exactly one PKCS#7 signer"
+    }
+    $signer = $cms.SignerInfos[0]
+    if ($signer.CounterSignerInfos.Count -ne 0) {
+        Fail "development package must not contain a countersignature"
+    }
+    $signerCertificate = $signer.Certificate
+    if ($null -eq $signerCertificate -or
+        [Convert]::ToHexString($signerCertificate.RawData) -cne
+            [Convert]::ToHexString($ExpectedCertificate.RawData)) {
+        Fail "development package signer is not the exact generated certificate"
     }
 
     $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
@@ -301,7 +494,7 @@ function Assert-DevelopmentSignature(
             [Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3')
         ) | Out-Null
         $chain.ChainPolicy.CustomTrustStore.Add($ExpectedCertificate) | Out-Null
-        if (-not $chain.Build($signature.SignerCertificate)) {
+        if (-not $chain.Build($signerCertificate)) {
             $statuses = @($chain.ChainStatus |
                 ForEach-Object { [string] $_.Status } |
                 Sort-Object -Unique)
@@ -314,8 +507,8 @@ function Assert-DevelopmentSignature(
             Fail "development signer failed custom-root validation: $statusText"
         }
         if ($chain.ChainElements.Count -ne 1 -or
-            $chain.ChainElements[0].Certificate.Thumbprint -cne
-                $ExpectedCertificate.Thumbprint) {
+            [Convert]::ToHexString($chain.ChainElements[0].Certificate.RawData) -cne
+                [Convert]::ToHexString($ExpectedCertificate.RawData)) {
             Fail "development signer chain is not the exact generated self-signed certificate"
         }
     }
@@ -766,9 +959,9 @@ try {
             '/s', 'My', $bundlePath
         )
 
-        # Verify the package hash/signature through PowerShell's Authenticode
-        # provider, then validate the exact signer in an in-memory custom-root
-        # chain. Development CI never mutates TrustedPeople or Root stores.
+        # Verify the package hash through WinVerifyTrust, then verify and bind
+        # the PKCS#7 signer to an in-memory custom-root chain. Development CI
+        # never mutates TrustedPeople or Root stores.
         Assert-DevelopmentSignature $bundlePath $developmentCertificate
 
         Copy-Item -LiteralPath $developmentWarningPath -Destination $artifactRoot
