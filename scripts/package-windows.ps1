@@ -566,6 +566,7 @@ foreach ($value in @($publisher, $publisherDisplayName, $displayName, $descripti
 $cargo = Get-RequiredCommand 'cargo.exe'
 $rustup = Get-RequiredCommand 'rustup.exe'
 $dotnet = Get-RequiredCommand 'dotnet.exe'
+$certUtil = Get-RequiredCommand 'certutil.exe'
 $makeAppx = Find-WindowsSdkTool 'makeappx.exe'
 $signTool = Find-WindowsSdkTool 'signtool.exe'
 
@@ -733,9 +734,12 @@ try {
         # verification fail closed instead of ignoring SignTool's exit code.
         $developmentRootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
         if (-not (Test-Path -LiteralPath $developmentRootPath)) {
-            Import-Certificate `
-                -FilePath $certificatePath `
-                -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+            # Import-Certificate can invoke Windows' interactive root-trust
+            # confirmation on a headless runner. certutil's forced user-store
+            # operation is non-interactive and its exit code remains enforced.
+            Invoke-Native $certUtil @(
+                '-user', '-f', '-addstore', 'Root', $certificatePath
+            )
             $developmentRootWasImported = $true
         }
         Invoke-Native $signTool @('verify', '/pa', '/all', '/v', $bundlePath)
@@ -867,7 +871,9 @@ finally {
     if ($developmentRootWasImported -and $null -ne $developmentCertificate) {
         $rootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
         try {
-            Remove-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            Invoke-Native $certUtil @(
+                '-user', '-f', '-delstore', 'Root', $developmentCertificate.Thumbprint
+            )
             if (Test-Path -LiteralPath $rootPath) {
                 throw 'certificate remains in CurrentUser/Root'
             }
