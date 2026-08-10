@@ -273,49 +273,54 @@ function Invoke-PersonalCertificateStoreDeltaCleanup([string[]] $BeforeThumbprin
     }
 }
 
-function Add-PublicCertificateToCurrentUserStore(
-    [string] $StoreName,
-    [string] $CertificatePath
+function Assert-DevelopmentSignature(
+    [string] $BundlePath,
+    [Security.Cryptography.X509Certificates.X509Certificate2] $ExpectedCertificate
 ) {
-    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
-        $CertificatePath
-    )
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
-        $StoreName,
-        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-    )
-    try {
-        if ($certificate.HasPrivateKey) {
-            Fail "development trust store input unexpectedly contains a private key"
-        }
-        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-        $store.Add($certificate)
+    $signature = Get-AuthenticodeSignature -LiteralPath $BundlePath
+    if ($signature.Status -notin @(
+        [System.Management.Automation.SignatureStatus]::Valid,
+        [System.Management.Automation.SignatureStatus]::NotTrusted
+    )) {
+        Fail "development Authenticode integrity verification failed: $($signature.Status)"
     }
-    finally {
-        $store.Dispose()
-        $certificate.Dispose()
+    if ($null -eq $signature.SignerCertificate -or
+        $signature.SignerCertificate.Thumbprint -cne $ExpectedCertificate.Thumbprint) {
+        Fail "development package signer does not match the generated certificate"
     }
-}
 
-function Remove-CertificateFromCurrentUserStore(
-    [string] $StoreName,
-    [string] $Thumbprint
-) {
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
-        $StoreName,
-        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-    )
+    $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
     try {
-        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
-        $matches = @($store.Certificates | Where-Object {
-            $_.Thumbprint -ceq $Thumbprint
-        })
-        foreach ($certificate in $matches) {
-            $store.Remove($certificate)
+        $chain.ChainPolicy.RevocationMode =
+            [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $chain.ChainPolicy.VerificationFlags =
+            [Security.Cryptography.X509Certificates.X509VerificationFlags]::NoFlag
+        $chain.ChainPolicy.TrustMode =
+            [Security.Cryptography.X509Certificates.X509ChainTrustMode]::CustomRootTrust
+        $chain.ChainPolicy.ApplicationPolicy.Add(
+            [Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3')
+        ) | Out-Null
+        $chain.ChainPolicy.CustomTrustStore.Add($ExpectedCertificate) | Out-Null
+        if (-not $chain.Build($signature.SignerCertificate)) {
+            $statuses = @($chain.ChainStatus |
+                ForEach-Object { [string] $_.Status } |
+                Sort-Object -Unique)
+            $statusText = if ($statuses.Count -eq 0) {
+                'unknown chain error'
+            }
+            else {
+                $statuses -join ', '
+            }
+            Fail "development signer failed custom-root validation: $statusText"
+        }
+        if ($chain.ChainElements.Count -ne 1 -or
+            $chain.ChainElements[0].Certificate.Thumbprint -cne
+                $ExpectedCertificate.Thumbprint) {
+            Fail "development signer chain is not the exact generated self-signed certificate"
         }
     }
     finally {
-        $store.Dispose()
+        $chain.Dispose()
     }
 }
 
@@ -529,8 +534,6 @@ $releaseCertificate = $null
 $releasePersonalStoreSnapshot = @()
 $releasePersonalStoreSnapshotTaken = $false
 $developmentCertificate = $null
-$developmentTrustedPeopleWasImported = $false
-$developmentRootWasImported = $false
 $packagingCompleted = $false
 
 if ($Development) {
@@ -763,29 +766,10 @@ try {
             '/s', 'My', $bundlePath
         )
 
-        $trustedPeoplePath = "Cert:\CurrentUser\TrustedPeople\$($developmentCertificate.Thumbprint)"
-        if (-not (Test-Path -LiteralPath $trustedPeoplePath)) {
-            Import-Certificate `
-                -FilePath $certificatePath `
-                -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
-            $developmentTrustedPeopleWasImported = $true
-        }
-        # SignTool's Authenticode policy still requires a trusted chain anchor
-        # when validating a self-signed development package. Trust the
-        # freshly-created certificate only for this isolated verification and
-        # remove it unconditionally in the finally block below. TrustedPeople
-        # remains necessary for the exported certificate's documented local
-        # installation flow; Root is used only to make the cryptographic CI
-        # verification fail closed instead of ignoring SignTool's exit code.
-        $developmentRootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
-        if (-not (Test-Path -LiteralPath $developmentRootPath)) {
-            # Add only the exported public certificate through the direct .NET
-            # store API. Import-Certificate/certutil can enter interactive or
-            # online root-store flows on a headless runner.
-            Add-PublicCertificateToCurrentUserStore 'Root' $certificatePath
-            $developmentRootWasImported = $true
-        }
-        Invoke-Native $signTool @('verify', '/pa', '/all', '/v', $bundlePath)
+        # Verify the package hash/signature through PowerShell's Authenticode
+        # provider, then validate the exact signer in an in-memory custom-root
+        # chain. Development CI never mutates TrustedPeople or Root stores.
+        Assert-DevelopmentSignature $bundlePath $developmentCertificate
 
         Copy-Item -LiteralPath $developmentWarningPath -Destination $artifactRoot
         Copy-Item -LiteralPath $developmentWarningRuPath -Destination $artifactRoot
@@ -896,33 +880,6 @@ finally {
         }
         catch {
             $releaseStoreCleanupError = $_
-        }
-    }
-    if ($developmentTrustedPeopleWasImported -and $null -ne $developmentCertificate) {
-        $trustedPeoplePath =
-            "Cert:\CurrentUser\TrustedPeople\$($developmentCertificate.Thumbprint)"
-        try {
-            Remove-Item -LiteralPath $trustedPeoplePath -Force -ErrorAction Stop
-            if (Test-Path -LiteralPath $trustedPeoplePath) {
-                throw 'certificate remains in CurrentUser/TrustedPeople'
-            }
-        }
-        catch {
-            $developmentStoreCleanupError = $_
-        }
-    }
-    if ($developmentRootWasImported -and $null -ne $developmentCertificate) {
-        $rootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
-        try {
-            Remove-CertificateFromCurrentUserStore `
-                'Root' `
-                $developmentCertificate.Thumbprint
-            if (Test-Path -LiteralPath $rootPath) {
-                throw 'certificate remains in CurrentUser/Root'
-            }
-        }
-        catch {
-            $developmentStoreCleanupError = $_
         }
     }
     if ($null -ne $developmentCertificate) {
