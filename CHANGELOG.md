@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 9 -->
+<!-- doc-id: changelog; lang: en; revision: 10 -->
 
 # Changelog
 
@@ -27,9 +27,12 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 - End-to-end bounded clipboard channels: text/HTML/PNG/clear on macOS and Windows, plus a strict canonical BMP/DIB subset on Windows.
 - Production-default macOS Keychain storage with an explicit insecure-development file fallback, and a universal development app/DMG plus fail-closed Developer ID/notarization packaging path.
 - Capability-rooted outbound file scanning and streaming with no-follow traversal, deterministic manifests, BLAKE3, mutation detection, resume evidence, and safe receiver staging.
+- Directional persisted grant epochs, bounded trusted-device listing, transactional post-pair capability updates, peer-scoped revocation cleanup, and native trusted-device/file-selection UX on macOS and Windows.
+- Authenticated bounded file channels with background workers, cooperative scan cancellation, same-process link-loss resume, completion ordering, process-wide staging leases, Windows birth-time owner-only DACLs, and conservative no-overwrite publication.
+- A fail-closed x64+ARM64 Windows development MSIXBundle pipeline, plus a signed-update state-machine core with bounded staging, consent, rollback-floor, and restart/health contracts.
 
 ### Not yet available
 
-- A usable or released macOS ↔ Windows application. Input/focus/clipboard are joined in the pre-alpha agent, but real two-machine runtime qualification and file peer-channel/UI integration remain.
-- Proven Windows agent/WinUI runtime behavior; release signing, updater installation, trusted-device/grant UX, hot-plug layout UX, file orchestration, and Windows ARM64 validation are also missing.
+- A usable or released macOS ↔ Windows application. Input/focus/clipboard/files are joined in the pre-alpha agent and native UX source exists, but real two-machine runtime qualification remains.
+- Proven Windows agent/WinUI runtime behavior; release signing, updater installation, hot-plug layout UX, detailed transfer progress/destinations, durable restart ownership journals, and Windows ARM64 execution are also missing.
 - Full security, fuzz, stress, compatibility, upgrade, accessibility, and real-device test matrices; these remain release gates for feature-complete 1.0.

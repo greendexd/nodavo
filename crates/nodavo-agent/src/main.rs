@@ -9,6 +9,8 @@ mod runtime;
 mod session_runtime;
 mod storage;
 mod topology_runtime;
+mod transfer_runtime;
+mod transfer_worker;
 #[cfg(target_os = "windows")]
 mod windows;
 mod wire;
@@ -164,6 +166,19 @@ fn requested_grants(capabilities: &[CapabilityName]) -> CapabilityGrants {
         })
 }
 
+const fn trusted_capability(capability: CapabilityName) -> TrustedCapability {
+    match capability {
+        CapabilityName::Input => TrustedCapability::RemoteInput,
+        CapabilityName::ClipboardRead => TrustedCapability::ClipboardRead,
+        CapabilityName::ClipboardWrite => TrustedCapability::ClipboardWrite,
+        CapabilityName::Files => TrustedCapability::FileTransfer,
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive local IPC command dispatcher keeps authority routing auditable"
+)]
 async fn serve_connection<S>(
     mut stream: S,
     runtime: Arc<AgentRuntime>,
@@ -181,6 +196,9 @@ where
 
         let event = match command {
             UiCommand::GetStatus => AgentEvent::Status(runtime.status().await),
+            UiCommand::ListTrustedPeers => AgentEvent::TrustedPeers {
+                peers: runtime.trusted_peers().await,
+            },
             UiCommand::BeginPairing {
                 endpoint,
                 capabilities,
@@ -217,12 +235,29 @@ where
                 },
                 Err(error) => agent_error_event(&error),
             },
-            UiCommand::SetCapability { .. } => AgentEvent::Error {
-                code: "not_available".to_owned(),
-                message: "capability changes require a signed peer update protocol".to_owned(),
+            UiCommand::SetCapability {
+                peer_id,
+                capability,
+                enabled,
+            } => match runtime
+                .set_capability(&peer_id, trusted_capability(capability), enabled)
+                .await
+            {
+                Ok(()) => AgentEvent::CapabilityChanged {
+                    peer_id,
+                    capability,
+                    enabled,
+                },
+                Err(error) => agent_error_event(&error),
             },
             UiCommand::RevokePeer { peer_id } => match runtime.revoke_peer(&peer_id).await {
                 Ok(()) => AgentEvent::Status(runtime.status().await),
+                Err(error) => agent_error_event(&error),
+            },
+            UiCommand::SendFiles { paths } => match runtime.send_files(paths).await {
+                Ok(transfer) => AgentEvent::TransferQueued {
+                    transfer_id: transfer.as_uuid().to_string(),
+                },
                 Err(error) => agent_error_event(&error),
             },
             UiCommand::RequestRemoteFocus { ttl_ms } => {
@@ -325,10 +360,12 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::AlreadyConfirmed => "already_confirmed",
         AgentError::PeerNotFound => "peer_not_found",
         AgentError::Storage => "storage_unavailable",
+        AgentError::GrantEpochExhausted => "grant_epoch_exhausted",
         AgentError::PairingFailed => "pairing_failed",
         AgentError::NotConnected => "not_connected",
         AgentError::FocusRejected => "focus_rejected",
         AgentError::SafetyRecoveryFailed => "safety_recovery_failed",
+        AgentError::TransferFailed => "transfer_failed",
     };
     AgentEvent::Error {
         code: code.to_owned(),

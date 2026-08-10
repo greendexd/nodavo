@@ -1,4 +1,4 @@
-<!-- doc-id: peer-protocol; lang: en; revision: 5 -->
+<!-- doc-id: peer-protocol; lang: en; revision: 7 -->
 
 # Nodavo peer protocol
 
@@ -36,7 +36,7 @@ Control and semantic input messages use a numeric-keyed canonical CBOR map:
 | `2` | `critical` | Whether an unknown receiver must reject the message |
 | `3` | `payload` | CBOR bytes for the tagged body |
 
-Decoders enforce the channel-specific size limit before decoding, require the envelope and body to re-encode identically, reject unknown critical tags, and preserve bounded unknown non-critical messages as opaque data. Version `0.x` is invalid. The current peer-message codec accepts exactly pre-alpha version `1.3`; the minor version changed for reliable pointer entry and relative motion and does not change the separate pairing-preflight version. It also does not mean the product itself is released as 1.0.
+Decoders enforce the channel-specific size limit before decoding, require the envelope and body to re-encode identically, reject unknown critical tags, and preserve bounded unknown non-critical messages as opaque data. Version `0.x` is invalid. The current peer-message codec accepts exactly pre-alpha version `1.4`; the minor version changed for directional grant epochs and authenticated post-pair capability updates and does not change the separate pairing-preflight version. It also does not mean the product itself is released as 1.0.
 
 ## Current tags
 
@@ -69,15 +69,15 @@ Every input event carries:
 - a random session identifier;
 - the authenticated origin device identifier;
 - a monotonically checked sequence in its control, reliable-input, or replaceable-input lane;
-- the current grant epoch;
+- the receiver-issued local grant epoch currently authorizing the sender;
 - exactly the remote-input capability;
 - the nonzero identifier of the focus lease authorizing the event, including forced release-all.
 
-Focus leases have a nonzero lease identifier and a bounded time-to-live. A request states whether a reliable pointer entry is required. When required, the controller does not enable native suppression or send relative motion until the receiver has installed the reliable entry position and returned a session-bound acknowledgement. A receiver validates the complete event, active lease, direction-specific grant, entry gate, and lane watermark before committing a new sequence. It rejects stale grants, stale sequences, wrong origins, wrong sessions, malformed zero identifiers, or events without the required grant. A normal authenticated focus release clears pressed state and returns focus to local ownership while the session remains ready. Emergency stop, lock, sleep, link loss, grant invalidation, and lease expiry synchronously clear the lease, entry gate, and pressed-state model and close the session before input routing can resume.
+Focus leases have a nonzero lease identifier and a bounded time-to-live. A request states whether a reliable pointer entry is required. When required, the controller does not enable native suppression or send relative motion until the receiver has installed the reliable entry position and returned a session-bound acknowledgement. A receiver validates the complete event, active lease, direction-specific grant, entry gate, and lane watermark before committing a new sequence. It rejects stale grants, stale sequences, wrong origins, wrong sessions, malformed zero identifiers, or events without the required grant. A normal authenticated focus release clears pressed state and returns focus to local ownership while the session remains ready. Emergency stop, lock, sleep, link loss, and lease expiry synchronously clear the lease, entry gate, and pressed-state model and close the session before input routing can resume. An accepted grant-epoch transition releases the active lease, aborts or suspends affected content work, and closes the old session so a fresh mutually authenticated connection must negotiate the new policy before routing resumes.
 
 Display topology is a critical, bounded control message with its own schema version, nonzero revision, at most 32 displays, bounded pixel geometry, and bounded scale/origin values. It shares the authenticated control replay lane. A sender assigns opaque display identifiers for the current session; platform-native display identifiers never cross the connection. A snapshot becomes routable only after reducer authorization and an exact-revision acknowledgement. The normal focus reducer rejects a focus request until the topology needed for that direction is installed or acknowledged.
 
-Capabilities are explicit and separately represented for remote input, clipboard read, clipboard write, and file transfer. The local grant authorizing peer input is tracked independently from the peer grant authorizing outbound local input. Clipboard requests require exactly the read capability; offers, clear operations, and content chunks require exactly the write capability. File manifests, resume/cancel/complete control, and data chunks require exactly file transfer. A transport connection alone never grants a capability.
+Capabilities are explicit and separately represented for remote input, clipboard read, clipboard write, and file transfer. Each endpoint maintains two independent values: its persisted local grant and epoch, which validate inbound messages, and the authenticated peer grant and epoch, which are cited by outbound metadata. Reconnect negotiation exchanges each side's complete capability set and nonzero epoch. A post-pair change is an ordered reliable `CapabilityGrant` or `CapabilityRevoke` targeted to the recipient device, carries exactly one changed capability, and must advance the sender's epoch by exactly one; a replay, gap, wrong target, or redundant delta fails closed. The receiver updates only its peer-grant view. Clipboard requests require exactly the read capability; offers, clear operations, and content chunks require exactly the write capability. File manifests, resume/cancel/complete control, and data chunks require exactly file transfer. A transport connection alone never grants a capability.
 
 ## Input semantics
 

@@ -1,5 +1,6 @@
 //! Symmetric authenticated peer-session orchestration over one transport connection.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -17,6 +18,7 @@ use nodavo_session::{
     DisconnectReason, Effect, Event, FocusState as CoreFocusState, LeaseId, LinkState,
     MonotonicMillis, SessionCore,
 };
+use nodavo_transfer::{FileSystemStagingArea, TransferError, TransferId};
 use nodavo_transport::{
     ChannelDirection, ChannelId, ChannelKind, CloseReason, DatagramAvailability, PeerConnection,
     TransportCommand, TransportError, TransportEvent,
@@ -33,6 +35,10 @@ use crate::input_wire::{
 use crate::native_bridge::{NativeInputReceiver, PlatformSafetyEvent, PlatformSafetyReceiver};
 use crate::platform_port::{PlatformPort, PlatformPortError};
 use crate::topology_runtime::{LocalPointerAction, PeerTopologyState};
+use crate::transfer_runtime::{PeerTransferConfig, PeerTransferRuntime, TransferRuntimeError};
+use crate::transfer_worker::{
+    TransferStopMode, TransferStore, TransferWorker, TransferWorkerEvent,
+};
 
 const SESSION_COMMAND_CAPACITY: usize = 32;
 const MIN_LEASE_TTL_MS: u32 = 1_000;
@@ -40,12 +46,17 @@ const MAX_LEASE_TTL_MS: u32 = 30_000;
 const DEFAULT_LEASE_TTL_MS: u32 = 5_000;
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_TOPOLOGY_TIMEOUT: Duration = Duration::from_secs(5);
-const GRANT_EPOCH: GrantEpoch = GrantEpoch::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionRole {
     Opener,
     Acceptor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PeerGrantState {
+    capabilities: Capability,
+    epoch: GrantEpoch,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,7 +65,9 @@ pub(crate) struct SessionConfig {
     pub(crate) local_device: DeviceId,
     pub(crate) peer_device: DeviceId,
     pub(crate) local_grants_to_peer: CapabilityGrants,
+    pub(crate) local_grant_epoch: GrantEpoch,
     pub(crate) peer_grants_to_local: Option<CapabilityGrants>,
+    pub(crate) peer_grant_epoch: Option<GrantEpoch>,
     pub(crate) existing_control: Option<ChannelId>,
 }
 
@@ -95,6 +108,26 @@ impl From<ClipboardRuntimeError> for SessionRuntimeError {
     }
 }
 
+impl From<TransferRuntimeError> for SessionRuntimeError {
+    fn from(error: TransferRuntimeError) -> Self {
+        match error {
+            TransferRuntimeError::Transfer(
+                TransferError::Platform
+                | TransferError::DestinationExists
+                | TransferError::IntegrityMismatch,
+            )
+            | TransferRuntimeError::ResumeDurabilityUnsupported => Self::Platform,
+            TransferRuntimeError::Protocol
+            | TransferRuntimeError::Authentication
+            | TransferRuntimeError::GrantDenied
+            | TransferRuntimeError::Replay
+            | TransferRuntimeError::Backpressure
+            | TransferRuntimeError::SequenceExhausted
+            | TransferRuntimeError::Transfer(_) => Self::ProtocolViolation,
+        }
+    }
+}
+
 pub(crate) enum LocalSessionCommand {
     RequestFocus {
         ttl_ms: u32,
@@ -112,6 +145,17 @@ pub(crate) enum LocalSessionCommand {
     LocalSleeping {
         acknowledgement: oneshot::Sender<Result<(), SessionRuntimeError>>,
     },
+    UpdateLocalGrant {
+        grants: CapabilityGrants,
+        epoch: GrantEpoch,
+        capability: Capability,
+        enabled: bool,
+        acknowledgement: oneshot::Sender<Result<(), SessionRuntimeError>>,
+    },
+    SendFiles {
+        paths: Vec<PathBuf>,
+        acknowledgement: oneshot::Sender<Result<TransferId, TransferError>>,
+    },
     LocalInput(InputEvent),
 }
 
@@ -126,6 +170,8 @@ pub(crate) struct NativeSessionEvents {
     pub(crate) input: NativeInputReceiver,
     pub(crate) safety: PlatformSafetyReceiver,
     pub(crate) clipboard: Box<dyn ClipboardPort>,
+    pub(crate) transfer: FileSystemStagingArea,
+    pub(crate) transfer_store: TransferStore,
 }
 
 struct Channels {
@@ -133,6 +179,8 @@ struct Channels {
     reliable_input: ChannelId,
     pointer_fallback: Option<ChannelId>,
     clipboard: ChannelId,
+    file_manifest: ChannelId,
+    file_data: ChannelId,
     datagrams: DatagramAvailability,
 }
 
@@ -152,6 +200,10 @@ struct PeerSession<'a> {
     routing_to_peer: bool,
     topology: PeerTopologyState,
     clipboard: PeerClipboardRuntime,
+    transfer: TransferWorker,
+    local_grant_epoch: GrantEpoch,
+    peer_grant_epoch: GrantEpoch,
+    peer_capabilities: Capability,
 }
 
 pub(crate) async fn run_peer_session(
@@ -164,16 +216,22 @@ pub(crate) async fn run_peer_session(
     platform: &mut dyn PlatformPort,
 ) -> Result<(), SessionRuntimeError> {
     let channels = establish_channels(connection.as_mut(), &config).await?;
-    let (session_id, peer_grants) =
+    let (session_id, peer_grant) =
         negotiate_session(connection.as_mut(), &config, &channels).await?;
     let clipboard = PeerClipboardRuntime::new(
         config.local_device,
         config.peer_device,
         session_id,
-        GRANT_EPOCH,
+        config.local_grant_epoch,
+        peer_grant.epoch,
         clipboard_grants(config.local_grants_to_peer),
-        peer_grants,
+        peer_grant.capabilities,
         native_events.clipboard,
+    );
+    let transfer = TransferWorker::start(
+        config.peer_device,
+        new_transfer_runtime(&config, session_id, peer_grant, native_events.transfer),
+        native_events.transfer_store,
     );
     let mut core = SessionCore::default();
     let _ = core.handle(Event::ConnectStarted);
@@ -182,9 +240,10 @@ pub(crate) async fn run_peer_session(
     let effects = core.handle(Event::SessionEstablished {
         session_id,
         peer_id: config.peer_device,
-        grant_epoch: GRANT_EPOCH,
+        local_grant_epoch: config.local_grant_epoch,
+        peer_grant_epoch: peer_grant.epoch,
         local_grant_allows_peer_input: allows_input(config.local_grants_to_peer),
-        peer_grant_allows_local_input: peer_grants.contains(Capability::REMOTE_INPUT),
+        peer_grant_allows_local_input: peer_grant.capabilities.contains(Capability::REMOTE_INPUT),
     });
     if !effects.is_empty() {
         return Err(SessionRuntimeError::ProtocolViolation);
@@ -207,6 +266,10 @@ pub(crate) async fn run_peer_session(
         topology: PeerTopologyState::from_environment()
             .map_err(|_| SessionRuntimeError::Platform)?,
         clipboard,
+        transfer,
+        local_grant_epoch: config.local_grant_epoch,
+        peer_grant_epoch: peer_grant.epoch,
+        peer_capabilities: peer_grant.capabilities,
     };
     if session.platform.start_capture().is_err() {
         if session
@@ -249,6 +312,28 @@ pub(crate) async fn run_peer_session(
     result
 }
 
+fn new_transfer_runtime(
+    config: &SessionConfig,
+    session_id: SessionId,
+    peer_grant: PeerGrantState,
+    staging: FileSystemStagingArea,
+) -> PeerTransferRuntime<FileSystemStagingArea> {
+    PeerTransferRuntime::new(
+        PeerTransferConfig {
+            local_device: config.local_device,
+            peer_device: config.peer_device,
+            session_id,
+            local_grant_epoch: config.local_grant_epoch,
+            peer_grant_epoch: peer_grant.epoch,
+            local_allows_peer_transfer: config
+                .local_grants_to_peer
+                .contains(TrustedCapability::FileTransfer),
+            peer_capabilities: peer_grant.capabilities,
+        },
+        staging,
+    )
+}
+
 impl PeerSession<'_> {
     async fn event_loop(
         &mut self,
@@ -285,6 +370,13 @@ impl PeerSession<'_> {
                     if self.handle_local_command(command).await? {
                         return Ok(());
                     }
+                }
+                event = self.transfer.next_event() => {
+                    let Some(event) = event else {
+                        self.force_recovery(Event::LocalEmergencyStop).await?;
+                        return Err(SessionRuntimeError::Platform);
+                    };
+                    self.handle_transfer_worker_event(event).await?;
                 }
                 event = self.connection.next_event() => {
                     let event = match event {
@@ -373,6 +465,34 @@ impl PeerSession<'_> {
                     Ok(true)
                 };
             }
+            LocalSessionCommand::UpdateLocalGrant {
+                grants,
+                epoch,
+                capability,
+                enabled,
+                acknowledgement,
+            } => {
+                let result = self
+                    .handle_local_grant_update(grants, epoch, capability, enabled)
+                    .await;
+                let failed = result.is_err();
+                let _ = acknowledgement.send(result);
+                if failed {
+                    return Ok(false);
+                }
+                self.update_status().await;
+                return Ok(true);
+            }
+            LocalSessionCommand::SendFiles {
+                paths,
+                acknowledgement,
+            } => {
+                if !self.peer_capabilities.contains(Capability::FILE_TRANSFER) || paths.is_empty() {
+                    let _ = acknowledgement.send(Err(TransferError::Cancelled));
+                } else {
+                    self.transfer.try_start_outbound(paths, acknowledgement);
+                }
+            }
             LocalSessionCommand::LocalInput(event) => {
                 self.handle_local_input(event).await?;
             }
@@ -388,6 +508,7 @@ impl PeerSession<'_> {
         }
         let clipboard_messages = self.clipboard.poll()?;
         self.send_clipboard_messages(clipboard_messages).await?;
+        self.transfer.try_pump()?;
         let now = self.now();
         if let CoreFocusState::ControllingRemote {
             lease_id,
@@ -447,20 +568,39 @@ impl PeerSession<'_> {
                 self.send_clipboard_messages(outbound).await?;
                 false
             }
+            TransportEvent::ReliableData {
+                channel, payload, ..
+            } if channel == self.channels.file_manifest => {
+                self.transfer.try_receive_manifest(payload.to_vec())?;
+                false
+            }
+            TransportEvent::ReliableData {
+                channel, payload, ..
+            } if channel == self.channels.file_data => {
+                self.transfer.try_receive_data(payload.to_vec())?;
+                false
+            }
             TransportEvent::Datagram { payload } => {
                 let message = decode_datagram(&payload)
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
                 self.handle_input(message).await?;
                 false
             }
-            TransportEvent::Closed(_) => {
-                self.force_recovery(Event::LinkDisconnected).await?;
+            TransportEvent::Closed(reason) => {
+                let event = if reason == CloseReason::EmergencyDisconnect {
+                    Event::LocalEmergencyStop
+                } else {
+                    Event::LinkDisconnected
+                };
+                self.force_recovery(event).await?;
                 true
             }
             TransportEvent::ChannelClosed { channel }
                 if channel == self.channels.control
                     || channel == self.channels.reliable_input
-                    || channel == self.channels.clipboard =>
+                    || channel == self.channels.clipboard
+                    || channel == self.channels.file_manifest
+                    || channel == self.channels.file_data =>
             {
                 self.force_recovery(Event::LinkDisconnected).await?;
                 true
@@ -479,6 +619,24 @@ impl PeerSession<'_> {
             return Err(SessionRuntimeError::ProtocolViolation);
         };
         let (effects, disconnect) = match control {
+            ControlMessage::CapabilityGrant {
+                peer,
+                capabilities,
+                epoch,
+            } => {
+                self.handle_peer_grant_update(peer, capabilities, epoch, true)
+                    .await?;
+                (Vec::new(), true)
+            }
+            ControlMessage::CapabilityRevoke {
+                peer,
+                capabilities,
+                epoch,
+            } => {
+                self.handle_peer_grant_update(peer, capabilities, epoch, false)
+                    .await?;
+                (Vec::new(), true)
+            }
             ControlMessage::FocusLeaseRequest {
                 meta,
                 lease_id,
@@ -582,11 +740,11 @@ impl PeerSession<'_> {
                 (Vec::new(), false)
             }
             ControlMessage::Pong { .. } | ControlMessage::Error { .. } => (Vec::new(), false),
-            ControlMessage::SessionClose { session_id, .. }
-            | ControlMessage::EmergencyDisconnect { session_id }
-                if session_id == self.session_id =>
-            {
-                (self.core.handle(Event::LinkDisconnected), true)
+            ControlMessage::SessionClose { session_id, .. } if session_id == self.session_id => {
+                (self.core.handle(Event::ReconnectRequested), true)
+            }
+            ControlMessage::EmergencyDisconnect { session_id } if session_id == self.session_id => {
+                (self.core.handle(Event::LocalEmergencyStop), true)
             }
             _ => return Err(SessionRuntimeError::ProtocolViolation),
         };
@@ -779,7 +937,14 @@ impl PeerSession<'_> {
                         .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
                 }
                 Effect::ArmFocusLease { .. } | Effect::CancelFocusLease => {}
-                Effect::AbortContentOperations => self.clipboard.disconnect(),
+                Effect::SuspendContentOperations => {
+                    self.clipboard.disconnect();
+                    self.transfer.stop(TransferStopMode::Suspend);
+                }
+                Effect::AbortContentOperations => {
+                    self.clipboard.disconnect();
+                    self.transfer.stop(TransferStopMode::AbortAll);
+                }
                 Effect::Rejected { .. } => return Err(SessionRuntimeError::ProtocolViolation),
             }
         }
@@ -886,6 +1051,97 @@ impl PeerSession<'_> {
         self.apply_local_effects(effects).await
     }
 
+    async fn handle_local_grant_update(
+        &mut self,
+        grants: CapabilityGrants,
+        epoch: GrantEpoch,
+        capability: Capability,
+        enabled: bool,
+    ) -> Result<(), SessionRuntimeError> {
+        if !is_single_capability(capability) || !is_next_epoch(self.local_grant_epoch, epoch) {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+        let previous = protocol_capabilities(self.config.local_grants_to_peer);
+        if previous.contains(capability) == enabled {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+        let mut expected = previous;
+        expected.set(capability, enabled);
+        if protocol_capabilities(grants) != expected {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+        self.transfer
+            .stop(if capability == Capability::FILE_TRANSFER && !enabled {
+                TransferStopMode::AbortInbound
+            } else {
+                TransferStopMode::Suspend
+            });
+
+        let effects = self.core.handle(Event::LocalGrantUpdated {
+            local_grant_epoch: epoch,
+            local_grant_allows_peer_input: grants.contains(TrustedCapability::RemoteInput),
+        });
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Rejected { .. }))
+        {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+        self.local_grant_epoch = epoch;
+        self.config.local_grants_to_peer = grants;
+        self.topology.invalidate_local_authorization();
+        let _clipboard_messages = self
+            .clipboard
+            .update_local_grants(epoch, clipboard_grants(grants))?;
+        self.apply_remote_effects(effects).await?;
+        self.force_recovery(Event::ReconnectRequested).await
+    }
+
+    async fn handle_peer_grant_update(
+        &mut self,
+        peer: DeviceId,
+        capability: Capability,
+        epoch: GrantEpoch,
+        enabled: bool,
+    ) -> Result<(), SessionRuntimeError> {
+        if peer != self.config.local_device
+            || !is_single_capability(capability)
+            || !is_next_epoch(self.peer_grant_epoch, epoch)
+            || self.peer_capabilities.contains(capability) == enabled
+        {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+
+        let mut capabilities = self.peer_capabilities;
+        capabilities.set(capability, enabled);
+        self.transfer
+            .stop(if capability == Capability::FILE_TRANSFER && !enabled {
+                TransferStopMode::AbortOutbound
+            } else {
+                TransferStopMode::Suspend
+            });
+        let effects = self.core.handle(Event::PeerGrantUpdated {
+            peer_grant_epoch: epoch,
+            peer_grant_allows_local_input: capabilities.contains(Capability::REMOTE_INPUT),
+        });
+        if effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Rejected { .. }))
+        {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+
+        self.peer_grant_epoch = epoch;
+        self.peer_capabilities = capabilities;
+        self.control_sequence = 0;
+        self.reliable_sequence = 0;
+        self.replaceable_sequence = 0;
+        self.topology.invalidate_remote_authorization();
+        let _clipboard_messages = self.clipboard.update_peer_grants(epoch, capabilities)?;
+        self.apply_remote_effects(effects).await?;
+        self.force_recovery(Event::ReconnectRequested).await
+    }
+
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), SessionRuntimeError> {
         let encoded = encode_control(&WireMessage::Control(message))
             .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
@@ -982,6 +1238,22 @@ impl PeerSession<'_> {
         Ok(())
     }
 
+    async fn handle_transfer_worker_event(
+        &mut self,
+        event: TransferWorkerEvent,
+    ) -> Result<(), SessionRuntimeError> {
+        match event {
+            TransferWorkerEvent::SendManifest(payload) => {
+                self.send_reliable(self.channels.file_manifest, payload)
+                    .await
+            }
+            TransferWorkerEvent::SendData(payload) => {
+                self.send_reliable(self.channels.file_data, payload).await
+            }
+            TransferWorkerEvent::Fatal(error) => Err(error.into()),
+        }
+    }
+
     async fn disconnect_transport(&mut self, reason: DisconnectReason) {
         if matches!(
             reason,
@@ -1000,7 +1272,7 @@ impl PeerSession<'_> {
             | DisconnectReason::LocalLocked
             | DisconnectReason::LocalSleeping => CloseReason::EmergencyDisconnect,
             DisconnectReason::LinkLost => CloseReason::TransportFailure,
-            DisconnectReason::FocusLeaseExpired | DisconnectReason::GrantChanged => {
+            DisconnectReason::RequestedReconnect | DisconnectReason::FocusLeaseExpired => {
                 CloseReason::Requested
             }
         };
@@ -1035,7 +1307,7 @@ impl PeerSession<'_> {
             self.session_id,
             self.config.local_device,
             sequence,
-            GRANT_EPOCH,
+            self.peer_grant_epoch,
             Capability::REMOTE_INPUT,
         )
     }
@@ -1110,11 +1382,16 @@ async fn establish_channels(
         None
     };
     let clipboard = establish_channel(connection, config.role, ChannelKind::Clipboard).await?;
+    let file_manifest =
+        establish_channel(connection, config.role, ChannelKind::FileManifest).await?;
+    let file_data = establish_channel(connection, config.role, ChannelKind::FileData).await?;
     Ok(Channels {
         control,
         reliable_input,
         pointer_fallback,
         clipboard,
+        file_manifest,
+        file_data,
         datagrams,
     })
 }
@@ -1146,7 +1423,7 @@ async fn negotiate_session(
     connection: &mut dyn PeerConnection,
     config: &SessionConfig,
     channels: &Channels,
-) -> Result<(SessionId, Capability), SessionRuntimeError> {
+) -> Result<(SessionId, PeerGrantState), SessionRuntimeError> {
     let local_capabilities = protocol_capabilities(config.local_grants_to_peer);
     match config.role {
         SessionRole::Opener => {
@@ -1159,12 +1436,11 @@ async fn negotiate_session(
                 local_capabilities,
             )
             .await?;
-            let peer_capabilities =
-                receive_handshake(connection, channels, config, session_id).await?;
-            Ok((session_id, peer_capabilities))
+            let peer_grant = receive_handshake(connection, channels, config, session_id).await?;
+            Ok((session_id, peer_grant))
         }
         SessionRole::Acceptor => {
-            let (session_id, peer_capabilities) =
+            let (session_id, peer_grant) =
                 receive_opening_handshake(connection, channels, config).await?;
             send_handshake(
                 connection,
@@ -1174,7 +1450,7 @@ async fn negotiate_session(
                 local_capabilities,
             )
             .await?;
-            Ok((session_id, peer_capabilities))
+            Ok((session_id, peer_grant))
         }
     }
 }
@@ -1196,14 +1472,14 @@ async fn send_handshake(
             // therefore requires this to equal its own pinned device identity.
             peer: config.peer_device,
             capabilities,
-            epoch: GRANT_EPOCH,
+            epoch: config.local_grant_epoch,
         });
     }
     messages.push(ControlMessage::SessionOpen {
         session_id,
         // SessionOpen uses the same recipient/target convention.
         peer: config.peer_device,
-        epoch: GRANT_EPOCH,
+        epoch: config.local_grant_epoch,
     });
     for message in messages {
         let payload = encode_control(&WireMessage::Control(message))
@@ -1223,12 +1499,18 @@ async fn receive_opening_handshake(
     connection: &mut dyn PeerConnection,
     channels: &Channels,
     config: &SessionConfig,
-) -> Result<(SessionId, Capability), SessionRuntimeError> {
+) -> Result<(SessionId, PeerGrantState), SessionRuntimeError> {
     let (hello, grant, session) = receive_handshake_frames(connection, channels.control).await?;
     let (capabilities, granted, peer, session_id, session_peer, epoch) =
         unpack_handshake(&hello, grant.as_ref(), &session)?;
     validate_handshake(config, capabilities, granted, peer, session_peer, epoch)?;
-    Ok((session_id, capabilities))
+    Ok((
+        session_id,
+        PeerGrantState {
+            capabilities,
+            epoch,
+        },
+    ))
 }
 
 async fn receive_handshake(
@@ -1236,7 +1518,7 @@ async fn receive_handshake(
     channels: &Channels,
     config: &SessionConfig,
     expected_session: SessionId,
-) -> Result<Capability, SessionRuntimeError> {
+) -> Result<PeerGrantState, SessionRuntimeError> {
     let (hello, grant, session) = receive_handshake_frames(connection, channels.control).await?;
     let (capabilities, granted, peer, session_id, session_peer, epoch) =
         unpack_handshake(&hello, grant.as_ref(), &session)?;
@@ -1244,7 +1526,10 @@ async fn receive_handshake(
     if session_id != expected_session {
         return Err(SessionRuntimeError::ProtocolViolation);
     }
-    Ok(capabilities)
+    Ok(PeerGrantState {
+        capabilities,
+        epoch,
+    })
 }
 
 async fn receive_handshake_frames(
@@ -1310,15 +1595,6 @@ fn unpack_handshake(
     if versions.as_slice() != [ProtocolVersion::CURRENT] {
         return Err(SessionRuntimeError::ProtocolViolation);
     }
-    let (peer, granted, epoch) = match grant {
-        Some(ControlMessage::CapabilityGrant {
-            peer,
-            capabilities: granted,
-            epoch,
-        }) if !granted.is_empty() => (*peer, *granted, *epoch),
-        None if capabilities.is_empty() => (DeviceId::new([0; 32]), *capabilities, GRANT_EPOCH),
-        _ => return Err(SessionRuntimeError::ProtocolViolation),
-    };
     let ControlMessage::SessionOpen {
         session_id,
         peer: session_peer,
@@ -1327,14 +1603,18 @@ fn unpack_handshake(
     else {
         return Err(SessionRuntimeError::ProtocolViolation);
     };
+    let (peer, granted, epoch) = match grant {
+        Some(ControlMessage::CapabilityGrant {
+            peer,
+            capabilities: granted,
+            epoch,
+        }) if !granted.is_empty() => (*peer, *granted, *epoch),
+        None if capabilities.is_empty() => (*session_peer, *capabilities, *session_epoch),
+        _ => return Err(SessionRuntimeError::ProtocolViolation),
+    };
     if *session_epoch != epoch {
         return Err(SessionRuntimeError::ProtocolViolation);
     }
-    let peer = if capabilities.is_empty() {
-        *session_peer
-    } else {
-        peer
-    };
     Ok((
         *capabilities,
         granted,
@@ -1356,7 +1636,9 @@ fn validate_handshake(
     if capabilities != granted
         || peer != config.local_device
         || session_peer != config.local_device
-        || epoch != GRANT_EPOCH
+        || config
+            .peer_grant_epoch
+            .is_some_and(|expected| expected != epoch)
         || config
             .peer_grants_to_local
             .is_some_and(|expected| protocol_capabilities(expected) != capabilities)
@@ -1393,6 +1675,17 @@ fn protocol_capabilities(grants: CapabilityGrants) -> Capability {
         capabilities |= Capability::FILE_TRANSFER;
     }
     capabilities
+}
+
+const fn is_single_capability(capability: Capability) -> bool {
+    capability.bits().is_power_of_two()
+}
+
+const fn is_next_epoch(current: GrantEpoch, next: GrantEpoch) -> bool {
+    match current.get().checked_add(1) {
+        Some(expected) => next.get() == expected,
+        None => false,
+    }
 }
 
 const fn is_replaceable(event: InputEvent) -> bool {
@@ -1443,7 +1736,9 @@ impl SaturatingMonotonic for MonotonicMillis {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1574,6 +1869,15 @@ mod tests {
         }
     }
 
+    fn test_transfer_staging() -> (FileSystemStagingArea, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "nodavo-session-transfer-test-{}",
+            nodavo_transfer::TransferId::new().as_uuid()
+        ));
+        fs::create_dir(&root).unwrap();
+        (FileSystemStagingArea::new(&root).unwrap(), root)
+    }
+
     async fn wait_for_owner(status: &RwLock<AgentStatus>, owner: InputOwner) {
         timeout(Duration::from_secs(2), async {
             loop {
@@ -1607,7 +1911,8 @@ mod tests {
         let grants = CapabilityGrants::NONE
             .with(TrustedCapability::RemoteInput)
             .with(TrustedCapability::ClipboardRead)
-            .with(TrustedCapability::ClipboardWrite);
+            .with(TrustedCapability::ClipboardWrite)
+            .with(TrustedCapability::FileTransfer);
         let a_status = Arc::new(RwLock::new(connected_status()));
         let b_status = Arc::new(RwLock::new(connected_status()));
         let a_platform = VirtualPlatformPort::default();
@@ -1625,6 +1930,19 @@ mod tests {
             crate::clipboard_port::VirtualClipboardPort::with_local_text(1, &clipboard_content);
         let (b_clipboard, b_clipboard_observer) =
             crate::clipboard_port::VirtualClipboardPort::empty();
+        let (a_transfer, a_transfer_root) = test_transfer_staging();
+        let (b_transfer, b_transfer_root) = test_transfer_staging();
+        let a_transfer_store = TransferStore::default();
+        a_transfer_store
+            .register_staging_root(a_transfer_root.clone())
+            .unwrap();
+        let b_transfer_store = TransferStore::default();
+        b_transfer_store
+            .register_staging_root(b_transfer_root.clone())
+            .unwrap();
+        let outbound_path = a_transfer_root.join("session-transfer-proof.txt");
+        let outbound_content = b"authenticated session file transfer proof";
+        fs::write(&outbound_path, outbound_content).unwrap();
         let (_a_disconnect, a_disconnect) = watch::channel(0_u64);
         let (_b_disconnect, b_disconnect) = watch::channel(0_u64);
 
@@ -1638,7 +1956,9 @@ mod tests {
                     local_device: DeviceId::new([1; 32]),
                     peer_device: DeviceId::new([2; 32]),
                     local_grants_to_peer: grants,
+                    local_grant_epoch: GrantEpoch::new(3),
                     peer_grants_to_local: Some(grants),
+                    peer_grant_epoch: Some(GrantEpoch::new(7)),
                     existing_control: None,
                 },
                 a_receiver,
@@ -1646,6 +1966,8 @@ mod tests {
                     input: a_native_receiver,
                     safety: a_safety_receiver,
                     clipboard: Box::new(a_clipboard),
+                    transfer: a_transfer,
+                    transfer_store: a_transfer_store,
                 },
                 a_disconnect,
                 &a_status_task,
@@ -1663,7 +1985,9 @@ mod tests {
                     local_device: DeviceId::new([2; 32]),
                     peer_device: DeviceId::new([1; 32]),
                     local_grants_to_peer: grants,
+                    local_grant_epoch: GrantEpoch::new(7),
                     peer_grants_to_local: Some(grants),
+                    peer_grant_epoch: Some(GrantEpoch::new(3)),
                     existing_control: None,
                 },
                 b_receiver,
@@ -1671,6 +1995,8 @@ mod tests {
                     input: b_native_receiver,
                     safety: b_safety_receiver,
                     clipboard: Box::new(b_clipboard),
+                    transfer: b_transfer,
+                    transfer_store: b_transfer_store,
                 },
                 b_disconnect,
                 &b_status_task,
@@ -1686,6 +2012,27 @@ mod tests {
         })
         .await
         .expect("clipboard content did not cross the dedicated session channel");
+
+        let (transfer_ack, transfer_result) = oneshot::channel();
+        a_commands
+            .send(LocalSessionCommand::SendFiles {
+                paths: vec![outbound_path],
+                acknowledgement: transfer_ack,
+            })
+            .await
+            .unwrap();
+        transfer_result.await.unwrap().unwrap();
+        timeout(Duration::from_secs(3), async {
+            let received = b_transfer_root.join("session-transfer-proof.txt");
+            loop {
+                if fs::read(&received).ok().as_deref() == Some(outbound_content) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("file did not cross the dedicated manifest/data channels");
 
         let (ack, received) = oneshot::channel();
         a_commands
@@ -1774,17 +2121,29 @@ mod tests {
         .await
         .unwrap();
 
+        let grants_without_input =
+            CapabilityGrants::from_bits(grants.bits() & !(TrustedCapability::RemoteInput as u8))
+                .unwrap();
         let (ack, received) = oneshot::channel();
         a_commands
-            .send(LocalSessionCommand::EmergencyStop {
+            .send(LocalSessionCommand::UpdateLocalGrant {
+                grants: grants_without_input,
+                epoch: GrantEpoch::new(4),
+                capability: Capability::REMOTE_INPUT,
+                enabled: false,
                 acknowledgement: ack,
             })
             .await
             .unwrap();
         received.await.unwrap().unwrap();
+        wait_for_owner(&a_status, InputOwner::Local).await;
+        wait_for_focus(&a_status, AgentFocusState::Local).await;
+        wait_for_focus(&b_status, AgentFocusState::Local).await;
+        assert!(!b_observer.snapshot().routing_to_peer);
+        assert_eq!(a_observer.snapshot().forced_releases.len(), 1);
+
         let recovered = a_observer.snapshot();
         assert_eq!(recovered.forced_releases.len(), 1);
-        assert_eq!(recovered.restore_count, 2);
         assert!(!recovered.routing_to_peer);
         assert_eq!(a_status.read().await.input_owner, InputOwner::Local);
         assert_eq!(a_status.read().await.focus_state, AgentFocusState::Local);
@@ -1801,5 +2160,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(b_result.is_ok(), "peer B failed: {b_result:?}");
+        fs::remove_dir_all(a_transfer_root).unwrap();
+        fs::remove_dir_all(b_transfer_root).unwrap();
     }
 }

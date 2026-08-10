@@ -138,6 +138,48 @@ impl TransferQueue {
         Ok(self.fill_active_slots())
     }
 
+    /// Restores one durably staged transfer directly into the active state.
+    ///
+    /// The caller must derive `completed_bytes` from staging-owned verified
+    /// evidence, never from a peer-provided resume offset. Normal queued work
+    /// is left untouched and no scheduler effect is emitted because the
+    /// staging owner is already attached.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate/full queues, a saturated active limit, an oversized
+    /// transfer, or progress beyond the declared total.
+    pub fn restore_active(
+        &mut self,
+        transfer: TransferId,
+        total_bytes: u64,
+        completed_bytes: u64,
+    ) -> Result<(), TransferError> {
+        if self.entries.contains_key(&transfer) {
+            return Err(TransferError::DuplicateTransfer);
+        }
+        if self.entries.len() >= MAX_QUEUED_TRANSFERS {
+            return Err(TransferError::QueueFull);
+        }
+        if self.active_count >= self.maximum_active
+            || total_bytes > crate::MAX_TRANSFER_BYTES
+            || completed_bytes > total_bytes
+        {
+            return Err(TransferError::InvalidQueueTransition);
+        }
+        self.entries.insert(
+            transfer,
+            QueuedTransfer {
+                id: transfer,
+                state: TransferQueueState::Active,
+                total_bytes,
+                completed_bytes,
+            },
+        );
+        self.active_count += 1;
+        Ok(())
+    }
+
     /// Advances exact monotonic progress for an active transfer.
     ///
     /// # Errors
@@ -343,5 +385,24 @@ mod tests {
         );
         queue.remove_terminal(transfer).unwrap();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn restores_only_verified_bounded_active_progress() {
+        let mut queue = TransferQueue::new(1).unwrap();
+        let transfer = TransferId::new();
+        queue.restore_active(transfer, 10, 4).unwrap();
+        assert_eq!(queue.active_count(), 1);
+        assert_eq!(queue.get(transfer).unwrap().completed_bytes(), 4);
+        assert_eq!(
+            queue.restore_active(TransferId::new(), 1, 0),
+            Err(TransferError::InvalidQueueTransition)
+        );
+        assert_eq!(
+            queue.restore_active(transfer, 10, 4),
+            Err(TransferError::DuplicateTransfer)
+        );
+        queue.record_progress(transfer, 10).unwrap();
+        queue.complete(transfer).unwrap();
     }
 }

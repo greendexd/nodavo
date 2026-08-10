@@ -304,6 +304,14 @@ pub type TransferFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Staging boundary that can reopen validated durable progress after restart.
 pub trait ResumableStagingArea: StagingArea {
+    /// Reports whether both pieces of safe durable state exist for a transfer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects partial state, links/reparse substitutions, or inaccessible
+    /// staging metadata instead of treating corruption as a fresh transfer.
+    fn has_persisted(&self, transfer: TransferId) -> Result<bool, TransferError>;
+
     /// Reopens an interrupted transfer and returns exact contiguous offsets.
     ///
     /// # Errors

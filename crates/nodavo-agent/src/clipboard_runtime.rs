@@ -34,7 +34,8 @@ pub(crate) struct PeerClipboardRuntime {
     local_device: DeviceId,
     peer_device: DeviceId,
     session_id: SessionId,
-    grant_epoch: GrantEpoch,
+    local_grant_epoch: GrantEpoch,
+    peer_grant_epoch: GrantEpoch,
     local_grants: PeerClipboardGrants,
     peer_capabilities: Capability,
     state: ClipboardState,
@@ -45,11 +46,16 @@ pub(crate) struct PeerClipboardRuntime {
 }
 
 impl PeerClipboardRuntime {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "constructor keeps the two authenticated device and epoch directions explicit"
+    )]
     pub(crate) fn new(
         local_device: DeviceId,
         peer_device: DeviceId,
         session_id: SessionId,
-        grant_epoch: GrantEpoch,
+        local_grant_epoch: GrantEpoch,
+        peer_grant_epoch: GrantEpoch,
         local_grants: PeerClipboardGrants,
         peer_capabilities: Capability,
         port: Box<dyn ClipboardPort>,
@@ -64,7 +70,8 @@ impl PeerClipboardRuntime {
             local_device,
             peer_device,
             session_id,
-            grant_epoch,
+            local_grant_epoch,
+            peer_grant_epoch,
             local_grants,
             peer_capabilities,
             state: ClipboardState::new(local_device, peer_device, effective_grants),
@@ -73,6 +80,42 @@ impl PeerClipboardRuntime {
             inbound_sequence: None,
             deferred: VecDeque::new(),
         }
+    }
+
+    pub(crate) fn update_local_grants(
+        &mut self,
+        epoch: GrantEpoch,
+        local_grants: PeerClipboardGrants,
+    ) -> Result<Vec<ClipboardMessage>, ClipboardRuntimeError> {
+        if !is_next_epoch(self.local_grant_epoch, epoch) {
+            return Err(ClipboardRuntimeError::Protocol);
+        }
+        self.local_grant_epoch = epoch;
+        self.local_grants = local_grants;
+        self.inbound_sequence = None;
+        self.deferred.clear();
+        let effects = self
+            .state
+            .reconnect(effective_grants(self.local_grants, self.peer_capabilities));
+        self.apply_effects(effects)
+    }
+
+    pub(crate) fn update_peer_grants(
+        &mut self,
+        epoch: GrantEpoch,
+        peer_capabilities: Capability,
+    ) -> Result<Vec<ClipboardMessage>, ClipboardRuntimeError> {
+        if !is_next_epoch(self.peer_grant_epoch, epoch) {
+            return Err(ClipboardRuntimeError::Protocol);
+        }
+        self.peer_grant_epoch = epoch;
+        self.peer_capabilities = peer_capabilities;
+        self.outbound_sequence = 0;
+        self.deferred.clear();
+        let effects = self
+            .state
+            .reconnect(effective_grants(self.local_grants, self.peer_capabilities));
+        self.apply_effects(effects)
     }
 
     pub(crate) fn poll(&mut self) -> Result<Vec<ClipboardMessage>, ClipboardRuntimeError> {
@@ -304,7 +347,7 @@ impl PeerClipboardRuntime {
     fn validate_remote_meta(&self, meta: &EventMeta) -> Result<(), ClipboardRuntimeError> {
         if meta.session_id() != self.session_id
             || meta.origin() != self.peer_device
-            || meta.grant_epoch() != self.grant_epoch
+            || meta.grant_epoch() != self.local_grant_epoch
             || meta.sequence().is_zero()
             || self
                 .inbound_sequence
@@ -338,9 +381,28 @@ impl PeerClipboardRuntime {
             self.session_id,
             self.local_device,
             Sequence::new(self.outbound_sequence),
-            self.grant_epoch,
+            self.peer_grant_epoch,
             capability,
         )
+    }
+}
+
+const fn effective_grants(
+    local_grants: PeerClipboardGrants,
+    peer_capabilities: Capability,
+) -> PeerClipboardGrants {
+    PeerClipboardGrants {
+        allow_peer_read: local_grants.allow_peer_read
+            && peer_capabilities.contains(Capability::CLIPBOARD_WRITE),
+        allow_peer_write: local_grants.allow_peer_write
+            && peer_capabilities.contains(Capability::CLIPBOARD_READ),
+    }
+}
+
+const fn is_next_epoch(current: GrantEpoch, next: GrantEpoch) -> bool {
+    match current.get().checked_add(1) {
+        Some(expected) => next.get() == expected,
+        None => false,
     }
 }
 
@@ -468,6 +530,7 @@ mod tests {
             b_device,
             session,
             GrantEpoch::new(1),
+            GrantEpoch::new(1),
             PeerClipboardGrants {
                 allow_peer_read: true,
                 allow_peer_write: false,
@@ -492,6 +555,7 @@ mod tests {
             b_device,
             a_device,
             session,
+            GrantEpoch::new(1),
             GrantEpoch::new(1),
             PeerClipboardGrants {
                 allow_peer_read: false,

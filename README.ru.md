@@ -1,4 +1,4 @@
-<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 10 -->
+<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 11 -->
 
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="Логотип Nodavo">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> Nodavo находится в активной разработке на стадии pre-alpha. Поддерживаемой межкомпьютерной сборки и публичного релиза пока нет. Интегрированный Rust-агент, оболочка macOS и WinUI 3 x64 компилируются в CI, а репозиторий собирает явно помеченные development app/DMG для macOS, но реальная квалификация Mac ↔ PC, release signing, установщики и полный файловый/product UX ещё не готовы.
+> Nodavo находится в активной разработке на стадии pre-alpha. Поддерживаемой межкомпьютерной сборки и публичного релиза пока нет. Интегрированный Rust-агент, оболочка macOS и WinUI 3 x64 компилируются в CI, а для macOS и Windows есть явно помеченный development packaging, но реальная квалификация Mac ↔ PC, release signing, чистая установка, подробный прогресс transfers и полная матрица release tests ещё не готовы.
 
 ## Видение
 
@@ -43,11 +43,11 @@ Nodavo создаётся, чтобы Mac и Windows-компьютер ощущ
 | Общая мышь и клавиатура | macOS ↔ Windows в обе стороны | Оба native bridge подключены к аутентифицированным equal-peer sessions. Reliable pointer entry подтверждается до suppression; relative motion, HID/media keys, buttons, scroll, focus leases, forced release и lifecycle recovery проходят virtual/native-inert проверки. Реального hardware-доказательства Mac ↔ PC пока нет |
 | Переход через край экрана | Разный масштаб DPI и несколько мониторов | Подключены authenticated session-scoped topology, mixed-DPI transforms, явные edge routes, debounce/hysteresis, reliable entry и relative deltas. Нет layout editor, hot-plug refresh и физической multi-monitor проверки |
 | Буфер обмена | UTF-8 текст, HTML, PNG/BMP | Надёжный peer channel применяет независимые grants, bounded streaming, BLAKE3, loop prevention и cleanup. macOS поддерживает text/HTML/PNG/clear; Windows — text/HTML/PNG/clear и строгий subset BMP. Для Windows есть только compile/parser evidence |
-| Файлы и папки | Копирование, очередь, возобновление, проверка целостности | Есть безопасный receive staging, durable exact-offset resume, очередь и no-overwrite finalization. Capability-rooted outbound source отклоняет links/reparse points, sparse/special files, mutation, collisions и unsafe resume. Peer channels и native transfer UI ещё не подключены |
+| Файлы и папки | Копирование, очередь, возобновление, проверка целостности | Authenticated manifest/data channels, ограниченные background workers, явные native pickers в обеих оболочках, exact-offset resume в рамках процесса, peer-scoped cleanup при revoke, BLAKE3, private no-follow staging и no-overwrite publication проходят focused/virtual checks. Нет подробного прогресса, реальной межкомпьютерной проверки, process-restart outbound/owner journals и Windows directory durability при отключении питания |
 | Обнаружение | mDNS и запасной вариант с ручным IP | Агент разрешает ограниченные записи mDNS и принимает ручные адреса; автоматического списка устройств в интерфейсе пока нет |
-| Сопряжение | Подтверждаемый пользователем короткий код и закреплённые идентификаторы устройств | Pairing-time grants, signed trust, pinned mutual TLS reconnect и revocation работают в smoke tests агентов. macOS по умолчанию использует Keychain, Windows — DPAPI; остаются signed/provisioned Keychain success, Windows runtime, trusted-device UI и post-pair изменения grants |
-| Транспорт | QUIC с TLS 1.3 | Через одно mutually authenticated соединение работают pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback и clipboard. File peer channels ещё не подключены |
-| Платформы | macOS 13+ и Windows 10 22H2/11, x64 и ARM64 | SwiftUI и WinUI 3 x64 компилируются в CI; Rust проверяется для macOS arm64/x64 и Windows x64, также собирается universal development app/DMG macOS. Windows runtime/ARM64, Developer ID/notarization и release installers не доказаны |
+| Сопряжение | Подтверждаемый пользователем короткий код и закреплённые идентификаторы устройств | Pairing-time grants, signed trust, pinned mutual TLS reconnect, directional grant epochs, транзакционные post-pair changes, bounded trusted-device list и revocation работают в focused tests. Этот UX есть в обеих native shells. Остаются signed/provisioned Keychain success и реальная Windows runtime validation |
+| Транспорт | QUIC с TLS 1.3 | Через одно mutually authenticated соединение в focused/virtual tests работают pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback, clipboard и bounded file channels. Нет реальной квалификации двух устройств с loss/reorder/performance |
+| Платформы | macOS 13+ и Windows 10 22H2/11, x64 и ARM64 | SwiftUI и WinUI 3 x64 компилируются в CI; Rust проверяется для macOS arm64/x64 и Windows x64, reproducibly собирается universal development app/DMG macOS, а также существует fail-closed Windows x64+ARM64 development MSIXBundle workflow. Windows runtime/ARM64 execution, Developer ID/notarization, production Authenticode и clean installer matrices не доказаны |
 
 Трансляция экрана, сервер-посредник в интернете, мобильные клиенты, Linux и управление Windows Secure Desktop не входят в первоначальный объём 1.0.
 
@@ -55,16 +55,17 @@ Nodavo создаётся, чтобы Mac и Windows-компьютер ощущ
 
 - Rust workspace с ограниченными компонентами протокола, идентификаторов, транспорта, сессии, обнаружения, буфера, передачи файлов, проверки обновлений и локального IPC.
 - Пользовательский Rust-агент с приватным локальным IPC, ручным/mDNS-сопряжением, явными grants, signed trust, pinned reconnect, revocation, negotiated peer sessions, authenticated topology, relative input, clipboard sync, deterministic safety recovery и emergency stop. macOS по умолчанию использует Keychain; файловое хранилище включается только явным insecure-development flag.
-- Двуязычная SwiftUI-оболочка macOS в строке меню, подключённая к приватному локальному сокету агента, включая ручной/ожидающий режим сопряжения и явное подтверждение кода.
-- Двуязычная WinUI 3-оболочка с ограниченными статусом, emergency stop, manual/listening pairing и подтверждением кода через protected named pipe. GitHub Actions компилирует Release x64; интерактивного запуска Windows пока не было.
+- Двуязычная SwiftUI-оболочка macOS в строке меню, подключённая к приватному локальному сокету агента, с pairing, управлением trusted devices/grants, подтверждённым revocation и явным выбором файлов/папок.
+- Двуязычная WinUI 3-оболочка с ограниченными статусом, emergency stop, pairing, управлением trusted devices/grants, подтверждённым revocation и явным выбором файлов/папок через protected named pipe. Неоднозначный результат grant/transfer запускает reconciliation или блокирует retry, а не изображает rollback. GitHub Actions компилирует Release x64; интерактивного запуска Windows пока не было.
 - Оригинальные macOS/Windows input и clipboard runtimes, подключённые к agent, с default-off suppression, injected-event rejection, bounded relative motion, lifecycle recovery, deterministic release и content-redacted failures.
-- Ограниченная transfer queue, durable private receiver staging и capability-rooted outbound filesystem source с exact hashes, resume evidence, mutation detection и no-follow paths. Network/file-selection orchestration ещё отсутствует.
+- Authenticated bounded file channels, process worker с четырьмя reservations, cooperative scan cancellation, peer-scoped cleanup, private capability-rooted receiver staging и outbound filesystem source с exact hashes, mutation detection, no-follow handles, Windows birth-time DACL и консервативной no-overwrite publication.
 - Universal development app/DMG pipeline для macOS и fail-closed release path Developer ID/provisioning/notarization. Release credentials недоступны, поэтому собран только явно непригодный для распространения development artifact.
+- Core state machine подписанных обновлений с bounded HTTPS/staging contracts, explicit consent, rollback floors и restart/health recovery. Конкретных network, protected persistence, installer и product-UI adapters пока нет.
 
 ### Чего не хватает до рабочей сборки
 
 - Реальная интерактивная Mac ↔ Windows проверка input, relative edge crossing, DPI, lifecycle, clipboard, DPAPI, named-pipe/WinUI flow и recovery; также отсутствует Windows ARM64 evidence.
-- File manifest/data channel orchestration, выбранные пользователем destinations, transfer queue UI, trusted-device и post-pair permission management, hot-plug layout editor, onboarding, diagnostics и updater installation.
+- Реальная проверка peer file transfer, выбираемые пользователем receive destinations, подробный progress/cancel history, durable peer/outbound ownership между перезапусками агента, hot-plug layout editor, onboarding, diagnostics и updater installation.
 - Signed/provisioned запуск macOS, подтверждающий стабильность Keychain/TCC, а также Developer ID/notarization и Authenticode/MSIX/MSI credentials с clean install/upgrade/uninstall matrices.
 - Полные security, fuzz, stress, compatibility, accessibility, long-running beta, external-review, SBOM/provenance и real-hardware gates версии 1.0.
 

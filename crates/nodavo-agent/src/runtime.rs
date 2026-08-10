@@ -1,14 +1,20 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nodavo_discovery::{DiscoveryLocation, DiscoveryRuntimeEvent, MdnsRuntime};
 use nodavo_identity::{
-    CapabilityGrants, DeviceSigner as _, PairingAction, PairingError, PairingNonce, PairingRole,
-    PairingTxn, PendingTrust, TransportCertificate,
+    Capability as TrustedCapability, CapabilityGrants, DeviceSigner as _, PairingAction,
+    PairingError, PairingNonce, PairingRole, PairingTxn, PendingTrust, TransportCertificate,
 };
-use nodavo_local_ipc::{AgentPhase, AgentStatus, FocusState, InputOwner};
+use nodavo_local_ipc::{
+    AgentPhase, AgentStatus, CapabilityName, FocusState, InputOwner, MAX_SELECTED_PATH_BYTES,
+    MAX_SELECTED_PATHS, TrustedPeerState, TrustedPeerSummary,
+};
+use nodavo_protocol::{Capability as ProtocolCapability, GrantEpoch};
+use nodavo_transfer::{FileSystemStagingArea, TransferId};
 use nodavo_transport::quinn_backend::{
     EphemeralPairingConfiguration, EphemeralPairingIdentity, PinnedMutualConfiguration,
     QuinnBackendOptions, QuinnTransport,
@@ -20,7 +26,7 @@ use nodavo_transport::{
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::clipboard_port::native_clipboard_port;
 use crate::native_bridge::{native_input_channel, platform_safety_channel};
@@ -33,6 +39,7 @@ use crate::session_runtime::{
     command_channel, run_peer_session,
 };
 use crate::storage::{DevelopmentStorage, DeviceMaterial, PeerRecord, device_id_text};
+use crate::transfer_worker::{TransferCleanupState, TransferStore};
 #[cfg(target_os = "windows")]
 use crate::windows::WindowsPlatformPort;
 use crate::wire::{
@@ -46,6 +53,7 @@ const NETWORK_DEADLINE: Duration = Duration::from_secs(10);
 const CONFIRMATION_DEADLINE: Duration = Duration::from_mins(2);
 const MDNS_LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
 const SAFETY_RECOVERY_DEADLINE: Duration = Duration::from_secs(5);
+const TRANSFER_PREPARATION_DEADLINE: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Error)]
 pub(crate) enum AgentError {
@@ -69,12 +77,16 @@ pub(crate) enum AgentError {
     PeerNotFound,
     #[error("development trust storage failed")]
     Storage,
+    #[error("the local capability grant epoch is exhausted")]
+    GrantEpochExhausted,
     #[error("no authenticated peer session is connected")]
     NotConnected,
     #[error("the focus request is not authorized or valid")]
     FocusRejected,
     #[error("local input release and ownership restore did not complete")]
     SafetyRecoveryFailed,
+    #[error("the selected file transfer could not be prepared or queued")]
+    TransferFailed,
 }
 
 impl From<WireError> for AgentError {
@@ -133,6 +145,7 @@ pub(crate) struct AgentRuntime {
     busy: AtomicBool,
     disconnect: watch::Sender<u64>,
     session_commands: Mutex<Option<mpsc::Sender<LocalSessionCommand>>>,
+    transfer_store: TransferStore,
     quic_bind_address: SocketAddr,
     device_name: String,
 }
@@ -161,6 +174,7 @@ impl AgentRuntime {
             busy: AtomicBool::new(false),
             disconnect,
             session_commands: Mutex::new(None),
+            transfer_store: TransferStore::default(),
             quic_bind_address,
             device_name,
         })
@@ -168,6 +182,140 @@ impl AgentRuntime {
 
     pub(crate) async fn status(&self) -> AgentStatus {
         self.status.read().await.clone()
+    }
+
+    pub(crate) async fn trusted_peers(&self) -> Vec<TrustedPeerSummary> {
+        self.peers
+            .lock()
+            .await
+            .iter()
+            .map(|record| TrustedPeerSummary {
+                peer_id: device_id_text(record.device_id()),
+                display_name: record.display_name.clone(),
+                state: if record.is_active() {
+                    TrustedPeerState::Active
+                } else {
+                    TrustedPeerState::Revoked
+                },
+                local_grants: capability_names(record.grants),
+            })
+            .collect()
+    }
+
+    pub(crate) async fn set_capability(
+        &self,
+        peer_id: &str,
+        capability: TrustedCapability,
+        enabled: bool,
+    ) -> Result<(), AgentError> {
+        let (grants, epoch, peer_device) = {
+            let mut peers = self.peers.lock().await;
+            let previous = peers.clone();
+            let record = peers
+                .iter_mut()
+                .find(|record| device_id_text(record.device_id()) == peer_id && record.is_active())
+                .ok_or(AgentError::PeerNotFound)?;
+            if record.grants.contains(capability) == enabled {
+                return Ok(());
+            }
+            let next = record
+                .grant_epoch
+                .get()
+                .checked_add(1)
+                .map(GrantEpoch::new)
+                .ok_or(AgentError::GrantEpochExhausted)?;
+            record.grants = set_capability(record.grants, capability, enabled)?;
+            record.grant_epoch = next;
+            let updated = (
+                record.grants,
+                record.grant_epoch,
+                protocol_device_id(record.device_id()),
+            );
+            if self.storage.store_peers(&peers).is_err() {
+                *peers = previous;
+                return Err(AgentError::Storage);
+            }
+            updated
+        };
+
+        let discard_inbound = capability == TrustedCapability::FileTransfer && !enabled;
+        if discard_inbound {
+            self.transfer_store
+                .require_peer_inbound_discard(peer_device);
+        }
+        if let Some(sender) = self.session_commands.lock().await.clone() {
+            let (acknowledgement, received) = oneshot::channel();
+            let command = LocalSessionCommand::UpdateLocalGrant {
+                grants,
+                epoch,
+                capability: protocol_capability(capability),
+                enabled,
+                acknowledgement,
+            };
+            let delivered = timeout(SAFETY_RECOVERY_DEADLINE, sender.send(command)).await;
+            let applied = if let Ok(Ok(())) = delivered {
+                timeout(SAFETY_RECOVERY_DEADLINE, received).await
+            } else {
+                self.disconnect_all();
+                if discard_inbound {
+                    self.wait_transfer_cleanup(peer_device).await?;
+                }
+                return Ok(());
+            };
+            if !matches!(applied, Ok(Ok(Ok(())))) {
+                // Persistence is already committed. Closing the authenticated
+                // session makes the new grant authoritative on reconnect even
+                // when the in-session notification cannot complete.
+                self.disconnect_all();
+            }
+        }
+        if discard_inbound {
+            self.wait_transfer_cleanup(peer_device).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn send_files(&self, paths: Vec<String>) -> Result<TransferId, AgentError> {
+        if paths.is_empty() || paths.len() > MAX_SELECTED_PATHS {
+            return Err(AgentError::TransferFailed);
+        }
+        let paths = paths
+            .into_iter()
+            .map(|path| {
+                if path.is_empty()
+                    || path.len() > MAX_SELECTED_PATH_BYTES
+                    || path.as_bytes().contains(&0)
+                {
+                    return Err(AgentError::TransferFailed);
+                }
+                let path = PathBuf::from(path);
+                path.is_absolute()
+                    .then_some(path)
+                    .ok_or(AgentError::TransferFailed)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sender = self
+            .session_commands
+            .lock()
+            .await
+            .clone()
+            .ok_or(AgentError::NotConnected)?;
+        let (acknowledgement, received) = oneshot::channel();
+        timeout(
+            SAFETY_RECOVERY_DEADLINE,
+            sender.send(LocalSessionCommand::SendFiles {
+                paths,
+                acknowledgement,
+            }),
+        )
+        .await
+        .map_err(|_| AgentError::TransferFailed)?
+        .map_err(|_| AgentError::NotConnected)?;
+        timeout(TRANSFER_PREPARATION_DEADLINE, received)
+            .await
+            .map_err(|_| AgentError::TransferFailed)?
+            .map_err(|_| AgentError::NotConnected)?
+            .map_err(|_| AgentError::TransferFailed)
     }
 
     pub(crate) fn is_reconnect_request(endpoint: &str) -> bool {
@@ -238,14 +386,22 @@ impl AgentRuntime {
             local_device: protocol_device_id(self.material.signer.public_identity().device_id()),
             peer_device: protocol_device_id(peer.device_id()),
             local_grants_to_peer: peer.grants,
+            local_grant_epoch: peer.grant_epoch,
             peer_grants_to_local: None,
+            peer_grant_epoch: None,
             existing_control: None,
         };
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
-            let result =
-                run_platform_session(connection, config, session_rx, disconnect, &runtime.status)
-                    .await;
+            let result = run_platform_session(
+                connection,
+                config,
+                session_rx,
+                disconnect,
+                &runtime.status,
+                runtime.transfer_store.clone(),
+            )
+            .await;
             runtime.session_commands.lock().await.take();
             runtime.busy.store(false, Ordering::Release);
             if matches!(result, Err(SessionRuntimeError::SafetyRecoveryFailed)) {
@@ -370,17 +526,43 @@ impl AgentRuntime {
             .iter_mut()
             .find(|record| device_id_text(record.device_id()) == peer_id && record.is_active())
             .ok_or(AgentError::PeerNotFound)?;
+        let revoked_peer = protocol_device_id(record.device_id());
         record.revoked_at_unix_ms = Some(now.max(record.established_at_unix_ms));
         if self.storage.store_peers(&peers).is_err() {
             *peers = previous;
             return Err(AgentError::Storage);
         }
         drop(peers);
+        self.transfer_store.mark_peer_revoked(revoked_peer);
 
-        if self.status.read().await.connected_peer.as_deref() == Some(peer_id) {
+        if self.session_commands.lock().await.is_some() {
             self.disconnect_all();
         }
+        self.wait_transfer_cleanup(revoked_peer).await?;
         Ok(())
+    }
+
+    async fn wait_transfer_cleanup(
+        &self,
+        peer: nodavo_protocol::DeviceId,
+    ) -> Result<(), AgentError> {
+        let store = self.transfer_store.clone();
+        timeout(SAFETY_RECOVERY_DEADLINE, async move {
+            loop {
+                let cleanup_store = store.clone();
+                let state =
+                    tokio::task::spawn_blocking(move || cleanup_store.cleanup_peer_if_idle(peer))
+                        .await
+                        .map_err(|_| AgentError::TransferFailed)?
+                        .map_err(|_| AgentError::TransferFailed)?;
+                if state == TransferCleanupState::Complete {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| AgentError::TransferFailed)?
     }
 
     pub(crate) async fn emergency_stop(&self) -> Result<AgentStatus, AgentError> {
@@ -460,7 +642,8 @@ impl AgentRuntime {
     }
 
     async fn handle_safety_stop(&self, reason: SessionStop) -> Result<AgentStatus, AgentError> {
-        match self.stop_session(reason).await {
+        let cleanup_peers = self.transfer_store.require_all_inbound_discard();
+        let result = match self.stop_session(reason).await {
             Ok(true) => Ok(self.ready_status().await),
             Ok(false) if self.status.read().await.phase != AgentPhase::Connected => {
                 self.disconnect_all();
@@ -471,7 +654,14 @@ impl AgentRuntime {
                 self.status.write().await.phase = AgentPhase::Stopping;
                 Err(AgentError::SafetyRecoveryFailed)
             }
+        };
+        for peer in cleanup_peers {
+            if self.wait_transfer_cleanup(peer).await.is_err() {
+                self.status.write().await.phase = AgentPhase::Stopping;
+                return Err(AgentError::SafetyRecoveryFailed);
+            }
         }
+        result
     }
 
     async fn ready_status(&self) -> AgentStatus {
@@ -871,6 +1061,8 @@ impl AgentRuntime {
             public_key: *binding.peer_identity().public_key_bytes(),
             certificate_der: binding.certificate_der().to_vec(),
             grants: committed.record().grants(),
+            grant_epoch: nodavo_protocol::GrantEpoch::new(1),
+            display_name: prepared.peer.name.clone(),
             established_at_unix_ms,
             revoked_at_unix_ms: None,
             server_name: prepared.peer.server_name.clone(),
@@ -908,7 +1100,9 @@ impl AgentRuntime {
             local_device: protocol_device_id(self.material.signer.public_identity().device_id()),
             peer_device: protocol_device_id(record.device_id()),
             local_grants_to_peer: record.grants,
+            local_grant_epoch: record.grant_epoch,
             peer_grants_to_local: Some(prepared.peer.grants),
+            peer_grant_epoch: Some(nodavo_protocol::GrantEpoch::new(1)),
             existing_control: Some(prepared.channel),
         };
         let session_result = run_platform_session(
@@ -917,6 +1111,7 @@ impl AgentRuntime {
             session_rx,
             disconnect.clone(),
             &self.status,
+            self.transfer_store.clone(),
         )
         .await;
         self.session_commands.lock().await.take();
@@ -978,10 +1173,12 @@ async fn run_platform_session(
     commands: mpsc::Receiver<LocalSessionCommand>,
     disconnect: watch::Receiver<u64>,
     status: &RwLock<AgentStatus>,
+    transfer_store: TransferStore,
 ) -> Result<(), SessionRuntimeError> {
     let (native_sender, native_receiver) = native_input_channel();
     let (safety_sender, safety_receiver) = platform_safety_channel();
     let clipboard = native_clipboard_port().map_err(|_| SessionRuntimeError::Platform)?;
+    let transfer = native_transfer_staging(&transfer_store)?;
 
     #[cfg(target_os = "macos")]
     let mut platform = MacPlatformPort::new(native_sender, &safety_sender);
@@ -1002,12 +1199,37 @@ async fn run_platform_session(
             input: native_receiver,
             safety: safety_receiver,
             clipboard,
+            transfer,
+            transfer_store,
         },
         disconnect,
         status,
         &mut platform,
     )
     .await
+}
+
+fn native_transfer_staging(
+    transfer_store: &TransferStore,
+) -> Result<FileSystemStagingArea, SessionRuntimeError> {
+    #[cfg(unix)]
+    let state_root = crate::default_state_directory().map_err(|_| SessionRuntimeError::Platform)?;
+    #[cfg(target_os = "windows")]
+    let state_root =
+        crate::windows::default_state_directory().map_err(|_| SessionRuntimeError::Platform)?;
+    let inbox = state_root.join("Received Files");
+    std::fs::create_dir_all(&inbox).map_err(|_| SessionRuntimeError::Platform)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| SessionRuntimeError::Platform)?;
+    }
+    transfer_store
+        .register_staging_root(inbox.clone())
+        .map_err(|_| SessionRuntimeError::Platform)?;
+    FileSystemStagingArea::new(inbox).map_err(|_| SessionRuntimeError::Platform)
 }
 
 enum ReconnectMode {
@@ -1116,6 +1338,46 @@ fn protocol_device_id(device_id: nodavo_identity::DeviceId) -> nodavo_protocol::
     nodavo_protocol::DeviceId::new(*device_id.as_bytes())
 }
 
+fn set_capability(
+    grants: CapabilityGrants,
+    capability: TrustedCapability,
+    enabled: bool,
+) -> Result<CapabilityGrants, AgentError> {
+    if enabled {
+        Ok(grants.with(capability))
+    } else {
+        CapabilityGrants::from_bits(grants.bits() & !(capability as u8))
+            .map_err(|_| AgentError::Storage)
+    }
+}
+
+const fn protocol_capability(capability: TrustedCapability) -> ProtocolCapability {
+    match capability {
+        TrustedCapability::RemoteInput => ProtocolCapability::REMOTE_INPUT,
+        TrustedCapability::ClipboardRead => ProtocolCapability::CLIPBOARD_READ,
+        TrustedCapability::ClipboardWrite => ProtocolCapability::CLIPBOARD_WRITE,
+        TrustedCapability::FileTransfer => ProtocolCapability::FILE_TRANSFER,
+    }
+}
+
+fn capability_names(grants: CapabilityGrants) -> Vec<CapabilityName> {
+    [
+        (TrustedCapability::RemoteInput, CapabilityName::Input),
+        (
+            TrustedCapability::ClipboardRead,
+            CapabilityName::ClipboardRead,
+        ),
+        (
+            TrustedCapability::ClipboardWrite,
+            CapabilityName::ClipboardWrite,
+        ),
+        (TrustedCapability::FileTransfer, CapabilityName::Files),
+    ]
+    .into_iter()
+    .filter_map(|(capability, name)| grants.contains(capability).then_some(name))
+    .collect()
+}
+
 fn expect_hello(message: PairingMessage) -> Result<PeerHello, AgentError> {
     match message {
         PairingMessage::Hello(hello) => Ok(hello),
@@ -1207,4 +1469,181 @@ fn unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(milliseconds).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Mutex as StdMutex;
+
+    use bytes::Bytes;
+    use nodavo_transfer::{
+        ContentHash, EntryKind, ManifestEntry, RelativePath, ResumableStagingArea, StagingArea,
+        TransferChunk, TransferManifest,
+    };
+
+    use super::*;
+    use crate::storage::{StorageError, create_identity};
+
+    struct MemoryStorage {
+        peers: StdMutex<Vec<PeerRecord>>,
+        fail_store: AtomicBool,
+    }
+
+    impl DevelopmentStorage for MemoryStorage {
+        fn load_or_create_identity(&self) -> Result<DeviceMaterial, StorageError> {
+            create_identity().map(|(material, _)| material)
+        }
+
+        fn load_peers(&self) -> Result<Vec<PeerRecord>, StorageError> {
+            Ok(self.peers.lock().unwrap().clone())
+        }
+
+        fn store_peers(&self, peers: &[PeerRecord]) -> Result<(), StorageError> {
+            if self.fail_store.load(Ordering::Acquire) {
+                return Err(StorageError::InvalidData);
+            }
+            *self.peers.lock().unwrap() = peers.to_vec();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_change_persists_epoch_atomically_and_listing_stays_public() {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
+        let peer = PeerRecord {
+            public_key: [4; 32],
+            certificate_der: generated.cert.der().to_vec(),
+            grants: CapabilityGrants::NONE,
+            grant_epoch: GrantEpoch::new(1),
+            display_name: "Office PC".to_owned(),
+            established_at_unix_ms: 1,
+            revoked_at_unix_ms: None,
+            server_name: "peer.nodavo.invalid".to_owned(),
+            last_endpoint: Some("127.0.0.1:44310".parse().unwrap()),
+        };
+        let peer_id = device_id_text(peer.device_id());
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(vec![peer.clone()]),
+            fail_store: AtomicBool::new(false),
+        });
+        let material = create_identity().unwrap().0;
+        let runtime = AgentRuntime::new(
+            Arc::clone(&storage) as Arc<dyn DevelopmentStorage>,
+            material,
+            vec![peer],
+            "127.0.0.1:0".parse().unwrap(),
+            "Test device".to_owned(),
+        );
+
+        runtime
+            .set_capability(&peer_id, TrustedCapability::RemoteInput, true)
+            .await
+            .unwrap();
+        let stored = storage.peers.lock().unwrap().clone();
+        assert_eq!(stored[0].grant_epoch, GrantEpoch::new(2));
+        assert!(stored[0].grants.contains(TrustedCapability::RemoteInput));
+        assert_eq!(
+            runtime.trusted_peers().await,
+            vec![TrustedPeerSummary {
+                peer_id: peer_id.clone(),
+                display_name: "Office PC".to_owned(),
+                state: TrustedPeerState::Active,
+                local_grants: vec![CapabilityName::Input],
+            }]
+        );
+
+        storage.fail_store.store(true, Ordering::Release);
+        assert!(matches!(
+            runtime
+                .set_capability(&peer_id, TrustedCapability::ClipboardRead, true)
+                .await,
+            Err(AgentError::Storage)
+        ));
+        let listed = runtime.trusted_peers().await;
+        assert_eq!(listed[0].local_grants, vec![CapabilityName::Input]);
+        assert_eq!(
+            storage.peers.lock().unwrap()[0].grant_epoch,
+            GrantEpoch::new(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_file_grant_revoke_discards_only_authenticated_peer_staging() {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
+        let peer = PeerRecord {
+            public_key: [5; 32],
+            certificate_der: generated.cert.der().to_vec(),
+            grants: CapabilityGrants::NONE.with(TrustedCapability::FileTransfer),
+            grant_epoch: GrantEpoch::new(1),
+            display_name: "Offline peer".to_owned(),
+            established_at_unix_ms: 1,
+            revoked_at_unix_ms: None,
+            server_name: "peer.nodavo.invalid".to_owned(),
+            last_endpoint: Some("127.0.0.1:44310".parse().unwrap()),
+        };
+        let peer_id = device_id_text(peer.device_id());
+        let protocol_peer = protocol_device_id(peer.device_id());
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(vec![peer.clone()]),
+            fail_store: AtomicBool::new(false),
+        });
+        let runtime = AgentRuntime::new(
+            Arc::clone(&storage) as Arc<dyn DevelopmentStorage>,
+            create_identity().unwrap().0,
+            vec![peer],
+            "127.0.0.1:0".parse().unwrap(),
+            "Test device".to_owned(),
+        );
+        let root = std::env::temp_dir().join(format!(
+            "nodavo-runtime-offline-revoke-{}",
+            TransferId::new().as_uuid()
+        ));
+        fs::create_dir(&root).unwrap();
+        runtime
+            .transfer_store
+            .register_staging_root(root.clone())
+            .unwrap();
+        let transfer = TransferId::new();
+        let payload = b"offline partial";
+        let manifest = TransferManifest::new(vec![ManifestEntry {
+            path: RelativePath::parse("partial.bin").unwrap(),
+            kind: EntryKind::File,
+            size: payload.len() as u64,
+            hash: Some(ContentHash::digest(payload)),
+        }])
+        .unwrap();
+        {
+            let mut staging = FileSystemStagingArea::new(&root).unwrap();
+            staging.begin(transfer, &manifest).await.unwrap();
+            staging
+                .write(TransferChunk {
+                    transfer,
+                    entry_index: 0,
+                    offset: 0,
+                    bytes: Bytes::copy_from_slice(&payload[..7]),
+                })
+                .await
+                .unwrap();
+        }
+        runtime
+            .transfer_store
+            .remember_inbound(protocol_peer, transfer);
+
+        runtime
+            .set_capability(&peer_id, TrustedCapability::FileTransfer, false)
+            .await
+            .unwrap();
+        let staging = FileSystemStagingArea::new(&root).unwrap();
+        assert!(!staging.has_persisted(transfer).unwrap());
+        assert!(
+            !storage.peers.lock().unwrap()[0]
+                .grants
+                .contains(TrustedCapability::FileTransfer)
+        );
+        assert!(!runtime.transfer_store.is_poisoned());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

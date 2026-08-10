@@ -19,6 +19,7 @@ nodavo-local-ipc = { path = "../nodavo-local-ipc" }
 nodavo-protocol = { path = "../nodavo-protocol" }
 nodavo-session = { path = "../nodavo-session" }
 nodavo-transport = { path = "../nodavo-transport" }
+nodavo-transfer = { path = "../nodavo-transfer" }
 rand.workspace = true
 rcgen.workspace = true
 serde.workspace = true

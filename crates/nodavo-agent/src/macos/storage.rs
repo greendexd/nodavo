@@ -229,6 +229,8 @@ mod tests {
             public_key: [7; 32],
             certificate_der: generated.cert.der().to_vec(),
             grants: CapabilityGrants::NONE,
+            grant_epoch: nodavo_protocol::GrantEpoch::new(1),
+            display_name: "Test peer".to_owned(),
             established_at_unix_ms: 10,
             revoked_at_unix_ms: None,
             server_name: "peer.nodavo.invalid".to_owned(),

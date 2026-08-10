@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::SystemTime;
 
+use cap_fs_ext::DirExt as _;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions};
 
 use crate::TransferError;
@@ -39,17 +40,16 @@ pub(super) fn open_file_no_follow(parent: &Dir, name: &Path) -> Result<File, Tra
 }
 
 pub(super) fn open_dir_no_follow(parent: &Dir, name: &Path) -> Result<Dir, TransferError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_directory_options(&mut options);
-    let file = parent
-        .open_with(name, &options)
+    let directory = parent
+        .open_dir_nofollow(name)
         .map_err(|_| TransferError::InvalidSource)?;
-    let metadata = file.metadata().map_err(|_| TransferError::InvalidSource)?;
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|_| TransferError::InvalidSource)?;
     if !metadata.is_dir() || metadata_is_unsafe(&metadata) {
         return Err(TransferError::UnsafeSourceType);
     }
-    Ok(Dir::from_std_file(file.into_std()))
+    Ok(directory)
 }
 
 pub(super) fn file_evidence(file: &File) -> Result<StableEvidence, TransferError> {
@@ -134,13 +134,6 @@ fn configure_file_options(options: &mut OpenOptions) {
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
-#[cfg(unix)]
-fn configure_directory_options(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
-}
-
 #[cfg(windows)]
 fn configure_file_options(options: &mut OpenOptions) {
     use cap_std::fs::OpenOptionsExt as _;
@@ -149,18 +142,5 @@ fn configure_file_options(options: &mut OpenOptions) {
     options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
 }
 
-#[cfg(windows)]
-fn configure_directory_options(options: &mut OpenOptions) {
-    use cap_std::fs::OpenOptionsExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-}
-
 #[cfg(not(any(unix, windows)))]
 fn configure_file_options(_options: &mut OpenOptions) {}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_directory_options(_options: &mut OpenOptions) {}

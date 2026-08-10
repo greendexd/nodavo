@@ -69,6 +69,18 @@ where
         })
     }
 
+    /// Returns the exact receiver-owned next offsets for reconnect negotiation.
+    ///
+    /// These offsets originate only from acknowledged staging writes or from a
+    /// [`ResumableStagingArea`] journal validated by [`Self::resume`].
+    #[must_use]
+    pub fn resume_state(&self) -> Option<crate::ResumeState> {
+        self.active.as_ref().map(|active| crate::ResumeState {
+            transfer: active.id,
+            next_offsets: active.next_offsets.clone(),
+        })
+    }
+
     /// Begins exactly one validated inbound transfer.
     ///
     /// # Errors
@@ -190,6 +202,15 @@ impl<S> TransferReceiver<S>
 where
     S: ResumableStagingArea,
 {
+    /// Checks for complete staging-owned durable state without opening it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects partial, substituted, or inaccessible state.
+    pub fn has_persisted(&self, transfer: TransferId) -> Result<bool, TransferError> {
+        self.staging.has_persisted(transfer)
+    }
+
     /// Reopens one interrupted transfer from staging-owned durable evidence.
     ///
     /// The receiver does not trust caller-provided offsets. The staging

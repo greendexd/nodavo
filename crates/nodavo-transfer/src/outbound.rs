@@ -5,7 +5,7 @@ mod platform;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use cap_std::ambient_authority;
@@ -13,9 +13,12 @@ use cap_std::fs::{Dir, File};
 
 use self::platform::{FileIdentity, StableEvidence};
 use crate::{
-    ContentHash, EntryKind, MAX_CHUNK_BYTES, MAX_MANIFEST_ENTRIES, MAX_TRANSFER_BYTES,
-    ManifestEntry, RelativePath, TransferChunk, TransferError, TransferId, TransferManifest,
+    ContentHash, EntryKind, MAX_CHUNK_BYTES, MAX_MANIFEST_BYTES, MAX_MANIFEST_ENTRIES,
+    MAX_TRANSFER_BYTES, ManifestEntry, RelativePath, TransferChunk, TransferError, TransferId,
+    TransferManifest,
 };
+
+const MAX_SELECTED_ROOTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutboundResumePoint {
@@ -51,6 +54,7 @@ impl OutboundResumePoint {
 }
 
 struct SourceFile {
+    root_index: usize,
     components: Vec<OsString>,
     evidence: StableEvidence,
     prefix_hashes: Vec<(u64, ContentHash)>,
@@ -62,6 +66,7 @@ struct ScannedEntry {
 }
 
 struct PendingDirectory {
+    root_index: usize,
     components: Vec<OsString>,
     manifest_path: RelativePath,
     identity: FileIdentity,
@@ -77,13 +82,14 @@ struct ActiveFile {
 
 /// A one-transfer, pull-based source over an authenticated deterministic manifest.
 ///
-/// The source holds one capability directory and at most one content file. Each
-/// descendant component is reopened without following links, so cancellation or
-/// drop closes native handles without retaining a descriptor per manifest entry.
+/// The source holds one capability directory per explicit selected root and at
+/// most one active content file. Each descendant component is reopened without
+/// following links, so cancellation or drop does not retain a descriptor per
+/// manifest entry.
 pub struct OutboundTransferSource {
     transfer: TransferId,
     manifest: TransferManifest,
-    base: Dir,
+    roots: Vec<Dir>,
     files: Vec<Option<SourceFile>>,
     next_entry: usize,
     active: Option<ActiveFile>,
@@ -119,55 +125,104 @@ impl OutboundTransferSource {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let selected = prepare_roots(sources)?;
-        let base_path = common_parent(&selected)?;
-        let base = Dir::open_ambient_dir(&base_path, ambient_authority())
-            .map_err(|_| TransferError::InvalidSource)?;
+        Self::scan_with_cancel(transfer, sources, || false)
+    }
+
+    /// Scans sources while cooperatively polling a cancellation callback.
+    ///
+    /// The callback is checked before opening each selected root, before and
+    /// during directory enumeration, and at every bounded file-hash chunk.
+    /// Returning `true` aborts without constructing a partial source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Cancelled`] when the callback requests
+    /// cancellation, in addition to the validation failures documented by
+    /// [`Self::scan`].
+    pub fn scan_with_cancel<I, P, C>(
+        transfer: TransferId,
+        sources: I,
+        mut is_cancelled: C,
+    ) -> Result<Self, TransferError>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+        C: FnMut() -> bool,
+    {
+        let selected = prepare_roots(sources, &mut is_cancelled)?;
         let mut scanned = Vec::new();
         let mut directories = VecDeque::new();
-        let mut directory_identities = HashSet::new();
+        let mut entity_identities = HashSet::new();
         let mut aggregate_bytes = 0_u64;
+        let mut manifest_bytes = 0_usize;
+        let mut roots = Vec::with_capacity(selected.len());
 
         for root in selected {
-            let components = relative_components(&base_path, &root)?;
-            let root_name =
-                unicode_name(root.file_name().ok_or(TransferError::UnsafeSourceRoots)?)?;
+            check_cancelled(&mut is_cancelled)?;
+            let root_index = roots.len();
+            let root_name = unicode_name(&root.name)?;
             let manifest_path = RelativePath::parse(root_name)?;
-            scan_selected_root(
-                &base,
-                components,
-                manifest_path,
-                &mut scanned,
-                &mut directories,
-                &mut directory_identities,
-                &mut aggregate_bytes,
-            )?;
+            match root.entity {
+                OpenedEntity::File(file) => {
+                    roots.push(root.anchor);
+                    scan_file(
+                        file,
+                        root_index,
+                        vec![root.name],
+                        manifest_path,
+                        &mut scanned,
+                        &mut aggregate_bytes,
+                        &mut manifest_bytes,
+                        &mut entity_identities,
+                        &mut is_cancelled,
+                    )?;
+                }
+                OpenedEntity::Directory(directory) => {
+                    let identity = platform::directory_identity(&directory)?;
+                    if !entity_identities.insert(identity) {
+                        return Err(TransferError::SourceCycle);
+                    }
+                    push_directory(&mut scanned, manifest_path.clone(), &mut manifest_bytes)?;
+                    roots.push(root.anchor);
+                    directories.push_back(PendingDirectory {
+                        root_index,
+                        components: Vec::new(),
+                        manifest_path,
+                        identity,
+                    });
+                }
+            }
         }
 
         while let Some(pending) = directories.pop_front() {
+            check_cancelled(&mut is_cancelled)?;
             scan_directory(
-                &base,
+                &roots,
                 &pending,
                 &mut scanned,
                 &mut directories,
-                &mut directory_identities,
+                &mut entity_identities,
                 &mut aggregate_bytes,
+                &mut manifest_bytes,
+                &mut is_cancelled,
             )?;
         }
 
+        check_cancelled(&mut is_cancelled)?;
         scanned.sort_by(|left, right| {
             left.manifest
                 .path
                 .as_str()
                 .cmp(right.manifest.path.as_str())
         });
+        check_cancelled(&mut is_cancelled)?;
         let entries = scanned.iter().map(|entry| entry.manifest.clone()).collect();
         let manifest = TransferManifest::new(entries)?;
         let files = scanned.into_iter().map(|entry| entry.source).collect();
         Ok(Self {
             transfer,
             manifest,
-            base,
+            roots,
             files,
             next_entry: 0,
             active: None,
@@ -325,7 +380,11 @@ impl OutboundTransferSource {
             .iter()
             .find_map(|(boundary, hash)| (*boundary == offset).then_some(*hash))
             .ok_or(TransferError::InvalidResumeState)?;
-        let mut file = open_relative_file(&self.base, &source.components)?;
+        let root = self
+            .roots
+            .get(source.root_index)
+            .ok_or(TransferError::SourceChanged)?;
+        let mut file = open_relative_file(root, &source.components)?;
         require_evidence(&file, source.evidence)?;
         let mut hasher = blake3::Hasher::new();
         hash_exact_prefix(&mut file, offset, &mut hasher)?;
@@ -351,144 +410,172 @@ impl OutboundTransferSource {
     }
 }
 
-fn prepare_roots<I, P>(sources: I) -> Result<Vec<PathBuf>, TransferError>
+struct SelectedRoot {
+    canonical: PathBuf,
+    name: OsString,
+    anchor: Dir,
+    entity: OpenedEntity,
+}
+
+fn open_selected_root(path: &Path) -> Result<SelectedRoot, TransferError> {
+    open_selected_root_with_hook(path, || {})
+}
+
+fn open_selected_root_with_hook(
+    path: &Path,
+    mut after_anchor: impl FnMut(),
+) -> Result<SelectedRoot, TransferError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|_| TransferError::InvalidSource)?
+            .join(path)
+    };
+    let name = absolute
+        .file_name()
+        .ok_or(TransferError::UnsafeSourceRoots)?
+        .to_os_string();
+    let parent_path = absolute.parent().ok_or(TransferError::UnsafeSourceRoots)?;
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+        .map_err(|_| TransferError::InvalidSource)?;
+    let entity = open_relative_entity(&parent, std::slice::from_ref(&name))?;
+    after_anchor();
+
+    let canonical = absolute
+        .canonicalize()
+        .map_err(|_| TransferError::InvalidSource)?;
+    let canonical_name = canonical
+        .file_name()
+        .ok_or(TransferError::UnsafeSourceRoots)?;
+    let canonical_parent = Dir::open_ambient_dir(
+        canonical.parent().ok_or(TransferError::UnsafeSourceRoots)?,
+        ambient_authority(),
+    )
+    .map_err(|_| TransferError::InvalidSource)?;
+    let canonical_entity =
+        open_relative_entity(&canonical_parent, &[canonical_name.to_os_string()])?;
+    if !same_entity(&entity, &canonical_entity)? {
+        return Err(TransferError::SourceChanged);
+    }
+
+    let anchor = match &entity {
+        OpenedEntity::File(_) => parent,
+        OpenedEntity::Directory(directory) => directory
+            .try_clone()
+            .map_err(|_| TransferError::InvalidSource)?,
+    };
+    Ok(SelectedRoot {
+        canonical,
+        name,
+        anchor,
+        entity,
+    })
+}
+
+fn same_entity(left: &OpenedEntity, right: &OpenedEntity) -> Result<bool, TransferError> {
+    match (left, right) {
+        (OpenedEntity::File(left), OpenedEntity::File(right)) => {
+            Ok(platform::file_evidence(left)? == platform::file_evidence(right)?)
+        }
+        (OpenedEntity::Directory(left), OpenedEntity::Directory(right)) => {
+            Ok(platform::directory_identity(left)? == platform::directory_identity(right)?)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn check_cancelled(is_cancelled: &mut impl FnMut() -> bool) -> Result<(), TransferError> {
+    if is_cancelled() {
+        Err(TransferError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn prepare_roots<I, P, C>(
+    sources: I,
+    is_cancelled: &mut C,
+) -> Result<Vec<SelectedRoot>, TransferError>
 where
     I: IntoIterator<Item = P>,
     P: AsRef<Path>,
+    C: FnMut() -> bool,
 {
     let mut selected = Vec::new();
     for source in sources {
-        let path = source.as_ref();
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| TransferError::InvalidSource)?;
-        if metadata.file_type().is_symlink() {
-            return Err(TransferError::UnsafeSourceType);
+        check_cancelled(is_cancelled)?;
+        if selected.len() >= MAX_SELECTED_ROOTS {
+            return Err(TransferError::InvalidSource);
         }
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Err(TransferError::UnsafeSourceType);
-        }
-        selected.push(
-            path.canonicalize()
-                .map_err(|_| TransferError::InvalidSource)?,
-        );
+        selected.push(open_selected_root(source.as_ref())?);
     }
-    if selected.is_empty() || selected.len() > MAX_MANIFEST_ENTRIES {
+    if selected.is_empty() {
         return Err(TransferError::InvalidSource);
     }
-    for (index, left) in selected.iter().enumerate() {
-        for right in &selected[index + 1..] {
-            if left == right || left.starts_with(right) || right.starts_with(left) {
-                return Err(TransferError::UnsafeSourceRoots);
-            }
+    check_cancelled(is_cancelled)?;
+    selected.sort_by(|left, right| left.canonical.cmp(&right.canonical));
+    check_cancelled(is_cancelled)?;
+    for pair in selected.windows(2) {
+        let left = &pair[0].canonical;
+        let right = &pair[1].canonical;
+        if left == right || right.starts_with(left) {
+            return Err(TransferError::UnsafeSourceRoots);
         }
     }
     Ok(selected)
 }
 
-fn common_parent(selected: &[PathBuf]) -> Result<PathBuf, TransferError> {
-    let mut common = selected
-        .first()
-        .and_then(|path| path.parent())
-        .ok_or(TransferError::UnsafeSourceRoots)?
-        .to_path_buf();
-    for path in &selected[1..] {
-        while !path.starts_with(&common) {
-            common = common
-                .parent()
-                .ok_or(TransferError::UnsafeSourceRoots)?
-                .to_path_buf();
-        }
-    }
-    Ok(common)
-}
-
-fn relative_components(base: &Path, source: &Path) -> Result<Vec<OsString>, TransferError> {
-    let relative = source
-        .strip_prefix(base)
-        .map_err(|_| TransferError::UnsafeSourceRoots)?;
-    let components = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => Ok(value.to_os_string()),
-            _ => Err(TransferError::UnsafeSourceRoots),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if components.is_empty() {
-        return Err(TransferError::UnsafeSourceRoots);
-    }
-    Ok(components)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_selected_root(
-    base: &Dir,
-    components: Vec<OsString>,
-    manifest_path: RelativePath,
-    scanned: &mut Vec<ScannedEntry>,
-    directories: &mut VecDeque<PendingDirectory>,
-    directory_identities: &mut HashSet<FileIdentity>,
-    aggregate_bytes: &mut u64,
-) -> Result<(), TransferError> {
-    match open_relative_entity(base, &components)? {
-        OpenedEntity::File(file) => {
-            scan_file(file, components, manifest_path, scanned, aggregate_bytes)
-        }
-        OpenedEntity::Directory(directory) => {
-            let identity = platform::directory_identity(&directory)?;
-            if !directory_identities.insert(identity) {
-                return Err(TransferError::SourceCycle);
-            }
-            push_directory(scanned, manifest_path.clone())?;
-            directories.push_back(PendingDirectory {
-                components,
-                manifest_path,
-                identity,
-            });
-            Ok(())
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn scan_directory(
-    base: &Dir,
+fn scan_directory<C>(
+    roots: &[Dir],
     pending: &PendingDirectory,
     scanned: &mut Vec<ScannedEntry>,
     directories: &mut VecDeque<PendingDirectory>,
-    directory_identities: &mut HashSet<FileIdentity>,
+    entity_identities: &mut HashSet<FileIdentity>,
     aggregate_bytes: &mut u64,
-) -> Result<(), TransferError> {
-    let directory = open_relative_directory(base, &pending.components)?;
+    manifest_bytes: &mut usize,
+    is_cancelled: &mut C,
+) -> Result<(), TransferError>
+where
+    C: FnMut() -> bool,
+{
+    let root = roots
+        .get(pending.root_index)
+        .ok_or(TransferError::SourceChanged)?;
+    let directory = open_rooted_directory(root, &pending.components)?;
     if platform::directory_identity(&directory)? != pending.identity {
         return Err(TransferError::SourceChanged);
     }
-    let mut children = Vec::new();
-    for entry in directory
-        .entries()
-        .map_err(|_| TransferError::InvalidSource)?
-    {
-        let entry = entry.map_err(|_| TransferError::InvalidSource)?;
-        let raw_name = entry.file_name();
-        let unicode = unicode_name(&raw_name)?;
-        let normalized_path =
-            RelativePath::parse(&format!("{}/{}", pending.manifest_path.as_str(), unicode))?;
-        children.push((normalized_path, raw_name));
-    }
-    children.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    let available = MAX_MANIFEST_ENTRIES.saturating_sub(scanned.len());
+    let children = enumerate_children(&directory, &pending.manifest_path, available, is_cancelled)?;
 
     for (manifest_path, raw_name) in children {
+        check_cancelled(is_cancelled)?;
         let mut components = pending.components.clone();
-        components.push(raw_name);
-        match open_relative_entity(base, &components)? {
+        components.push(raw_name.clone());
+        match open_relative_entity(&directory, &[raw_name])? {
             OpenedEntity::File(file) => {
-                scan_file(file, components, manifest_path, scanned, aggregate_bytes)?;
+                scan_file(
+                    file,
+                    pending.root_index,
+                    components,
+                    manifest_path,
+                    scanned,
+                    aggregate_bytes,
+                    manifest_bytes,
+                    entity_identities,
+                    is_cancelled,
+                )?;
             }
             OpenedEntity::Directory(child) => {
                 let identity = platform::directory_identity(&child)?;
-                if !directory_identities.insert(identity) {
+                if !entity_identities.insert(identity) {
                     return Err(TransferError::SourceCycle);
                 }
-                push_directory(scanned, manifest_path.clone())?;
+                push_directory(scanned, manifest_path.clone(), manifest_bytes)?;
                 directories.push_back(PendingDirectory {
+                    root_index: pending.root_index,
                     components,
                     manifest_path,
                     identity,
@@ -499,13 +586,51 @@ fn scan_directory(
     Ok(())
 }
 
+fn open_rooted_directory(root: &Dir, components: &[OsString]) -> Result<Dir, TransferError> {
+    if components.is_empty() {
+        root.try_clone().map_err(|_| TransferError::InvalidSource)
+    } else {
+        let (parent, name) = open_parent(root, components)?;
+        platform::open_dir_no_follow(&parent, name)
+    }
+}
+
+fn enumerate_children<C>(
+    directory: &Dir,
+    manifest_path: &RelativePath,
+    limit: usize,
+    is_cancelled: &mut C,
+) -> Result<Vec<(RelativePath, OsString)>, TransferError>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(is_cancelled)?;
+    let mut children = Vec::new();
+    for entry in directory
+        .entries()
+        .map_err(|_| TransferError::InvalidSource)?
+    {
+        check_cancelled(is_cancelled)?;
+        if children.len() >= limit {
+            return Err(TransferError::InvalidManifest);
+        }
+        let entry = entry.map_err(|_| TransferError::InvalidSource)?;
+        let raw_name = entry.file_name();
+        let unicode = unicode_name(&raw_name)?;
+        let normalized_path =
+            RelativePath::parse(&format!("{}/{}", manifest_path.as_str(), unicode))?;
+        children.push((normalized_path, raw_name));
+    }
+    children.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    Ok(children)
+}
+
 fn push_directory(
     scanned: &mut Vec<ScannedEntry>,
     manifest_path: RelativePath,
+    manifest_bytes: &mut usize,
 ) -> Result<(), TransferError> {
-    if scanned.len() >= MAX_MANIFEST_ENTRIES {
-        return Err(TransferError::InvalidManifest);
-    }
+    reserve_manifest_entry(scanned.len(), &manifest_path, manifest_bytes)?;
     scanned.push(ScannedEntry {
         manifest: ManifestEntry {
             path: manifest_path,
@@ -518,24 +643,34 @@ fn push_directory(
     Ok(())
 }
 
-fn scan_file(
+#[allow(clippy::too_many_arguments)]
+fn scan_file<C>(
     mut file: File,
+    root_index: usize,
     components: Vec<OsString>,
     manifest_path: RelativePath,
     scanned: &mut Vec<ScannedEntry>,
     aggregate_bytes: &mut u64,
-) -> Result<(), TransferError> {
-    if scanned.len() >= MAX_MANIFEST_ENTRIES {
-        return Err(TransferError::InvalidManifest);
-    }
+    manifest_bytes: &mut usize,
+    entity_identities: &mut HashSet<FileIdentity>,
+    is_cancelled: &mut C,
+) -> Result<(), TransferError>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(is_cancelled)?;
+    reserve_manifest_entry(scanned.len(), &manifest_path, manifest_bytes)?;
     let evidence = platform::file_evidence(&file)?;
+    if !entity_identities.insert(evidence.identity) {
+        return Err(TransferError::SourceCycle);
+    }
     *aggregate_bytes = aggregate_bytes
         .checked_add(evidence.size)
         .ok_or(TransferError::TransferTooLarge)?;
     if *aggregate_bytes > MAX_TRANSFER_BYTES {
         return Err(TransferError::TransferTooLarge);
     }
-    let (hash, prefix_hashes) = hash_file(&mut file, evidence)?;
+    let (hash, prefix_hashes) = hash_file(&mut file, evidence, is_cancelled)?;
     scanned.push(ScannedEntry {
         manifest: ManifestEntry {
             path: manifest_path,
@@ -544,6 +679,7 @@ fn scan_file(
             hash: Some(hash),
         },
         source: Some(SourceFile {
+            root_index,
             components,
             evidence,
             prefix_hashes,
@@ -552,10 +688,33 @@ fn scan_file(
     Ok(())
 }
 
-fn hash_file(
+fn reserve_manifest_entry(
+    entry_count: usize,
+    path: &RelativePath,
+    manifest_bytes: &mut usize,
+) -> Result<(), TransferError> {
+    if entry_count >= MAX_MANIFEST_ENTRIES {
+        return Err(TransferError::InvalidManifest);
+    }
+    let next = manifest_bytes
+        .checked_add(path.as_str().len() + 64)
+        .ok_or(TransferError::ManifestTooLarge)?;
+    if next > MAX_MANIFEST_BYTES {
+        return Err(TransferError::ManifestTooLarge);
+    }
+    *manifest_bytes = next;
+    Ok(())
+}
+
+fn hash_file<C>(
     file: &mut File,
     evidence: StableEvidence,
-) -> Result<(ContentHash, Vec<(u64, ContentHash)>), TransferError> {
+    is_cancelled: &mut C,
+) -> Result<(ContentHash, Vec<(u64, ContentHash)>), TransferError>
+where
+    C: FnMut() -> bool,
+{
+    check_cancelled(is_cancelled)?;
     let mut hasher = blake3::Hasher::new();
     let mut prefix_hashes = vec![(
         0,
@@ -564,6 +723,7 @@ fn hash_file(
     let mut offset = 0_u64;
     let mut buffer = vec![0_u8; MAX_CHUNK_BYTES];
     while offset < evidence.size {
+        check_cancelled(is_cancelled)?;
         require_evidence(file, evidence)?;
         let remaining = evidence.size - offset;
         let read_len = usize::try_from(remaining.min(MAX_CHUNK_BYTES as u64))
@@ -578,6 +738,7 @@ fn hash_file(
             offset,
             ContentHash::from_bytes(*hasher.clone().finalize().as_bytes()),
         ));
+        check_cancelled(is_cancelled)?;
     }
     require_evidence(file, evidence)?;
     Ok((
@@ -614,11 +775,6 @@ fn open_relative_entity(
 fn open_relative_file(base: &Dir, components: &[OsString]) -> Result<File, TransferError> {
     let (parent, name) = open_parent(base, components)?;
     platform::open_file_no_follow(&parent, name)
-}
-
-fn open_relative_directory(base: &Dir, components: &[OsString]) -> Result<Dir, TransferError> {
-    let (parent, name) = open_parent(base, components)?;
-    platform::open_dir_no_follow(&parent, name)
 }
 
 fn open_parent<'a>(
@@ -715,6 +871,79 @@ mod tests {
 
     fn patterned_bytes(length: usize) -> Vec<u8> {
         (0_u8..=250).cycle().take(length).collect()
+    }
+
+    #[test]
+    fn scan_with_cancel_matches_scan_when_not_cancelled() {
+        let temp = TemporaryDirectory::new();
+        let selected = temp.path().join("selected");
+        fs::create_dir(&selected).unwrap();
+        fs::write(selected.join("one.txt"), b"one").unwrap();
+        let ordinary = OutboundTransferSource::scan(TransferId::new(), [&selected]).unwrap();
+        let cancellable =
+            OutboundTransferSource::scan_with_cancel(TransferId::new(), [&selected], || false)
+                .unwrap();
+        assert_eq!(ordinary.manifest(), cancellable.manifest());
+    }
+
+    #[test]
+    fn scan_cancellation_is_polled_between_file_hash_chunks() {
+        let temp = TemporaryDirectory::new();
+        let path = temp.path().join("large.bin");
+        fs::write(&path, patterned_bytes(MAX_CHUNK_BYTES * 3)).unwrap();
+        let mut polls = 0_usize;
+        let result = OutboundTransferSource::scan_with_cancel(TransferId::new(), [&path], || {
+            polls += 1;
+            polls >= 9
+        });
+        assert!(matches!(result, Err(TransferError::Cancelled)));
+        assert!(polls >= 9);
+    }
+
+    #[test]
+    fn directory_enumeration_stops_at_its_preallocation_bound() {
+        let temp = TemporaryDirectory::new();
+        for name in ["a", "b", "c"] {
+            fs::write(temp.path().join(name), name.as_bytes()).unwrap();
+        }
+        let directory = Dir::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
+        let mut never_cancelled = || false;
+        assert!(matches!(
+            enumerate_children(
+                &directory,
+                &RelativePath::parse("root").unwrap(),
+                2,
+                &mut never_cancelled,
+            ),
+            Err(TransferError::InvalidManifest)
+        ));
+    }
+
+    #[test]
+    fn selected_leaf_replacement_between_anchor_and_canonicalization_is_rejected() {
+        let temp = TemporaryDirectory::new();
+        let path = temp.path().join("selected.txt");
+        let original = temp.path().join("original.txt");
+        fs::write(&path, b"original").unwrap();
+        let result = open_selected_root_with_hook(&path, || {
+            fs::rename(&path, &original).unwrap();
+            fs::write(&path, b"replacement").unwrap();
+        });
+        assert!(matches!(result, Err(TransferError::SourceChanged)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_identity_aliases_across_roots_are_rejected() {
+        let temp = TemporaryDirectory::new();
+        let first = temp.path().join("first.txt");
+        let second = temp.path().join("second.txt");
+        fs::write(&first, b"same inode").unwrap();
+        fs::hard_link(&first, &second).unwrap();
+        assert!(matches!(
+            OutboundTransferSource::scan(TransferId::new(), [&first, &second]),
+            Err(TransferError::SourceCycle)
+        ));
     }
 
     #[test]
@@ -844,6 +1073,10 @@ mod tests {
         fs::create_dir(&linked_folder).unwrap();
         fs::write(linked_folder.join("target.txt"), b"target").unwrap();
         symlink("target.txt", linked_folder.join("alias.txt")).unwrap();
+        assert!(matches!(
+            OutboundTransferSource::scan(TransferId::new(), [&linked_folder.join("alias.txt")]),
+            Err(TransferError::UnsafeSourceType)
+        ));
         assert!(matches!(
             OutboundTransferSource::scan(TransferId::new(), [&linked_folder]),
             Err(TransferError::UnsafeSourceType)

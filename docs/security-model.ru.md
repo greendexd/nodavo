@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 7 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 9 -->
 
 # Модель безопасности
 
@@ -38,7 +38,7 @@ Physical compromise paired-машины, kernel compromise, malicious firmware �
 - Silent trust-on-first-use запрещён.
 - Reset identity, key replacement и revoked trust требуют нового pairing.
 
-Private keys по возможности non-exportable и хранятся через macOS Keychain и Windows DPAPI/CNG. Trust records разделяют input, clipboard и file capabilities.
+Private keys по возможности non-exportable и хранятся через macOS Keychain и Windows DPAPI/CNG. Trust records разделяют input, clipboard и file capabilities. Локальная trust record также хранит ограниченное display name из pairing и ненулевую монотонно возрастающую local grant epoch. Legacy pre-alpha trust records мигрируют с нейтральным ограниченным display name и epoch `1`; миграция не выводит и не добавляет новые grants.
 
 Текущий pre-alpha agent также содержит явно предназначенный только для разработки versioned file fallback для локальной работы с двумя процессами. На Unix каталоги ограничены режимом `0700`, файлы — `0600`, decoding ограничен, а replacement выполняется атомарно, но этот fallback не выполняет production-требование Keychain/DPAPI и не должен попадать в stable storage.
 
@@ -52,6 +52,8 @@ Private keys по возможности non-exportable и хранятся че
 - Emergency disconnect выполняется локально и не зависит от peer.
 - Lock, sleep, timeout и disconnect освобождают keys/buttons и отзывают active lease.
 - Display snapshots являются critical, versioned, ограничены 32 записями, привязаны к сессии и защищены replay-проверкой. Native display IDs остаются локальными; peer может указать только непрозрачный token, установленный для этой аутентифицированной сессии.
+- Local и peer capability epochs разделены по направлениям. Входящие input, topology, clipboard и file metadata должны указывать текущую persistent local epoch получателя; исходящие metadata используют epoch, аутентифицированную от peer. Reconnect обменивается полными grants и epochs обеих сторон.
+- Изменения capabilities после pairing используют существующий mutually authenticated TLS control stream. Они не описываются как отдельно подписанные: trust boundary состоит из pinned mTLS-аутентификации peer, строгой проверки target/epoch и локальной OS-protected trust database. Каждое принятое изменение освобождает затронутое input/content state и закрывает старое соединение; reconnect обязан использовать persistent policy и заново согласованные epochs.
 
 ## Захват и эмуляция ввода
 
@@ -89,17 +91,26 @@ Private keys по возможности non-exportable и хранятся че
 - Полученные файлы не запускаются и не открываются автоматически.
 - Per-peer quotas, cancellation, backpressure и rate limits ограничивают DoS.
 
+Pre-alpha receiver пишет через capability-rooted no-follow handles каталогов и файлов. Staging root становится приватным до создания любого имени содержимого: на Unix проверяются permissions, а на Windows owner-only protected DACL создаётся атомарно через root-relative handle; permissive, inherited, foreign-owned, reparse и структурно неоднозначное состояние отклоняется. Один process-wide operation lease сериализует begin/resume/finalize/discard. Progress подтверждается только после flush файлов и журнала; поддерживаемые платформы также синхронизируют каждый изменённый destination-каталог от самого глубокого к корню, причём destination root — последним. Windows явно сообщает, что crash-flush directory entries не поддерживается, поэтому untracked resume после перезапуска агента отклоняется и не выдаётся за устойчивый к отключению питания.
+
+Исходный выбор закрепляется no-follow handles до canonicalization. Enumeration, manifest accounting, hashing, chunks, roots, stable file identities и cooperative cancellation ограничены. Links, reparse points, sparse/special files, overlapping roots, hard-link aliases, mutations, cycles и cross-platform path collisions отклоняются fail-closed. Publication никогда не перезаписывает существующий destination. Если поздняя ошибка многофайловой publication или cleanup делает безопасный rollback неоднозначным, staging owner переходит в poisoned state, а уже опубликованные Nodavo identities сохраняются для явного исправления вместо удаления потенциально подменённого pathname.
+
+Работающий агент связывает входящий transfer ID с peer только после аутентифицированного и разрешённого manifest и сохраняет эту peer-scoped связь при потере соединения. Revocation ждёт завершения workers и освобождения staging lease, затем удаляет только IDs, известные для этого peer. Durable peer-ownership journal между перезапусками агента пока не реализован; неизвестный persisted ID никогда не удаляется лишь потому, что peer предъявил его UUID. Outbound persistence между перезапусками процесса и durable persistence poisoned state также остаются stable-release gates.
+
 ## Локальный IPC
 
 - macOS использует user-owned Unix domain socket с restrictive permissions и peer credential checks.
 - Windows использует named pipe с ACL текущего пользователя и проверкой peer process context.
 - UI requests проходят capability checks; UI не читает private network keys напрямую.
+- Listing доверенных устройств ограничен 32 публичными summaries, содержащими только локальный peer identifier, ограниченное display name, состояние active/revoked и локально выданные grants. Сертификаты, endpoints, private material и независимо выданные peer grants исключены.
 
 Текущий pre-alpha Unix socket аутентифицирует только credential владельца, а Windows pipe — тот же SID/session. Это блокирует cross-user и remote clients, но пока не отличает подписанный UI Nodavo от другого процесса, уже работающего от того же пользователя. Поэтому signed-client или launch-bound authentication остаётся stable-release gate; чувствительные локальные запросы должны быть узко ограничены, а release storage не должно открывать UI приватные сетевые ключи.
 
 ## Обновления и supply chain
 
-Ниже перечислены обязательные требования к релизу, а не описание текущего pre-alpha репозитория:
+Pre-alpha crate обновлений проверяет ограниченные подписанные manifests и предоставляет effect-isolated contracts для HTTPS response policy, resumable content-addressed staging, streaming-проверки размера/digest, явного согласия пользователя, монотонного rollback persistence и восстановления через restart/health/rollback. Сам crate никогда не загружает и не запускает содержимое. Конкретные network adapters, OS-protected persistence состояния обновлений, подписанные platform installers, restart orchestration и product UI не интегрированы и остаются release gates.
+
+Ниже перечислены обязательные требования к релизу:
 
 - Артефакты релиза будут подписаны; сборки macOS пройдут notarization, а Windows будет использовать Authenticode.
 - Манифесты обновлений будут подписаны отдельным офлайн-ключом релиза.

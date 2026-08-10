@@ -11,11 +11,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Maximum serialized size of a single local IPC message.
 pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024;
+/// Maximum number of trusted-device summaries returned by one local IPC call.
+pub const MAX_TRUSTED_PEERS: usize = 32;
+/// Maximum explicit filesystem selections accepted by one send request.
+pub const MAX_SELECTED_PATHS: usize = 32;
+/// Maximum UTF-8 bytes accepted for one local selected path.
+pub const MAX_SELECTED_PATH_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum UiCommand {
     GetStatus,
+    ListTrustedPeers,
     BeginPairing {
         endpoint: String,
         #[serde(default)]
@@ -32,6 +39,10 @@ pub enum UiCommand {
     },
     RevokePeer {
         peer_id: String,
+    },
+    /// Sends only paths explicitly selected by the local user interface.
+    SendFiles {
+        paths: Vec<String>,
     },
     /// Requests a bounded focus lease on the connected peer.
     RequestRemoteFocus {
@@ -56,10 +67,32 @@ pub enum CapabilityName {
     Files,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedPeerState {
+    Active,
+    Revoked,
+}
+
+/// Public local summary of one trust record.
+///
+/// Certificate material, network locations, grant epochs, and private storage
+/// metadata are deliberately absent from this UI boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustedPeerSummary {
+    pub peer_id: String,
+    pub display_name: String,
+    pub state: TrustedPeerState,
+    pub local_grants: Vec<CapabilityName>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
     Status(AgentStatus),
+    TrustedPeers {
+        peers: Vec<TrustedPeerSummary>,
+    },
     PairingCode {
         pairing_id: String,
         peer_name: String,
@@ -73,6 +106,9 @@ pub enum AgentEvent {
         peer_id: String,
         capability: CapabilityName,
         enabled: bool,
+    },
+    TransferQueued {
+        transfer_id: String,
     },
     Error {
         code: String,
@@ -229,7 +265,8 @@ pub mod unix {
 #[cfg(test)]
 mod tests {
     use super::{
-        CapabilityName, IpcError, MAX_IPC_MESSAGE_SIZE, UiCommand, read_frame, write_frame,
+        AgentEvent, CapabilityName, IpcError, MAX_IPC_MESSAGE_SIZE, MAX_TRUSTED_PEERS,
+        TrustedPeerState, TrustedPeerSummary, UiCommand, read_frame, write_frame,
     };
 
     #[tokio::test]
@@ -296,6 +333,55 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"local_sleeping"}"#).unwrap(),
             UiCommand::LocalSleeping
+        );
+    }
+
+    #[test]
+    fn trusted_peer_response_is_bounded_and_contains_only_public_local_fields() {
+        let peers = (0..MAX_TRUSTED_PEERS)
+            .map(|index| TrustedPeerSummary {
+                peer_id: format!("{index:064x}"),
+                display_name: "x".repeat(63),
+                state: if index % 2 == 0 {
+                    TrustedPeerState::Active
+                } else {
+                    TrustedPeerState::Revoked
+                },
+                local_grants: vec![
+                    CapabilityName::Input,
+                    CapabilityName::ClipboardRead,
+                    CapabilityName::ClipboardWrite,
+                    CapabilityName::Files,
+                ],
+            })
+            .collect();
+        let encoded = serde_json::to_value(AgentEvent::TrustedPeers { peers }).unwrap();
+        assert!(serde_json::to_vec(&encoded).unwrap().len() < MAX_IPC_MESSAGE_SIZE);
+        let first = &encoded["peers"][0];
+        assert_eq!(first["state"], "active");
+        assert!(first.get("certificate_der").is_none());
+        assert!(first.get("last_endpoint").is_none());
+        assert!(first.get("grant_epoch").is_none());
+    }
+
+    #[test]
+    fn trusted_peer_listing_has_a_stable_command_name() {
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(r#"{"command":"list_trusted_peers"}"#).unwrap(),
+            UiCommand::ListTrustedPeers
+        );
+    }
+
+    #[test]
+    fn selected_file_request_has_a_stable_bounded_shape() {
+        let request = UiCommand::SendFiles {
+            paths: vec!["/Users/example/Documents/report.pdf".to_owned()],
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert!(encoded.len() < MAX_IPC_MESSAGE_SIZE);
+        assert_eq!(
+            serde_json::from_slice::<UiCommand>(&encoded).unwrap(),
+            request
         );
     }
 

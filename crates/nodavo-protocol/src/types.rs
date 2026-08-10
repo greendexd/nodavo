@@ -139,7 +139,7 @@ pub struct ProtocolVersion {
 
 impl ProtocolVersion {
     /// The only version understood by this pre-alpha codec.
-    pub const CURRENT: Self = Self { major: 1, minor: 3 };
+    pub const CURRENT: Self = Self { major: 1, minor: 4 };
 
     #[must_use]
     pub const fn new(major: u16, minor: u16) -> Self {

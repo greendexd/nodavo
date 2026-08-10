@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 7 -->
+<!-- doc-id: security-model; lang: en; revision: 9 -->
 
 # Security model
 
@@ -38,7 +38,7 @@ Physical compromise of either paired machine, kernel compromise, malicious firmw
 - Silent trust-on-first-use is not allowed.
 - Reset identity, key replacement, or revoked trust requires pairing again.
 
-Private keys are non-exportable where practical and stored with macOS Keychain and Windows DPAPI/CNG. Trust records distinguish input, clipboard, and file capabilities.
+Private keys are non-exportable where practical and stored with macOS Keychain and Windows DPAPI/CNG. Trust records distinguish input, clipboard, and file capabilities. The local trust record also stores the bounded pairing display name and a nonzero monotonically increasing local grant epoch. Legacy pre-alpha trust records migrate to a neutral bounded display name and epoch `1`; migration does not infer new grants.
 
 The current pre-alpha agent also contains an explicitly development-only, versioned file fallback for local two-process work. Unix directories are restricted to mode `0700`, files to `0600`, decoding is bounded, and atomic replacement is used, but this fallback does not satisfy the production Keychain/DPAPI requirement and must not ship as stable storage.
 
@@ -52,6 +52,8 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Emergency disconnect is processed locally and cannot depend on the peer.
 - Lock, sleep, timeout, and disconnect release all keys/buttons and revoke the active lease.
 - Display snapshots are critical, versioned, bounded to 32 records, session-bound, and replay-checked. Native display identifiers remain local; a peer can name only an opaque token installed for this authenticated session.
+- Local and peer capability epochs are directionally separate. Inbound input, topology, clipboard, and file metadata must cite the receiver's current persisted local epoch; outbound metadata cites the epoch authenticated from the peer. Reconnect exchanges both sides' complete grants and epochs.
+- Post-pair capability changes use the existing mutually authenticated TLS control stream. They are not described as separately signed: pinned mTLS peer authentication, strict target/epoch validation, and the local OS-protected trust database are the trust boundary. Every accepted change releases affected input/content state and closes the old connection; reconnect must use the persisted policy and newly negotiated epochs.
 
 ## Input capture and injection
 
@@ -89,17 +91,26 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Received files are not executed or automatically opened.
 - Per-peer quotas, cancellation, backpressure, and rate limits limit denial of service.
 
+The pre-alpha receiver writes through capability-rooted, no-follow directory and file handles. Its staging root is private before any content name is created: Unix permissions are verified, while Windows creates an owner-only protected DACL atomically through a root-relative handle and rejects permissive, inherited, foreign-owned, reparse, or structurally ambiguous state. One process-wide operation lease serializes begin/resume/finalize/discard. Progress is acknowledged only after file and journal flushes; supported platforms also sync every mutated destination directory deepest-first and the destination root last. Windows exposes that directory-entry crash flushing is unsupported, so an untracked resume after an agent restart is rejected rather than advertised as power-loss durable.
+
+Outbound selection is anchored by no-follow handles before canonicalization. Enumeration, manifest accounting, hashing, chunks, roots, stable file identities, and cooperative cancellation are bounded. Links, reparse points, sparse/special files, overlapping roots, hard-link aliases, mutations, cycles, and cross-platform path collisions fail closed. Publication never overwrites an existing destination. If a late multi-file publication or cleanup failure makes safe rollback ambiguous, the staging owner is poisoned and already published Nodavo identities are retained for explicit remediation instead of deleting a possibly substituted pathname.
+
+The running agent associates inbound transfer identifiers only after an authenticated, authorized manifest and keeps that association peer-scoped across link loss. Revocation waits for workers and the staging lease, then discards only identifiers known for that peer. A durable peer-ownership journal across agent restart is not implemented yet; unknown persisted identifiers are never deleted merely because a peer presents their UUID. Outbound process-restart persistence and durable poison persistence are also stable-release gates.
+
 ## Local IPC
 
 - macOS uses a user-owned Unix domain socket with restrictive permissions and peer credential checks.
 - Windows uses a named pipe with an ACL limited to the current user and validates the peer process context.
 - UI requests are capability checked; the UI does not directly read private network keys.
+- Trusted-device listing is bounded to 32 public summaries containing only the local peer identifier, bounded display name, active/revoked state, and locally issued grants. It excludes certificates, endpoints, private material, and the peer's independently issued grants.
 
 The current pre-alpha Unix socket authenticates only the owning user credential, and the Windows pipe authenticates the same SID/session. That blocks cross-user and remote clients but does not yet distinguish the signed Nodavo UI from another process already running as the same user. Signed-client or launch-bound authentication is therefore a stable-release gate; sensitive local requests remain narrowly bounded and release storage must not expose network private keys to the UI.
 
 ## Updates and supply chain
 
-The following are mandatory release requirements, not descriptions of the current pre-alpha repository:
+The pre-alpha update crate verifies bounded signed manifests and exposes effect-isolated contracts for HTTPS response policy, resumable content-addressed staging, streaming size/digest verification, explicit user consent, monotonic rollback persistence, and restart/health/rollback recovery. It never downloads or executes content by itself. Concrete network adapters, OS-protected update-state persistence, signed platform installers, restart orchestration, and product UI are not integrated and remain release gates.
+
+The following are mandatory release requirements:
 
 - Release artifacts will be code signed; macOS will be notarized and Windows will use Authenticode.
 - Update manifests will be signed with an offline-controlled release key.

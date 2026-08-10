@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 9 -->
+<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 10 -->
 
 # История изменений
 
@@ -27,9 +27,12 @@
 - Сквозные bounded clipboard channels: text/HTML/PNG/clear в macOS и Windows, а также строгий canonical BMP/DIB subset в Windows.
 - Production-default macOS Keychain storage с явным insecure-development file fallback, universal development app/DMG и fail-closed packaging path Developer ID/notarization.
 - Capability-rooted outbound file scanning/streaming с no-follow traversal, deterministic manifests, BLAKE3, mutation detection, resume evidence и безопасным receiver staging.
+- Directional persistent grant epochs, bounded trusted-device listing, транзакционные post-pair capability updates, peer-scoped cleanup при revocation и native trusted-device/file-selection UX для macOS и Windows.
+- Authenticated bounded file channels с background workers, cooperative scan cancellation, same-process resume после потери связи, completion ordering, process-wide staging leases, Windows owner-only DACL при создании и консервативной no-overwrite publication.
+- Fail-closed Windows x64+ARM64 development MSIXBundle pipeline и core state machine подписанных updates с bounded staging, consent, rollback floor и restart/health contracts.
 
 ### Пока недоступно
 
-- Рабочее или выпущенное приложение macOS ↔ Windows. Input/focus/clipboard объединены в pre-alpha agent, но реальная квалификация на двух машинах и file peer-channel/UI integration ещё отсутствуют.
-- Подтверждённая runtime-работа Windows agent/WinUI; также отсутствуют release signing, updater installation, trusted-device/grant UX, hot-plug layout UX, file orchestration и Windows ARM64 validation.
+- Рабочее или выпущенное приложение macOS ↔ Windows. Input/focus/clipboard/files объединены в pre-alpha agent и есть исходники native UX, но реальная квалификация на двух машинах ещё отсутствует.
+- Подтверждённая runtime-работа Windows agent/WinUI; также отсутствуют release signing, updater installation, hot-plug layout UX, подробный transfer progress/destinations, durable restart ownership journals и Windows ARM64 execution.
 - Полные матрицы безопасности, фаззинга, нагрузки, совместимости, обновлений, доступности и реальных устройств; они остаются условиями релиза функционально завершённой версии 1.0.

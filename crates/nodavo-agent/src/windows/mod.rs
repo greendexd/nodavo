@@ -19,7 +19,7 @@ use crate::{initialize_runtime, serve_connection};
 
 pub(crate) use self::platform::WindowsPlatformPort;
 
-fn default_state_directory() -> Result<PathBuf, &'static str> {
+pub(crate) fn default_state_directory() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("NODAVO_STATE_DIR") {
         return Ok(PathBuf::from(path));
     }

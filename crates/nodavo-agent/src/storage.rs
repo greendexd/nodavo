@@ -21,18 +21,24 @@ use nodavo_identity::{
     CapabilityGrants, DeviceId, PublicIdentity, Revocation, RevocationReason, SoftwareSigner,
     TransportCertificate, TrustRecord,
 };
+use nodavo_local_ipc::MAX_TRUSTED_PEERS;
+use nodavo_protocol::GrantEpoch;
 use nodavo_transport::quinn_backend::CertificateCredentials;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
-const STORAGE_FORMAT_VERSION: u16 = 1;
+const IDENTITY_FORMAT_VERSION: u16 = 1;
+const LEGACY_TRUST_FORMAT_VERSION: u16 = 1;
+const TRUST_FORMAT_VERSION: u16 = 2;
 #[cfg(unix)]
 const IDENTITY_FILE: &str = "development-identity-v1.json";
 #[cfg(unix)]
 const TRUST_FILE: &str = "development-trust-v1.json";
 pub(crate) const MAX_STORAGE_FILE_BYTES: u64 = 512 * 1024;
-const MAX_PEERS: usize = 32;
+const MAX_PEERS: usize = MAX_TRUSTED_PEERS;
+const MAX_DISPLAY_NAME_BYTES: usize = 63;
+const MIGRATED_DISPLAY_NAME: &str = "Previously trusted device";
 pub(crate) const MAX_PRIVATE_KEY_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_SERVER_NAME_BYTES: usize = 253;
@@ -44,6 +50,7 @@ pub(crate) struct DeviceMaterial {
     pub(crate) server_name: String,
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) type SplitIdentityPayloads = (DeviceMaterial, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
 impl DeviceMaterial {
@@ -61,6 +68,8 @@ pub(crate) struct PeerRecord {
     pub(crate) public_key: [u8; 32],
     pub(crate) certificate_der: Vec<u8>,
     pub(crate) grants: CapabilityGrants,
+    pub(crate) grant_epoch: GrantEpoch,
+    pub(crate) display_name: String,
     pub(crate) established_at_unix_ms: u64,
     pub(crate) revoked_at_unix_ms: Option<u64>,
     pub(crate) server_name: String,
@@ -196,6 +205,7 @@ struct IdentityDisk {
 
 #[derive(Deserialize, Serialize, Zeroize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 struct SigningSeedDisk {
     format_version: u16,
     ed25519_seed: String,
@@ -203,6 +213,7 @@ struct SigningSeedDisk {
 
 #[derive(Deserialize, Serialize, Zeroize)]
 #[serde(deny_unknown_fields)]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 struct TlsIdentityDisk {
     format_version: u16,
     certificate_der: String,
@@ -223,6 +234,10 @@ struct PeerDisk {
     public_key: String,
     certificate_der: String,
     grants: u8,
+    #[serde(default)]
+    grant_epoch: Option<u64>,
+    #[serde(default)]
+    display_name: Option<String>,
     established_at_unix_ms: u64,
     revoked_at_unix_ms: Option<u64>,
     server_name: String,
@@ -235,6 +250,8 @@ impl PeerDisk {
             public_key: STANDARD.encode(record.public_key),
             certificate_der: STANDARD.encode(&record.certificate_der),
             grants: record.grants.bits(),
+            grant_epoch: Some(record.grant_epoch.get()),
+            display_name: Some(record.display_name.clone()),
             established_at_unix_ms: record.established_at_unix_ms,
             revoked_at_unix_ms: record.revoked_at_unix_ms,
             server_name: record.server_name.clone(),
@@ -242,13 +259,30 @@ impl PeerDisk {
         }
     }
 
-    fn into_record(self) -> Result<PeerRecord, StorageError> {
+    fn into_record(self, format_version: u16) -> Result<PeerRecord, StorageError> {
         let public_key = decode_array::<32>(&self.public_key)?;
         let certificate_der = decode_bounded(&self.certificate_der, MAX_CERTIFICATE_BYTES)?;
         TransportCertificate::from_der(certificate_der.clone())
             .map_err(|_| StorageError::InvalidData)?;
         let grants =
             CapabilityGrants::from_bits(self.grants).map_err(|_| StorageError::InvalidData)?;
+        let (grant_epoch, display_name) = match format_version {
+            LEGACY_TRUST_FORMAT_VERSION
+                if self.grant_epoch.is_none() && self.display_name.is_none() =>
+            {
+                (GrantEpoch::new(1), MIGRATED_DISPLAY_NAME.to_owned())
+            }
+            TRUST_FORMAT_VERSION => {
+                let epoch = GrantEpoch::new(self.grant_epoch.ok_or(StorageError::InvalidData)?);
+                let display_name = self.display_name.ok_or(StorageError::InvalidData)?;
+                (epoch, display_name)
+            }
+            _ => return Err(StorageError::InvalidData),
+        };
+        if grant_epoch.is_zero() {
+            return Err(StorageError::InvalidData);
+        }
+        validate_display_name(&display_name)?;
         validate_server_name(&self.server_name)?;
         if self
             .revoked_at_unix_ms
@@ -264,6 +298,8 @@ impl PeerDisk {
             public_key,
             certificate_der,
             grants,
+            grant_epoch,
+            display_name,
             established_at_unix_ms: self.established_at_unix_ms,
             revoked_at_unix_ms: self.revoked_at_unix_ms,
             server_name: self.server_name,
@@ -275,7 +311,7 @@ impl PeerDisk {
 pub(crate) fn create_identity() -> Result<(DeviceMaterial, Zeroizing<Vec<u8>>), StorageError> {
     let (material, secret_seed) = generate_identity_material()?;
     let disk = Zeroizing::new(IdentityDisk {
-        format_version: STORAGE_FORMAT_VERSION,
+        format_version: IDENTITY_FORMAT_VERSION,
         ed25519_seed: STANDARD.encode(*secret_seed),
         certificate_der: STANDARD.encode(&material.certificate_der),
         private_key_pkcs8_der: STANDARD.encode(&*material.private_key_pkcs8_der),
@@ -285,14 +321,15 @@ pub(crate) fn create_identity() -> Result<(DeviceMaterial, Zeroizing<Vec<u8>>), 
     Ok((material, encoded))
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn create_split_identity() -> Result<SplitIdentityPayloads, StorageError> {
     let (material, secret_seed) = generate_identity_material()?;
     let signing = Zeroizing::new(SigningSeedDisk {
-        format_version: STORAGE_FORMAT_VERSION,
+        format_version: IDENTITY_FORMAT_VERSION,
         ed25519_seed: STANDARD.encode(*secret_seed),
     });
     let tls = Zeroizing::new(TlsIdentityDisk {
-        format_version: STORAGE_FORMAT_VERSION,
+        format_version: IDENTITY_FORMAT_VERSION,
         certificate_der: STANDARD.encode(&material.certificate_der),
         private_key_pkcs8_der: STANDARD.encode(&*material.private_key_pkcs8_der),
         server_name: material.server_name.clone(),
@@ -328,7 +365,7 @@ pub(crate) fn decode_identity(bytes: &[u8]) -> Result<DeviceMaterial, StorageErr
     let disk = Zeroizing::new(
         serde_json::from_slice::<IdentityDisk>(bytes).map_err(|_| StorageError::InvalidData)?,
     );
-    if disk.format_version != STORAGE_FORMAT_VERSION {
+    if disk.format_version != IDENTITY_FORMAT_VERSION {
         return Err(StorageError::InvalidData);
     }
     let secret_seed = Zeroizing::new(decode_array::<32>(&disk.ed25519_seed)?);
@@ -345,6 +382,7 @@ pub(crate) fn decode_identity(bytes: &[u8]) -> Result<DeviceMaterial, StorageErr
     )
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn decode_split_identity(
     signing_bytes: &[u8],
     tls_bytes: &[u8],
@@ -359,8 +397,8 @@ pub(crate) fn decode_split_identity(
         serde_json::from_slice::<TlsIdentityDisk>(tls_bytes)
             .map_err(|_| StorageError::InvalidData)?,
     );
-    if signing.format_version != STORAGE_FORMAT_VERSION
-        || tls.format_version != STORAGE_FORMAT_VERSION
+    if signing.format_version != IDENTITY_FORMAT_VERSION
+        || tls.format_version != IDENTITY_FORMAT_VERSION
     {
         return Err(StorageError::InvalidData);
     }
@@ -422,7 +460,7 @@ pub(crate) fn encode_peers(peers: &[PeerRecord]) -> Result<Vec<u8>, StorageError
         return Err(StorageError::InvalidData);
     }
     let disk = TrustDisk {
-        format_version: STORAGE_FORMAT_VERSION,
+        format_version: TRUST_FORMAT_VERSION,
         peers: peers.iter().map(PeerDisk::from_record).collect(),
     };
     let encoded = serde_json::to_vec(&disk).map_err(|_| StorageError::InvalidData)?;
@@ -437,14 +475,19 @@ pub(crate) fn decode_peers(bytes: &[u8]) -> Result<Vec<PeerRecord>, StorageError
         return Err(StorageError::InvalidData);
     }
     let disk: TrustDisk = serde_json::from_slice(bytes).map_err(|_| StorageError::InvalidData)?;
-    if disk.format_version != STORAGE_FORMAT_VERSION || disk.peers.len() > MAX_PEERS {
+    if !matches!(
+        disk.format_version,
+        LEGACY_TRUST_FORMAT_VERSION | TRUST_FORMAT_VERSION
+    ) || disk.peers.len() > MAX_PEERS
+    {
         return Err(StorageError::InvalidData);
     }
+    let format_version = disk.format_version;
     let mut ids = HashSet::with_capacity(disk.peers.len());
     disk.peers
         .into_iter()
         .map(|peer| {
-            let record = peer.into_record()?;
+            let record = peer.into_record(format_version)?;
             if !ids.insert(record.device_id()) {
                 return Err(StorageError::InvalidData);
             }
@@ -480,6 +523,18 @@ fn decode_bounded(encoded: &str, maximum: usize) -> Result<Vec<u8>, StorageError
 
 fn validate_server_name(name: &str) -> Result<(), StorageError> {
     if name.is_empty() || name.len() > MAX_SERVER_NAME_BYTES || !name.is_ascii() {
+        Err(StorageError::InvalidData)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_display_name(name: &str) -> Result<(), StorageError> {
+    if name.is_empty()
+        || name.len() > MAX_DISPLAY_NAME_BYTES
+        || name.trim() != name
+        || name.chars().any(char::is_control)
+    {
         Err(StorageError::InvalidData)
     } else {
         Ok(())
@@ -641,6 +696,8 @@ mod tests {
             public_key: [7_u8; 32],
             certificate_der: generated.cert.der().to_vec(),
             grants: CapabilityGrants::NONE,
+            grant_epoch: GrantEpoch::new(1),
+            display_name: "Test peer".to_owned(),
             established_at_unix_ms: 10,
             revoked_at_unix_ms: Some(11),
             server_name: "peer.nodavo.invalid".to_owned(),
@@ -649,5 +706,46 @@ mod tests {
         let trust = record.restored_trust().unwrap();
         assert!(!trust.is_active());
         assert!(trust.transport_binding().is_none());
+    }
+
+    #[test]
+    fn legacy_trust_migrates_to_named_epoch_records_without_losing_grants() {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
+        let record = PeerRecord {
+            public_key: [8_u8; 32],
+            certificate_der: generated.cert.der().to_vec(),
+            grants: CapabilityGrants::NONE.with(nodavo_identity::Capability::RemoteInput),
+            grant_epoch: GrantEpoch::new(7),
+            display_name: "Current peer name".to_owned(),
+            established_at_unix_ms: 10,
+            revoked_at_unix_ms: None,
+            server_name: "peer.nodavo.invalid".to_owned(),
+            last_endpoint: Some("127.0.0.1:4431".parse().unwrap()),
+        };
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&encode_peers(std::slice::from_ref(&record)).unwrap()).unwrap();
+        legacy["format_version"] = 1.into();
+        legacy["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("grant_epoch");
+        legacy["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+
+        let migrated = decode_peers(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(migrated[0].grants, record.grants);
+        assert_eq!(migrated[0].grant_epoch, GrantEpoch::new(1));
+        assert_eq!(migrated[0].display_name, MIGRATED_DISPLAY_NAME);
+
+        let persisted = encode_peers(&migrated).unwrap();
+        let round_trip = decode_peers(&persisted).unwrap();
+        assert_eq!(round_trip, migrated);
+        let encoded: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(encoded["format_version"], TRUST_FORMAT_VERSION);
+        assert_eq!(encoded["peers"][0]["grant_epoch"], 1);
+        assert_eq!(encoded["peers"][0]["display_name"], MIGRATED_DISPLAY_NAME);
     }
 }

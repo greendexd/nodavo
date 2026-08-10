@@ -253,6 +253,18 @@ impl PeerTopologyState {
         self.local.reconcile(snapshots)
     }
 
+    pub(crate) fn invalidate_local_authorization(&mut self) {
+        self.published_local_revision = None;
+        self.ready_local_revision = None;
+    }
+
+    pub(crate) fn invalidate_remote_authorization(&mut self) {
+        self.staged_remote = None;
+        self.remote = None;
+        self.active_route = None;
+        self.pending_target = None;
+    }
+
     pub(crate) fn stage_remote(
         &mut self,
         topology: DisplayTopology,

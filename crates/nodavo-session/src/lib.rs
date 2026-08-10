@@ -148,14 +148,19 @@ pub enum Event {
     SessionEstablished {
         session_id: SessionId,
         peer_id: DeviceId,
-        grant_epoch: GrantEpoch,
+        local_grant_epoch: GrantEpoch,
+        peer_grant_epoch: GrantEpoch,
         local_grant_allows_peer_input: bool,
         peer_grant_allows_local_input: bool,
     },
-    /// A trusted local authorization update. Epochs must increase.
-    GrantUpdated {
-        grant_epoch: GrantEpoch,
+    /// A trusted local authorization update. Epochs must advance exactly once.
+    LocalGrantUpdated {
+        local_grant_epoch: GrantEpoch,
         local_grant_allows_peer_input: bool,
+    },
+    /// An authenticated update to the capabilities granted by the peer.
+    PeerGrantUpdated {
+        peer_grant_epoch: GrantEpoch,
         peer_grant_allows_local_input: bool,
     },
     /// Records the revision most recently sent by this endpoint. The runtime
@@ -241,6 +246,9 @@ pub enum Event {
     LocalEmergencyStop,
     LocalLocked,
     LocalSleeping,
+    /// Close an authenticated session so persisted configuration becomes
+    /// authoritative on a fresh set of streams. Durable content may resume.
+    ReconnectRequested,
     LinkDisconnected,
 }
 
@@ -250,9 +258,9 @@ pub enum DisconnectReason {
     EmergencyStop,
     LocalLocked,
     LocalSleeping,
+    RequestedReconnect,
     LinkLost,
     FocusLeaseExpired,
-    GrantChanged,
 }
 
 /// Why an event was rejected without applying its requested action.
@@ -341,6 +349,10 @@ pub enum Effect {
         releases: Vec<InputEvent>,
     },
     RestoreLocalOwnership,
+    /// Stop session-bound content work while retaining durable/restartable
+    /// state for a newly authenticated session.
+    SuspendContentOperations,
+    /// Cancel content work and discard durable partial state.
     AbortContentOperations,
     Disconnect {
         reason: DisconnectReason,
@@ -384,7 +396,8 @@ pub struct SessionCore {
     focus: FocusState,
     session_id: Option<SessionId>,
     peer_id: Option<DeviceId>,
-    grant_epoch: Option<GrantEpoch>,
+    local_grant_epoch: Option<GrantEpoch>,
+    peer_grant_epoch: Option<GrantEpoch>,
     remote_sequences: SequenceWatermarks,
     local_grant_allows_peer_input: bool,
     peer_grant_allows_local_input: bool,
@@ -419,8 +432,13 @@ impl SessionCore {
     }
 
     #[must_use]
-    pub const fn grant_epoch(&self) -> Option<GrantEpoch> {
-        self.grant_epoch
+    pub const fn local_grant_epoch(&self) -> Option<GrantEpoch> {
+        self.local_grant_epoch
+    }
+
+    #[must_use]
+    pub const fn peer_grant_epoch(&self) -> Option<GrantEpoch> {
+        self.peer_grant_epoch
     }
 
     #[must_use]
@@ -503,7 +521,8 @@ impl SessionCore {
             Event::SessionEstablished {
                 session_id,
                 peer_id,
-                grant_epoch,
+                local_grant_epoch,
+                peer_grant_epoch,
                 local_grant_allows_peer_input,
                 peer_grant_allows_local_input,
             } if self.link == LinkState::Negotiating => {
@@ -511,7 +530,8 @@ impl SessionCore {
                 self.focus = FocusState::Local;
                 self.session_id = Some(session_id);
                 self.peer_id = Some(peer_id);
-                self.grant_epoch = Some(grant_epoch);
+                self.local_grant_epoch = Some(local_grant_epoch);
+                self.peer_grant_epoch = Some(peer_grant_epoch);
                 self.remote_sequences = SequenceWatermarks::default();
                 self.local_grant_allows_peer_input = local_grant_allows_peer_input;
                 self.peer_grant_allows_local_input = peer_grant_allows_local_input;
@@ -521,15 +541,14 @@ impl SessionCore {
                 self.clear_pointer_enter_state();
                 Vec::new()
             }
-            Event::GrantUpdated {
-                grant_epoch,
+            Event::LocalGrantUpdated {
+                local_grant_epoch,
                 local_grant_allows_peer_input,
+            } => self.update_local_grant(local_grant_epoch, local_grant_allows_peer_input),
+            Event::PeerGrantUpdated {
+                peer_grant_epoch,
                 peer_grant_allows_local_input,
-            } => self.update_grant(
-                grant_epoch,
-                local_grant_allows_peer_input,
-                peer_grant_allows_local_input,
-            ),
+            } => self.update_peer_grant(peer_grant_epoch, peer_grant_allows_local_input),
             Event::LocalTopologyPublished { revision } => self.publish_local_topology(revision),
             Event::RemoteTopologyReceived { meta, revision } => {
                 self.accept_remote_topology(meta, revision)
@@ -705,6 +724,7 @@ impl SessionCore {
             Event::LocalEmergencyStop => self.recover(DisconnectReason::EmergencyStop),
             Event::LocalLocked => self.recover(DisconnectReason::LocalLocked),
             Event::LocalSleeping => self.recover(DisconnectReason::LocalSleeping),
+            Event::ReconnectRequested => self.recover(DisconnectReason::RequestedReconnect),
             Event::LinkDisconnected => self.recover(DisconnectReason::LinkLost),
             Event::ConnectStarted
             | Event::TransportConnected
@@ -715,38 +735,72 @@ impl SessionCore {
         }
     }
 
-    fn update_grant(
+    fn update_local_grant(
         &mut self,
-        grant_epoch: GrantEpoch,
+        local_grant_epoch: GrantEpoch,
         local_grant_allows_peer_input: bool,
-        peer_grant_allows_local_input: bool,
     ) -> Vec<Effect> {
-        let Some(current) = self.grant_epoch else {
+        let Some(current) = self.local_grant_epoch else {
             return rejected(RejectReason::NoSession);
         };
-        if grant_epoch <= current {
+        if !is_next_epoch(current, local_grant_epoch) {
             return rejected(RejectReason::GrantEpochDidNotIncrease);
         }
 
-        // Any authorization epoch change invalidates leases established under
-        // the previous epoch, even if the resulting capability set is equal.
-        let needs_recovery = self.focus != FocusState::Local
-            || !self.injected_pressed.is_empty()
-            || !self.routed_pressed.is_empty();
-        self.grant_epoch = Some(grant_epoch);
+        self.local_grant_epoch = Some(local_grant_epoch);
         self.remote_sequences = SequenceWatermarks::default();
         self.local_grant_allows_peer_input = local_grant_allows_peer_input;
-        self.peer_grant_allows_local_input = peer_grant_allows_local_input;
         self.published_topology_revision = None;
         self.acknowledged_topology_revision = None;
-        self.remote_topology_revision = None;
-        self.clear_pointer_enter_state();
 
-        if needs_recovery {
-            self.recover(DisconnectReason::GrantChanged)
+        if self.focus != FocusState::Local
+            || !self.injected_pressed.is_empty()
+            || !self.routed_pressed.is_empty()
+        {
+            self.release_lease_for_grant_change()
         } else {
+            self.clear_pointer_enter_state();
             Vec::new()
         }
+    }
+
+    fn update_peer_grant(
+        &mut self,
+        peer_grant_epoch: GrantEpoch,
+        peer_grant_allows_local_input: bool,
+    ) -> Vec<Effect> {
+        let Some(current) = self.peer_grant_epoch else {
+            return rejected(RejectReason::NoSession);
+        };
+        if !is_next_epoch(current, peer_grant_epoch) {
+            return rejected(RejectReason::GrantEpochDidNotIncrease);
+        }
+
+        self.peer_grant_epoch = Some(peer_grant_epoch);
+        self.peer_grant_allows_local_input = peer_grant_allows_local_input;
+        self.remote_topology_revision = None;
+
+        if self.focus != FocusState::Local
+            || !self.injected_pressed.is_empty()
+            || !self.routed_pressed.is_empty()
+        {
+            self.release_lease_for_grant_change()
+        } else {
+            self.clear_pointer_enter_state();
+            Vec::new()
+        }
+    }
+
+    fn release_lease_for_grant_change(&mut self) -> Vec<Effect> {
+        let releases = self.injected_pressed.take_forced_releases();
+        let _ = self.routed_pressed.take_forced_releases();
+        self.focus = FocusState::Local;
+        self.clear_pointer_enter_state();
+        vec![
+            Effect::ReleaseInjectedInput { releases },
+            Effect::RestoreLocalOwnership,
+            Effect::CancelFocusLease,
+        ]
     }
 
     fn publish_local_topology(&mut self, revision: u64) -> Vec<Effect> {
@@ -1102,7 +1156,7 @@ impl SessionCore {
         if Some(meta.origin()) != self.peer_id {
             return Err(RejectReason::WrongOrigin);
         }
-        if Some(meta.grant_epoch()) != self.grant_epoch {
+        if Some(meta.grant_epoch()) != self.local_grant_epoch {
             return Err(RejectReason::WrongGrantEpoch);
         }
         if meta.capability() != Capability::REMOTE_INPUT {
@@ -1161,7 +1215,8 @@ impl SessionCore {
         self.link = LinkState::Down;
         self.session_id = None;
         self.peer_id = None;
-        self.grant_epoch = None;
+        self.local_grant_epoch = None;
+        self.peer_grant_epoch = None;
         self.remote_sequences = SequenceWatermarks::default();
         self.local_grant_allows_peer_input = false;
         self.peer_grant_allows_local_input = false;
@@ -1179,12 +1234,18 @@ impl SessionCore {
                 releases: remote_releases,
             });
         }
-        effects.extend([
-            Effect::RestoreLocalOwnership,
-            Effect::CancelFocusLease,
-            Effect::AbortContentOperations,
-            Effect::Disconnect { reason },
-        ]);
+        effects.extend([Effect::RestoreLocalOwnership, Effect::CancelFocusLease]);
+        effects.push(
+            if matches!(
+                reason,
+                DisconnectReason::LinkLost | DisconnectReason::RequestedReconnect
+            ) {
+                Effect::SuspendContentOperations
+            } else {
+                Effect::AbortContentOperations
+            },
+        );
+        effects.push(Effect::Disconnect { reason });
         effects
     }
 
@@ -1205,6 +1266,13 @@ const fn input_sequence_lane(input: InputEvent) -> SequenceLane {
 
 fn rejected(reason: RejectReason) -> Vec<Effect> {
     vec![Effect::Rejected { reason }]
+}
+
+const fn is_next_epoch(current: GrantEpoch, next: GrantEpoch) -> bool {
+    match current.get().checked_add(1) {
+        Some(expected) => next.get() == expected,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -1231,7 +1299,8 @@ mod tests {
             core.handle(Event::SessionEstablished {
                 session_id: session,
                 peer_id: DeviceId::new([9; 32]),
-                grant_epoch: epoch,
+                local_grant_epoch: epoch,
+                peer_grant_epoch: GrantEpoch::new(8),
                 local_grant_allows_peer_input,
                 peer_grant_allows_local_input,
             })
@@ -1654,7 +1723,9 @@ mod tests {
         );
         assert!(!effects.iter().any(|effect| matches!(
             effect,
-            Effect::AbortContentOperations | Effect::Disconnect { .. }
+            Effect::SuspendContentOperations
+                | Effect::AbortContentOperations
+                | Effect::Disconnect { .. }
         )));
     }
 
@@ -1785,21 +1856,43 @@ mod tests {
     }
 
     #[test]
-    fn only_safety_terminal_events_disconnect() {
+    fn terminal_events_explicitly_split_suspend_from_abort() {
         let cases = [
-            (Event::LocalEmergencyStop, DisconnectReason::EmergencyStop),
-            (Event::LocalLocked, DisconnectReason::LocalLocked),
-            (Event::LocalSleeping, DisconnectReason::LocalSleeping),
-            (Event::LinkDisconnected, DisconnectReason::LinkLost),
+            (
+                Event::LocalEmergencyStop,
+                DisconnectReason::EmergencyStop,
+                Effect::AbortContentOperations,
+            ),
+            (
+                Event::LocalLocked,
+                DisconnectReason::LocalLocked,
+                Effect::AbortContentOperations,
+            ),
+            (
+                Event::LocalSleeping,
+                DisconnectReason::LocalSleeping,
+                Effect::AbortContentOperations,
+            ),
+            (
+                Event::ReconnectRequested,
+                DisconnectReason::RequestedReconnect,
+                Effect::SuspendContentOperations,
+            ),
+            (
+                Event::LinkDisconnected,
+                DisconnectReason::LinkLost,
+                Effect::SuspendContentOperations,
+            ),
             (
                 Event::TimerElapsed {
                     now: MonotonicMillis::new(100),
                 },
                 DisconnectReason::FocusLeaseExpired,
+                Effect::AbortContentOperations,
             ),
         ];
 
-        for (terminal, expected_reason) in cases {
+        for (terminal, expected_reason, expected_content_effect) in cases {
             let (mut core, session, epoch) = ready_core(true, true);
             let lease = LeaseId::new(11);
             accept_peer_focus(&mut core, session, epoch, 1, lease);
@@ -1833,27 +1926,84 @@ mod tests {
                     reason: expected_reason,
                 })
             );
+            assert!(effects.contains(&expected_content_effect));
         }
     }
 
     #[test]
-    fn grant_epoch_change_invalidates_the_active_lease() {
+    fn local_grant_epoch_replay_is_rejected_and_inbound_focus_is_released() {
         let (mut core, session, epoch) = ready_core(true, true);
         accept_peer_focus(&mut core, session, epoch, 1, LeaseId::new(12));
 
-        let effects = core.handle(Event::GrantUpdated {
-            grant_epoch: GrantEpoch::new(4),
+        let effects = core.handle(Event::LocalGrantUpdated {
+            local_grant_epoch: GrantEpoch::new(4),
             local_grant_allows_peer_input: false,
-            peer_grant_allows_local_input: true,
         });
 
-        assert_eq!(core.link_state(), LinkState::Down);
+        assert_eq!(core.link_state(), LinkState::Ready);
         assert_eq!(core.focus_state(), FocusState::Local);
         assert_eq!(
-            effects.last(),
-            Some(&Effect::Disconnect {
-                reason: DisconnectReason::GrantChanged,
-            })
+            effects,
+            vec![
+                Effect::ReleaseInjectedInput {
+                    releases: Vec::new(),
+                },
+                Effect::RestoreLocalOwnership,
+                Effect::CancelFocusLease,
+            ]
+        );
+        assert_eq!(core.local_grant_epoch(), Some(GrantEpoch::new(4)));
+        assert_eq!(core.peer_grant_epoch(), Some(GrantEpoch::new(8)));
+        assert_eq!(
+            core.handle(Event::LocalGrantUpdated {
+                local_grant_epoch: GrantEpoch::new(4),
+                local_grant_allows_peer_input: true,
+            }),
+            rejected(RejectReason::GrantEpochDidNotIncrease)
+        );
+        assert_eq!(
+            core.handle(Event::LocalGrantUpdated {
+                local_grant_epoch: GrantEpoch::new(6),
+                local_grant_allows_peer_input: true,
+            }),
+            rejected(RejectReason::GrantEpochDidNotIncrease)
+        );
+    }
+
+    #[test]
+    fn peer_grant_update_changes_only_outbound_authority_and_releases_routing() {
+        let (mut core, _session, _epoch) = ready_core(true, true);
+        core.focus = FocusState::ControllingRemote {
+            lease_id: LeaseId::new(42),
+            expires_at: MonotonicMillis::new(100),
+        };
+        core.routed_pressed.apply(&key_down(4));
+
+        assert_eq!(
+            core.handle(Event::PeerGrantUpdated {
+                peer_grant_epoch: GrantEpoch::new(9),
+                peer_grant_allows_local_input: false,
+            }),
+            vec![
+                Effect::ReleaseInjectedInput {
+                    releases: Vec::new(),
+                },
+                Effect::RestoreLocalOwnership,
+                Effect::CancelFocusLease,
+            ]
+        );
+        assert_eq!(core.focus_state(), FocusState::Local);
+        assert!(core.routed_input_is_clear());
+        assert!(core.local_grant_allows_peer_input());
+        assert!(!core.peer_grant_allows_local_input());
+        assert_eq!(core.local_grant_epoch(), Some(GrantEpoch::new(3)));
+        assert_eq!(core.peer_grant_epoch(), Some(GrantEpoch::new(9)));
+        assert_eq!(
+            core.handle(Event::PeerGrantUpdated {
+                peer_grant_epoch: GrantEpoch::new(9),
+                peer_grant_allows_local_input: true,
+            }),
+            rejected(RejectReason::GrantEpochDidNotIncrease)
         );
     }
 }

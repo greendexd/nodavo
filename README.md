@@ -1,4 +1,4 @@
-<!-- doc-id: readme; lang: en; revision: 10 -->
+<!-- doc-id: readme; lang: en; revision: 11 -->
 
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="Nodavo logo">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> Nodavo is under active pre-alpha implementation. There is no supported cross-machine build or public release yet. The integrated Rust agent, macOS shell, and WinUI 3 x64 shell compile in CI, and a clearly labeled development macOS app/DMG can be built, but real Mac ↔ PC runtime qualification, release signing, installers, and the complete file-transfer/product UX are not finished.
+> Nodavo is under active pre-alpha implementation. There is no supported cross-machine build or public release yet. The integrated Rust agent, macOS shell, and WinUI 3 x64 shell compile in CI, and clearly labeled development packaging exists for macOS and Windows, but real Mac ↔ PC runtime qualification, release signing, clean installation, detailed transfer progress, and the full release test matrix are not finished.
 
 ## Vision
 
@@ -43,11 +43,11 @@ The implementation will be written from scratch. Existing software KVM projects 
 | Mouse and keyboard sharing | macOS ↔ Windows, both directions | Both native bridges are wired to authenticated equal-peer sessions. Reliable pointer entry is acknowledged before suppression; relative motion, HID/media keys, buttons, scroll, focus leases, forced release, and lifecycle recovery pass virtual/native-inert checks. Real Mac ↔ PC hardware proof is still missing |
 | Seamless edge switching | Mixed DPI and multi-monitor layouts | Authenticated session-scoped topology, mixed-DPI transforms, explicit edge routes, debounce/hysteresis, reliable entry, and relative deltas are wired. The layout editor, hot-plug refresh, and physical multi-monitor proof are missing |
 | Clipboard | UTF-8 text, HTML, PNG/BMP | The reliable peer channel enforces independent grants, bounded streaming, BLAKE3, loop prevention, and cleanup. macOS supports text/HTML/PNG/clear; Windows supports text/HTML/PNG/clear and a strict BMP subset. Windows has compile/parser evidence only |
-| Files and folders | Copy/paste, queue, resume, integrity checks | Safe receive staging, durable exact-offset resume, queueing, and no-overwrite finalization exist. A capability-rooted outbound scanner/source rejects links/reparse points, sparse/special files, mutation, collisions, and unsafe resume. Peer channels and native transfer UI are not wired |
+| Files and folders | Copy/paste, queue, resume, integrity checks | Authenticated manifest/data channels, bounded background workers, explicit native pickers on both shells, exact-offset same-process resume, peer-scoped revoke cleanup, BLAKE3, private no-follow staging, and no-overwrite publication pass focused/virtual checks. Detailed progress, real cross-machine proof, process-restart outbound/owner journals, and Windows power-loss directory durability are missing |
 | Discovery | mDNS with manual IP fallback | The agent resolves bounded mDNS records and accepts manual addresses; automatic device-list UX is missing |
-| Pairing | User-confirmed short code and pinned device identities | Pairing-time grants, signed trust, pinned mutual TLS reconnect, and revocation work in agent smoke tests. macOS defaults to Keychain and Windows to DPAPI; signed/provisioned Keychain success, Windows runtime validation, trusted-device UI, and post-pair grant changes remain |
-| Transport | QUIC with TLS 1.3 | Pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback, and clipboard run over one mutually authenticated connection. File peer channels are not wired yet |
-| Platforms | macOS 13+ and Windows 10 22H2/11, x64 and ARM64 | SwiftUI and WinUI 3 x64 compile in CI; Rust checks for macOS arm64/x64 and Windows x64, and a universal development macOS app/DMG is reproducibly assembled. Windows runtime, Windows ARM64, Developer ID/notarization, and release installers remain unproven |
+| Pairing | User-confirmed short code and pinned device identities | Pairing-time grants, signed trust, pinned mutual TLS reconnect, directional grant epochs, transactional post-pair changes, bounded trusted-device listing, and revocation work in focused tests. Both native shells expose this UX. Signed/provisioned Keychain success and real Windows runtime validation remain |
+| Transport | QUIC with TLS 1.3 | Pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback, clipboard, and bounded file channels run over one mutually authenticated connection in focused/virtual tests. Real two-device loss/reorder/performance qualification is missing |
+| Platforms | macOS 13+ and Windows 10 22H2/11, x64 and ARM64 | SwiftUI and WinUI 3 x64 compile in CI; Rust checks for macOS arm64/x64 and Windows x64, a universal development macOS app/DMG is reproducibly assembled, and a fail-closed Windows x64+ARM64 development MSIXBundle workflow exists. Windows runtime/ARM64 execution, Developer ID/notarization, production Authenticode, and clean installer matrices remain unproven |
 
 Screen streaming, internet relay, mobile clients, Linux support, and Windows secure-desktop control are not part of the initial 1.0 scope.
 
@@ -55,16 +55,17 @@ Screen streaming, internet relay, mobile clients, Linux support, and Windows sec
 
 - A Rust workspace with bounded protocol, identity, transport, session, discovery, clipboard, transfer, update-verification, and local-IPC components.
 - A per-user Rust agent with private local IPC, manual/mDNS pairing, explicit pairing-time grants, signed trust, pinned reconnect, revocation, negotiated peer sessions, authenticated topology, relative input, clipboard synchronization, deterministic safety recovery, and emergency stop. macOS uses Keychain by default; its file store requires an explicit insecure-development flag.
-- A bilingual SwiftUI macOS menu-bar shell connected to the private local agent socket, including manual/listening pairing and explicit code confirmation.
-- A bilingual WinUI 3 shell with bounded status, emergency stop, manual/listening pairing, and explicit short-code confirmation over the protected named pipe. GitHub Actions compiles its x64 Release configuration; it has not been run interactively on Windows.
+- A bilingual SwiftUI macOS menu-bar shell connected to the private local agent socket, including pairing, trusted-device/grant management, confirmed revocation, and explicit file/folder selection.
+- A bilingual WinUI 3 shell with bounded status, emergency stop, pairing, trusted-device/grant management, confirmed revocation, and explicit file/folder selection over the protected named pipe. Ambiguous grant/transfer outcomes reconcile or lock retries instead of claiming rollback. GitHub Actions compiles its x64 Release configuration; it has not been run interactively on Windows.
 - Original macOS and Windows input/clipboard runtimes wired into the agent, with default-off suppression, injected-event rejection, bounded relative motion, lifecycle recovery, deterministic release, and content-redacted failures.
-- A bounded transfer queue, durable private receiver staging, and a capability-rooted outbound filesystem source with exact hashes, resume evidence, mutation detection, and no-follow path handling. Network/file-selection orchestration remains.
+- Authenticated bounded file channels, a four-reservation process worker, cooperative scan cancellation, peer-scoped cleanup, private capability-rooted receiver staging, and an outbound filesystem source with exact hashes, mutation detection, no-follow handles, Windows birth-time DACLs, and conservative no-overwrite publication.
 - A universal development macOS app/DMG pipeline and a fail-closed Developer ID/provisioning/notarization release path. Release credentials are unavailable, so only the explicitly non-distributable development artifact has been built.
+- A signed-update state-machine core with bounded HTTPS/staging contracts, explicit consent, rollback floors, and restart/health recovery. It has no concrete network, protected persistence, installer, or product-UI adapters yet.
 
 ### What still blocks a usable build
 
 - Real interactive Mac ↔ Windows validation of input, relative edge crossing, DPI, lifecycle, clipboard, DPAPI, named-pipe/WinUI flow, and recovery; Windows ARM64 evidence is also missing.
-- File manifest/data channel orchestration, user-selected destinations, transfer queue UI, trusted-device and post-pair permission management, hot-plug layout editing, onboarding, diagnostics, and updater installation.
+- Real peer file-transfer qualification, user-selected receive destinations, detailed progress/cancel history, durable peer/outbound ownership across agent restart, hot-plug layout editing, onboarding, diagnostics, and updater installation.
 - A signed/provisioned macOS run proving Keychain/TCC stability, plus Developer ID/notarization and Authenticode/MSIX/MSI release credentials and clean install/upgrade/uninstall matrices.
 - The full security, fuzz, stress, compatibility, accessibility, long-running beta, external-review, SBOM/provenance, and real-hardware gates required for 1.0.
 
