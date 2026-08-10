@@ -1,6 +1,9 @@
 //! Ordered receive-side orchestration over a platform staging boundary.
 
-use crate::{EntryKind, StagingArea, TransferChunk, TransferError, TransferId, TransferManifest};
+use crate::{
+    EntryKind, ResumableStagingArea, StagingArea, TransferChunk, TransferError, TransferId,
+    TransferManifest,
+};
 
 /// Filename-free progress suitable for local status surfaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,12 +186,88 @@ where
     }
 }
 
+impl<S> TransferReceiver<S>
+where
+    S: ResumableStagingArea,
+{
+    /// Reopens one interrupted transfer from staging-owned durable evidence.
+    ///
+    /// The receiver does not trust caller-provided offsets. The staging
+    /// implementation validates its journal and staged files first, truncates
+    /// torn data, and returns the only offsets admitted here.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an already active receiver, malformed/mismatched progress, an
+    /// offset beyond its manifest entry, or an aggregate progress overflow.
+    pub fn resume(
+        &mut self,
+        transfer: TransferId,
+        manifest: TransferManifest,
+    ) -> Result<ActiveReceiveSnapshot, TransferError> {
+        if self.active.is_some() {
+            return Err(TransferError::TransferNotActive);
+        }
+        let state = self.staging.resume(transfer, &manifest)?;
+        if state.transfer() != transfer || state.entry_count() != manifest.entries().len() {
+            self.staging.abort(transfer);
+            return Err(TransferError::InvalidResumeState);
+        }
+        let validated = (|| {
+            let mut next_offsets = Vec::with_capacity(state.entry_count());
+            let mut completed_bytes = 0_u64;
+            for (index, entry) in manifest.entries().iter().enumerate() {
+                let offset = state
+                    .next_offset(index)
+                    .ok_or(TransferError::InvalidResumeState)?;
+                match entry.kind {
+                    EntryKind::File if offset <= entry.size => {
+                        completed_bytes = completed_bytes
+                            .checked_add(offset)
+                            .ok_or(TransferError::InvalidResumeState)?;
+                    }
+                    EntryKind::Directory if offset == 0 => {}
+                    EntryKind::File | EntryKind::Directory => {
+                        return Err(TransferError::InvalidResumeState);
+                    }
+                }
+                next_offsets.push(offset);
+            }
+            if completed_bytes > manifest.total_bytes() {
+                return Err(TransferError::InvalidResumeState);
+            }
+            Ok((next_offsets, completed_bytes))
+        })();
+        let (next_offsets, completed_bytes) = match validated {
+            Ok(validated) => validated,
+            Err(error) => {
+                self.staging.abort(transfer);
+                return Err(error);
+            }
+        };
+        let snapshot = ActiveReceiveSnapshot {
+            transfer,
+            total_bytes: manifest.total_bytes(),
+            completed_bytes,
+        };
+        self.active = Some(ActiveReceive {
+            id: transfer,
+            manifest,
+            next_offsets,
+            completed_bytes,
+        });
+        Ok(snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use bytes::Bytes;
 
     use super::*;
-    use crate::{ContentHash, ManifestEntry, RelativePath, TransferFuture};
+    use crate::{ContentHash, FileSystemStagingArea, ManifestEntry, RelativePath, TransferFuture};
 
     #[derive(Default)]
     struct MemoryStaging {
@@ -250,6 +329,15 @@ mod tests {
             hash: Some(ContentHash::digest(bytes)),
         }])
         .unwrap()
+    }
+
+    fn temporary_directory() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nodavo-receiver-resume-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&path).unwrap();
+        path
     }
 
     #[tokio::test]
@@ -316,5 +404,52 @@ mod tests {
         let staging = receiver.into_staging();
         assert!(staging.aborted);
         assert!(!staging.finalized);
+    }
+
+    #[tokio::test]
+    async fn restores_receiver_progress_from_staging_owned_durable_state() {
+        let root = temporary_directory();
+        let payload = b"resume through the receiver boundary";
+        let transfer = TransferId::from_bytes([9; 16]);
+        let transfer_manifest = manifest(payload);
+        let split = 11_usize;
+
+        {
+            let staging = FileSystemStagingArea::new(&root).unwrap();
+            let mut receiver = TransferReceiver::new(staging);
+            receiver
+                .begin(transfer, transfer_manifest.clone())
+                .await
+                .unwrap();
+            receiver
+                .write(TransferChunk {
+                    transfer,
+                    entry_index: 0,
+                    offset: 0,
+                    bytes: Bytes::copy_from_slice(&payload[..split]),
+                })
+                .await
+                .unwrap();
+        }
+
+        let staging = FileSystemStagingArea::new(&root).unwrap();
+        let mut receiver = TransferReceiver::new(staging);
+        let snapshot = receiver.resume(transfer, transfer_manifest).unwrap();
+        assert_eq!(snapshot.transfer(), transfer);
+        assert_eq!(snapshot.total_bytes(), payload.len() as u64);
+        assert_eq!(snapshot.completed_bytes(), split as u64);
+        receiver
+            .write(TransferChunk {
+                transfer,
+                entry_index: 0,
+                offset: split as u64,
+                bytes: Bytes::copy_from_slice(&payload[split..]),
+            })
+            .await
+            .unwrap();
+        receiver.complete(transfer).await.unwrap();
+
+        assert_eq!(fs::read(root.join("received.bin")).unwrap(), payload);
+        fs::remove_dir_all(root).unwrap();
     }
 }

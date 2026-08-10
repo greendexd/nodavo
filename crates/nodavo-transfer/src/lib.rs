@@ -302,6 +302,20 @@ impl TransferChunk {
 
 pub type TransferFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Staging boundary that can reopen validated durable progress after restart.
+pub trait ResumableStagingArea: StagingArea {
+    /// Reopens an interrupted transfer and returns exact contiguous offsets.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing, malformed, mismatched, or unsafe persisted state.
+    fn resume(
+        &mut self,
+        transfer: TransferId,
+        manifest: &TransferManifest,
+    ) -> Result<ResumeState, TransferError>;
+}
+
 /// Platform-owned staging area. Implementations must use create-new semantics
 /// and atomically finalize without silently overwriting an existing file.
 pub trait StagingArea: Send {

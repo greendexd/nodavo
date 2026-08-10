@@ -6,8 +6,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
-    ContentHash, EntryKind, ResumeState, StagingArea, TransferChunk, TransferError, TransferFuture,
-    TransferId, TransferManifest,
+    ContentHash, EntryKind, ResumableStagingArea, ResumeState, StagingArea, TransferChunk,
+    TransferError, TransferFuture, TransferId, TransferManifest,
 };
 
 const STAGING_DIRECTORY_NAME: &str = ".nodavo-staging";
@@ -287,6 +287,16 @@ impl StagingArea for FileSystemStagingArea {
         } else {
             self.active = Some(active);
         }
+    }
+}
+
+impl ResumableStagingArea for FileSystemStagingArea {
+    fn resume(
+        &mut self,
+        transfer: TransferId,
+        manifest: &TransferManifest,
+    ) -> Result<ResumeState, TransferError> {
+        Self::resume(self, transfer, manifest)
     }
 }
 
