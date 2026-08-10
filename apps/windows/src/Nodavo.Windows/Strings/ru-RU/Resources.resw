@@ -19,9 +19,72 @@
   <data name="RefreshButton.Content" xml:space="preserve"><value>Обновить статус</value></data>
   <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Аварийно отключить</value></data>
   <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha оболочка</value></data>
-  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Сопряжение и переподключение находятся на стадии pre-alpha. Ввод, буфер и файлы пока недоступны.</value></data>
+  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Сопряжение, управление доверием и передачи выбранных путей находятся на стадии pre-alpha. Runtime ввода и буфера ещё квалифицируется.</value></data>
   <data name="DevicesTitle.Text" xml:space="preserve"><value>Устройства</value></data>
   <data name="DevicesSubtitle.Text" xml:space="preserve"><value>Соедините компьютеры напрямую в локальной сети и подтвердите одинаковый шестизначный код на обоих.</value></data>
+  <data name="TrustedDevicesHeading.Text" xml:space="preserve"><value>Доверенные устройства</value></data>
+  <data name="TrustedDevicesRefresh.Content" xml:space="preserve"><value>Обновить список доверия</value></data>
+  <data name="TrustedDevicesLoadingTitle" xml:space="preserve"><value>Загрузка доверенных устройств</value></data>
+  <data name="TrustedDevicesLoadingMessage" xml:space="preserve"><value>Чтение ограниченной локальной сводки доверия из пользовательского агента.</value></data>
+  <data name="TrustedDevicesLoadedTitle" xml:space="preserve"><value>Доверенные устройства загружены</value></data>
+  <data name="TrustedDevicesLoadedMessage" xml:space="preserve"><value>Выберите устройство, чтобы проверить или изменить его локальные разрешения.</value></data>
+  <data name="TrustedDevicesEmptyTitle" xml:space="preserve"><value>Нет доверенных устройств</value></data>
+  <data name="TrustedDevicesEmptyMessage" xml:space="preserve"><value>Завершите сопряжение с подтверждением кода, чтобы создать доверие.</value></data>
+  <data name="TrustedDevicesTimeoutTitle" xml:space="preserve"><value>Агент не ответил</value></data>
+  <data name="TrustedDevicesTimeoutMessage" xml:space="preserve"><value>Запрос списка доверия достиг локального тайм-аута.</value></data>
+  <data name="TrustedDevicesFailedTitle" xml:space="preserve"><value>Доверенные устройства недоступны</value></data>
+  <data name="TrustedDevicesFailedMessage" xml:space="preserve"><value>Запустите пользовательский агент и повторите попытку.</value></data>
+  <data name="TrustedStateActive" xml:space="preserve"><value>Активное доверие</value></data>
+  <data name="TrustedStateRevoked" xml:space="preserve"><value>Отозвано</value></data>
+  <data name="TrustedAllowInput.Header" xml:space="preserve"><value>Удалённый ввод на этом ПК</value></data>
+  <data name="TrustedAllowClipboardRead.Header" xml:space="preserve"><value>Чтение буфера этого ПК</value></data>
+  <data name="TrustedAllowClipboardWrite.Header" xml:space="preserve"><value>Запись в буфер этого ПК</value></data>
+  <data name="TrustedAllowFiles.Header" xml:space="preserve"><value>Отправка файлов на этот ПК</value></data>
+  <data name="TrustedPermissionsHelp.Text" xml:space="preserve"><value>Изменение сохраняется только после точного подтверждения агентом. Отозванное доверие нельзя включить здесь снова.</value></data>
+  <data name="TrustedRevoke.Content" xml:space="preserve"><value>Отозвать доверие…</value></data>
+  <data name="TrustedPermissionSavingTitle" xml:space="preserve"><value>Сохранение разрешения</value></data>
+  <data name="TrustedPermissionSavingMessage" xml:space="preserve"><value>Переключатель остаётся транзакционным до точного подтверждения изменения агентом.</value></data>
+  <data name="TrustedPermissionSavedTitle" xml:space="preserve"><value>Разрешение сохранено</value></data>
+  <data name="TrustedPermissionSavedMessage" xml:space="preserve"><value>Агент подтвердил точные устройство, разрешение и состояние.</value></data>
+  <data name="TrustedPermissionFailedTitle" xml:space="preserve"><value>Разрешение не изменено</value></data>
+  <data name="TrustedPermissionFailedMessage" xml:space="preserve"><value>Изменение не подтверждено, переключатель возвращён в прежнее состояние.</value></data>
+  <data name="TrustedPermissionRejectedTitle" xml:space="preserve"><value>Разрешение отклонено</value></data>
+  <data name="TrustedPermissionRejectedMessage" xml:space="preserve"><value>Агент вернул явную ошибку, поэтому сохраняется предыдущее авторитетное состояние переключателя.</value></data>
+  <data name="TrustedPermissionReconcilingTitle" xml:space="preserve"><value>Результат изменения неизвестен</value></data>
+  <data name="TrustedPermissionReconcilingMessage" xml:space="preserve"><value>Подтверждение потеряно или некорректно. Элементы отключены, пока Nodavo ждёт завершения ограниченного окна агента и заново загружает авторитетное доверие.</value></data>
+  <data name="TrustedPermissionReconciledAppliedTitle" xml:space="preserve"><value>Разрешение подтверждено после загрузки</value></data>
+  <data name="TrustedPermissionReconciledAppliedMessage" xml:space="preserve"><value>Авторитетный список доверенных устройств содержит запрошенное состояние.</value></data>
+  <data name="TrustedPermissionReconciledNotAppliedTitle" xml:space="preserve"><value>Разрешение не применено</value></data>
+  <data name="TrustedPermissionReconciledNotAppliedMessage" xml:space="preserve"><value>Авторитетный список доверенных устройств сохранил предыдущее состояние.</value></data>
+  <data name="TrustedMutationPeerMissingTitle" xml:space="preserve"><value>Состояние устройства недоступно</value></data>
+  <data name="TrustedMutationPeerMissingMessage" xml:space="preserve"><value>Авторитетный список больше не содержит это устройство. Локальный результат не предполагается.</value></data>
+  <data name="TrustedMutationPeerRevokedTitle" xml:space="preserve"><value>Доверие устройства изменилось</value></data>
+  <data name="TrustedMutationPeerRevokedMessage" xml:space="preserve"><value>Авторитетный список теперь помечает устройство отозванным, поэтому его элементы остаются отключены.</value></data>
+  <data name="TrustedMutationOutcomeUnknownTitle" xml:space="preserve"><value>Результат доверия всё ещё неизвестен</value></data>
+  <data name="TrustedMutationOutcomeUnknownMessage" xml:space="preserve"><value>После ограниченного окна завершения не удалось загрузить авторитетное состояние. Устройство остаётся отключено до успешного обновления списка доверия.</value></data>
+  <data name="TrustedRevokeConfirmTitle" xml:space="preserve"><value>Отозвать доверие устройства?</value></data>
+  <data name="TrustedRevokeConfirmMessage" xml:space="preserve"><value>{0} потеряет все разрешения, и потребуется новое сопряжение. Это действие необратимо.</value></data>
+  <data name="TrustedRevokeConfirmAction" xml:space="preserve"><value>Отозвать доверие</value></data>
+  <data name="TrustedRevokeConfirmCancel" xml:space="preserve"><value>Оставить устройство</value></data>
+  <data name="TrustedRevokeStateChangedTitle" xml:space="preserve"><value>Состояние устройства изменилось</value></data>
+  <data name="TrustedRevokeStateChangedMessage" xml:space="preserve"><value>Пока подтверждение было открыто, изменились выбор доверенного устройства или состояние обновления. Проверьте текущее устройство и подтвердите снова.</value></data>
+  <data name="TrustedRevokingTitle" xml:space="preserve"><value>Отзыв доверия</value></data>
+  <data name="TrustedRevokingMessage" xml:space="preserve"><value>Ожидание удаления разрешений устройства локальным агентом.</value></data>
+  <data name="TrustedRevokeVerifyingTitle" xml:space="preserve"><value>Проверка отзыва</value></data>
+  <data name="TrustedRevokeVerifyingMessage" xml:space="preserve"><value>Агент ответил; Nodavo заново загружает авторитетное доверие перед показом результата.</value></data>
+  <data name="TrustedRevokeReconcilingTitle" xml:space="preserve"><value>Результат отзыва неизвестен</value></data>
+  <data name="TrustedRevokeReconcilingMessage" xml:space="preserve"><value>Ответ потерян или некорректен. Элементы отключены, пока Nodavo ждёт завершения ограниченного окна агента и заново загружает авторитетное доверие.</value></data>
+  <data name="TrustedRevokedTitle" xml:space="preserve"><value>Доверие отозвано</value></data>
+  <data name="TrustedRevokedMessage" xml:space="preserve"><value>Устройство сохранено как отозванная локальная запись без действующих разрешений.</value></data>
+  <data name="TrustedRevokeFailedTitle" xml:space="preserve"><value>Доверие не отозвано</value></data>
+  <data name="TrustedRevokeFailedMessage" xml:space="preserve"><value>Агент не подтвердил отзыв. Успех не предполагается.</value></data>
+  <data name="TrustedRevokeRejectedTitle" xml:space="preserve"><value>Отзыв отклонён</value></data>
+  <data name="TrustedRevokeRejectedMessage" xml:space="preserve"><value>Агент вернул явную ошибку и не подтвердил отзыв.</value></data>
+  <data name="TrustedRevokeReconciledNotAppliedTitle" xml:space="preserve"><value>Доверие остаётся активным</value></data>
+  <data name="TrustedRevokeReconciledNotAppliedMessage" xml:space="preserve"><value>После неоднозначного ответа авторитетный список всё ещё помечает устройство активным.</value></data>
+  <data name="TrustedRevokeVerificationFailedTitle" xml:space="preserve"><value>Проверка отзыва не пройдена</value></data>
+  <data name="TrustedRevokeVerificationFailedMessage" xml:space="preserve"><value>Ответ команды расходится с авторитетным списком. Для безопасности устройство остаётся отключено.</value></data>
+  <data name="PairingHeading.Text" xml:space="preserve"><value>Сопряжение нового устройства</value></data>
   <data name="PairingListen.Content" xml:space="preserve"><value>Ждать другое устройство</value></data>
   <data name="PairingEndpoint.Header" xml:space="preserve"><value>Другой компьютер</value></data>
   <data name="PairingEndpoint.PlaceholderText" xml:space="preserve"><value>192.168.1.20:44310 или mdns:Nodavo-Mac</value></data>
@@ -31,13 +94,13 @@
   <data name="PairingAllowClipboardRead.Content" xml:space="preserve"><value>Читать содержимое буфера этого ПК</value></data>
   <data name="PairingAllowClipboardWrite.Content" xml:space="preserve"><value>Записывать содержимое в буфер этого ПК</value></data>
   <data name="PairingAllowFiles.Content" xml:space="preserve"><value>Отправлять файлы на этот ПК</value></data>
-  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>Все разрешения изначально выключены. Выбор привязывается к подтверждённому коду и подписанному доверию. Пока для изменения требуется повторное сопряжение.</value></data>
+  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>Все разрешения изначально выключены. Выбор привязывается к подтверждённому коду и подписанному доверию; позже каждое разрешение можно изменить выше.</value></data>
   <data name="PairingPeerLabel.Text" xml:space="preserve"><value>Устройство</value></data>
   <data name="PairingCodeLabel.Text" xml:space="preserve"><value>Этот код совпадает на обоих компьютерах?</value></data>
   <data name="PairingConfirm.Content" xml:space="preserve"><value>Коды совпадают</value></data>
   <data name="PairingCancel.Content" xml:space="preserve"><value>Отмена</value></data>
   <data name="PairingPreAlpha.Title" xml:space="preserve"><value>Pre-alpha сопряжение</value></data>
-  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Разрешения при сопряжении и закреплённое доверие реализованы. Изменение после сопряжения, список устройств, ввод, буфер и файлы пока недоступны.</value></data>
+  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Сопряжение, сводки доверенных устройств, изменение отдельных разрешений и отзыв реализованы в исходниках. Квалифицированного Windows runtime-подтверждения пока нет.</value></data>
   <data name="PairingIdleTitle" xml:space="preserve"><value>Готово к сопряжению</value></data>
   <data name="PairingIdleMessage" xml:space="preserve"><value>На одном компьютере включите ожидание, а со второго выполните подключение.</value></data>
   <data name="PairingCancelled" xml:space="preserve"><value>Сопряжение отменено. Локальный ввод остаётся на этом ПК.</value></data>
@@ -61,6 +124,40 @@
   <data name="LayoutTitle.Text" xml:space="preserve"><value>Расположение</value></data>
   <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Расположение дисплеев и переход через край ещё разрабатываются.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Передачи</value></data>
+  <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Ставьте в очередь только файлы и папки, которые явно выбрали на этом ПК.</value></data>
+  <data name="TransferAddFiles.Content" xml:space="preserve"><value>Добавить файлы…</value></data>
+  <data name="TransferAddFolder.Content" xml:space="preserve"><value>Добавить папку…</value></data>
+  <data name="TransferRemoveSelection.Content" xml:space="preserve"><value>Удалить выбранное</value></data>
+  <data name="TransferClearSelection.Content" xml:space="preserve"><value>Очистить</value></data>
+  <data name="TransferBoundsHelp.Text" xml:space="preserve"><value>До 32 явно выбранных абсолютных путей; каждый путь ограничен 4 КиБ UTF-8. Nodavo не журналирует имена файлов и не включает их в подтверждение очереди.</value></data>
+  <data name="TransferSend.Content" xml:space="preserve"><value>Поставить выбранное в очередь</value></data>
+  <data name="TransferQueueing.Text" xml:space="preserve"><value>Подготовка ограниченного запроса передачи…</value></data>
+  <data name="TransfersPreAlpha.Title" xml:space="preserve"><value>Pre-alpha исходники передачи</value></data>
+  <data name="TransfersPreAlpha.Message" xml:space="preserve"><value>Нужно подключённое устройство с требуемым разрешением. Windows runtime-совместимость ещё не квалифицирована.</value></data>
+  <data name="TransferIdleTitle" xml:space="preserve"><value>Выберите файлы или папки</value></data>
+  <data name="TransferIdleMessage" xml:space="preserve"><value>Ничего не отправляется, пока вы не выберете локальные объекты и не нажмёте кнопку очереди.</value></data>
+  <data name="TransferSelectionReadyTitle" xml:space="preserve"><value>Выбор готов</value></data>
+  <data name="TransferSelectionReadyMessage" xml:space="preserve"><value>Проверьте видимый список перед постановкой в очередь.</value></data>
+  <data name="TransferTooManyTitle" xml:space="preserve"><value>Слишком много объектов</value></data>
+  <data name="TransferTooManyMessage" xml:space="preserve"><value>Выберите не более 32 файлов и папок в одном запросе.</value></data>
+  <data name="TransferUnsafeSelectionTitle" xml:space="preserve"><value>Выбор отклонён</value></data>
+  <data name="TransferUnsafeSelectionMessage" xml:space="preserve"><value>Путь пуст, повторяется, не является абсолютным или превышает локальный предел байтов.</value></data>
+  <data name="TransferPickerFailedTitle" xml:space="preserve"><value>Windows picker недоступен</value></data>
+  <data name="TransferPickerFailedMessage" xml:space="preserve"><value>Nodavo не удалось открыть локальный выбор файлов или папок. Ничего не добавлено.</value></data>
+  <data name="TransferSelectionCount" xml:space="preserve"><value>Выбрано: {0} из {1}</value></data>
+  <data name="TransferSelectedRoot" xml:space="preserve"><value>Выбранный корень</value></data>
+  <data name="TransferSendingTitle" xml:space="preserve"><value>Постановка передачи в очередь</value></data>
+  <data name="TransferSendingMessage" xml:space="preserve"><value>Ожидание ограниченного подтверждения подготовки от агента.</value></data>
+  <data name="TransferQueuedTitle" xml:space="preserve"><value>Передача поставлена в очередь</value></data>
+  <data name="TransferQueuedMessage" xml:space="preserve"><value>Скрытый ID передачи: {0}</value></data>
+  <data name="TransferTimedOutTitle" xml:space="preserve"><value>Передача не подтверждена</value></data>
+  <data name="TransferTimedOutMessage" xml:space="preserve"><value>Локальный запрос достиг тайм-аута; успех не предполагается.</value></data>
+  <data name="TransferFailedTitle" xml:space="preserve"><value>Передача не поставлена в очередь</value></data>
+  <data name="TransferFailedMessage" xml:space="preserve"><value>Проверьте подключение и разрешение файлов, затем при необходимости выберите объекты снова.</value></data>
+  <data name="TransferRejectedTitle" xml:space="preserve"><value>Передача отклонена</value></data>
+  <data name="TransferRejectedMessage" xml:space="preserve"><value>Агент вернул явную ошибку вместо подтверждения очереди.</value></data>
+  <data name="TransferOutcomeUnknownTitle" xml:space="preserve"><value>Результат передачи неизвестен</value></data>
+  <data name="TransferOutcomeUnknownMessage" xml:space="preserve"><value>Подтверждение потеряно или некорректно, поэтому передача уже могла попасть в очередь. Этот выбор нельзя повторить; явно выберите новый файл или папку.</value></data>
   <data name="TransfersUnavailable.Text" xml:space="preserve"><value>Безопасная очередь передачи файлов ещё разрабатывается.</value></data>
   <data name="UnavailableBadge.Title" xml:space="preserve"><value>Недоступно в этой сборке</value></data>
   <data name="UnavailableBadge.Message" xml:space="preserve"><value>Этот экран пока не выполняет действий.</value></data>

@@ -30,7 +30,7 @@ public sealed partial class MainWindow : Window
             ["overview"] = new OverviewView(_agent),
             ["devices"] = new DevicesView(agentClient, resources),
             ["layout"] = new LayoutView(),
-            ["transfers"] = new TransfersView(),
+            ["transfers"] = new TransfersView(agentClient, resources),
             ["settings"] = new SettingsView(_agent),
         };
 

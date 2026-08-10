@@ -13,3 +13,19 @@ internal sealed record PairingCodeSnapshot(
 internal sealed record PairingResultSnapshot(
     string PairingId,
     bool Paired);
+
+internal sealed record TrustedPeerSnapshot(
+    string PeerId,
+    string DisplayName,
+    string State,
+    IReadOnlySet<string> LocalGrants)
+{
+    internal bool HasGrant(string capability) => LocalGrants.Contains(capability);
+}
+
+internal sealed record CapabilityChangeSnapshot(
+    string PeerId,
+    string Capability,
+    bool Enabled);
+
+internal sealed record TransferQueuedSnapshot(string RedactedTransferId);

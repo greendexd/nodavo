@@ -55,36 +55,37 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
             AgentStatusSnapshot status = await _client.GetStatusAsync();
             if (IsCurrent(generation))
             {
-                Apply(status, generation);
+                await ApplyAsync(status, generation);
             }
         }
         catch (OperationCanceledException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentTimeout", generation);
+                await SetUnavailableAsync("StatusAgentTimeout", generation);
             }
         }
         catch (UnauthorizedAccessException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentAccessDenied", generation);
+                await SetUnavailableAsync("StatusAgentAccessDenied", generation);
             }
         }
         catch (IOException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentUnavailable", generation);
+                await SetUnavailableAsync("StatusAgentUnavailable", generation);
             }
         }
         catch (Exception exception) when (
-            exception is InvalidDataException or JsonException or InvalidOperationException)
+            exception is InvalidDataException or JsonException or InvalidOperationException or
+            AgentProtocolException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusFailed", generation);
+                await SetUnavailableAsync("StatusFailed", generation);
             }
         }
         finally
@@ -111,36 +112,37 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
             AgentStatusSnapshot status = await _client.EmergencyStopAsync();
             if (IsCurrent(generation))
             {
-                Apply(status, generation);
+                await ApplyAsync(status, generation);
             }
         }
         catch (OperationCanceledException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentTimeout", generation);
+                await SetUnavailableAsync("StatusAgentTimeout", generation);
             }
         }
         catch (UnauthorizedAccessException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentAccessDenied", generation);
+                await SetUnavailableAsync("StatusAgentAccessDenied", generation);
             }
         }
         catch (IOException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusAgentUnavailable", generation);
+                await SetUnavailableAsync("StatusAgentUnavailable", generation);
             }
         }
         catch (Exception exception) when (
-            exception is InvalidDataException or JsonException or InvalidOperationException)
+            exception is InvalidDataException or JsonException or InvalidOperationException or
+            AgentProtocolException)
         {
             if (IsCurrent(generation))
             {
-                SetUnavailable("StatusFailed", generation);
+                await SetUnavailableAsync("StatusFailed", generation);
             }
         }
         finally
@@ -156,14 +158,9 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
     private bool IsCurrent(long generation) =>
         generation == Interlocked.Read(ref _requestGeneration);
 
-    private void Apply(AgentStatusSnapshot status, long generation)
-    {
-        _dispatcher.TryEnqueue(() =>
+    private Task ApplyAsync(AgentStatusSnapshot status, long generation) =>
+        RunOnUiAsync(() =>
         {
-            if (!IsCurrent(generation))
-            {
-                return;
-            }
             StatusText = _resources.GetString(status.Phase switch
             {
                 "starting" => "StatusStarting",
@@ -180,22 +177,48 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
             };
             PeerText = status.ConnectedPeer ?? _resources.GetString("NoPeer");
             InputOwnerText = _resources.GetString(status.InputOwner == "remote" ? "InputOwnerRemote" : "InputOwnerLocal");
-        });
-    }
+        }, generation);
 
-    private void SetUnavailable(string resourceKey, long generation)
-    {
-        _dispatcher.TryEnqueue(() =>
+    private Task SetUnavailableAsync(string resourceKey, long generation) =>
+        RunOnUiAsync(() =>
         {
-            if (!IsCurrent(generation))
-            {
-                return;
-            }
             StatusText = _resources.GetString(resourceKey);
             StatusGlyph = "\uE783";
             PeerText = _resources.GetString("NoPeer");
             InputOwnerText = _resources.GetString("InputOwnerLocal");
-        });
+        }, generation);
+
+    private Task RunOnUiAsync(Action action, long generation)
+    {
+        if (_dispatcher.HasThreadAccess)
+        {
+            if (IsCurrent(generation))
+            {
+                action();
+            }
+            return Task.CompletedTask;
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_dispatcher.TryEnqueue(() =>
+        {
+            try
+            {
+                if (IsCurrent(generation))
+                {
+                    action();
+                }
+                completion.SetResult();
+            }
+            catch (Exception exception)
+            {
+                completion.SetException(exception);
+            }
+        }))
+        {
+            completion.SetException(new InvalidOperationException("The UI dispatcher is unavailable."));
+        }
+        return completion.Task;
     }
 
     private void SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)

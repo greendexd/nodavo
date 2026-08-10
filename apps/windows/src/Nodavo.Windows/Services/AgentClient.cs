@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.IO.Pipes;
 using System.Security.Principal;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Nodavo.Windows.Models;
@@ -12,6 +13,10 @@ internal sealed class AgentClient
     private const int MaximumMessageSize = 64 * 1024;
     private const int MaximumEndpointLength = 512;
     private const int MaximumIdentifierLength = 256;
+    private const int MaximumErrorMessageLength = 1024;
+    private const int MaximumTrustedPeers = 32;
+    private const int MaximumSelectedPaths = 32;
+    private const int MaximumSelectedPathBytes = 4 * 1024;
     private static readonly HashSet<string> AllowedPairingCapabilities = new(StringComparer.Ordinal)
     {
         "input",
@@ -19,7 +24,29 @@ internal sealed class AgentClient
         "clipboard_write",
         "files",
     };
+    private static readonly HashSet<string> AllowedAgentErrorCodes = new(StringComparer.Ordinal)
+    {
+        "busy",
+        "invalid_endpoint",
+        "discovery_unavailable",
+        "pairing_timed_out",
+        "reconnect_failed",
+        "pairing_not_found",
+        "already_confirmed",
+        "peer_not_found",
+        "storage_unavailable",
+        "grant_epoch_exhausted",
+        "pairing_failed",
+        "not_connected",
+        "focus_rejected",
+        "safety_recovery_failed",
+        "transfer_failed",
+    };
     private static readonly TimeSpan StatusRequestTimeout = TimeSpan.FromSeconds(3);
+    // The agent may spend two sequential five-second safety windows applying a grant.
+    private static readonly TimeSpan MutationRequestTimeout = TimeSpan.FromSeconds(15);
+    // The agent owns a five-minute bounded preparation window after command delivery.
+    private static readonly TimeSpan TransferRequestTimeout = TimeSpan.FromMinutes(5.25);
     private static readonly TimeSpan PairingRequestTimeout = TimeSpan.FromMinutes(2.2);
     private readonly string _pipeName;
 
@@ -92,6 +119,75 @@ internal sealed class AgentClient
             PairingRequestTimeout,
             DecodePairingResult,
             cancellationToken);
+    }
+
+    internal Task<IReadOnlyList<TrustedPeerSnapshot>> ListTrustedPeersAsync(
+        CancellationToken cancellationToken = default) =>
+        RequestAsync(
+            new CommandEnvelope("list_trusted_peers"),
+            StatusRequestTimeout,
+            DecodeTrustedPeers,
+            cancellationToken);
+
+    internal Task<CapabilityChangeSnapshot> SetCapabilityAsync(
+        string peerId,
+        string capability,
+        bool enabled,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateText(peerId, MaximumIdentifierLength, "peer identifier");
+        ValidateCapability(capability);
+        return RequestAsync(
+            new SetCapabilityEnvelope("set_capability", peerId, capability, enabled),
+            MutationRequestTimeout,
+            DecodeCapabilityChanged,
+            cancellationToken);
+    }
+
+    internal Task<AgentStatusSnapshot> RevokePeerAsync(
+        string peerId,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateText(peerId, MaximumIdentifierLength, "peer identifier");
+        return RequestAsync(
+            new RevokePeerEnvelope("revoke_peer", peerId),
+            MutationRequestTimeout,
+            DecodeStatus,
+            cancellationToken);
+    }
+
+    internal Task<TransferQueuedSnapshot> SendFilesAsync(
+        IReadOnlyCollection<string> paths,
+        CancellationToken cancellationToken = default)
+    {
+        string[] selectedPaths = ValidateSelectedPaths(paths);
+        return RequestAsync(
+            new SendFilesEnvelope("send_files", selectedPaths),
+            TransferRequestTimeout,
+            DecodeTransferQueued,
+            cancellationToken);
+    }
+
+    internal static string[] ValidateSelectedPaths(IReadOnlyCollection<string> paths)
+    {
+        if (paths.Count is 0 or > MaximumSelectedPaths)
+        {
+            throw new InvalidDataException("Select between one and 32 files or folders.");
+        }
+
+        var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var validated = new List<string>(paths.Count);
+        foreach (string path in paths)
+        {
+            if (string.IsNullOrEmpty(path) || path.Any(char.IsControl) ||
+                Encoding.UTF8.GetByteCount(path) > MaximumSelectedPathBytes ||
+                !Path.IsPathFullyQualified(path) || !unique.Add(path))
+            {
+                throw new InvalidDataException("Unsafe or duplicate selected path.");
+            }
+            validated.Add(path);
+        }
+        return validated.ToArray();
     }
 
     private async Task<TResult> RequestAsync<TRequest, TResult>(
@@ -222,6 +318,84 @@ internal sealed class AgentClient
         return new PairingResultSnapshot(pairingId, paired.GetBoolean());
     }
 
+    private static IReadOnlyList<TrustedPeerSnapshot> DecodeTrustedPeers(byte[] payload)
+    {
+        using JsonDocument document = ParseResponse(payload);
+        JsonElement root = document.RootElement;
+        RequireEvent(root, "trusted_peers");
+        if (!root.TryGetProperty("peers", out JsonElement peers) ||
+            peers.ValueKind != JsonValueKind.Array || peers.GetArrayLength() > MaximumTrustedPeers)
+        {
+            throw new InvalidDataException("Invalid trusted-peer list.");
+        }
+
+        var decoded = new List<TrustedPeerSnapshot>(peers.GetArrayLength());
+        var peerIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonElement peer in peers.EnumerateArray())
+        {
+            if (peer.ValueKind != JsonValueKind.Object)
+            {
+                throw new InvalidDataException("Invalid trusted peer.");
+            }
+            string peerId = ReadRequiredText(peer, "peer_id", MaximumIdentifierLength);
+            string displayName = ReadRequiredText(peer, "display_name", MaximumIdentifierLength);
+            string state = ReadRequiredEnum(peer, "state", "active", "revoked");
+            if (!peerIds.Add(peerId) ||
+                !peer.TryGetProperty("local_grants", out JsonElement grants) ||
+                grants.ValueKind != JsonValueKind.Array ||
+                grants.GetArrayLength() > AllowedPairingCapabilities.Count)
+            {
+                throw new InvalidDataException("Invalid trusted peer.");
+            }
+
+            var localGrants = new HashSet<string>(StringComparer.Ordinal);
+            foreach (JsonElement grant in grants.EnumerateArray())
+            {
+                if (grant.ValueKind != JsonValueKind.String || grant.GetString() is not { } capability)
+                {
+                    throw new InvalidDataException("Invalid trusted-peer capability.");
+                }
+                ValidateCapability(capability);
+                if (!localGrants.Add(capability))
+                {
+                    throw new InvalidDataException("Duplicate trusted-peer capability.");
+                }
+            }
+            decoded.Add(new TrustedPeerSnapshot(peerId, displayName, state, localGrants));
+        }
+        return decoded;
+    }
+
+    private static CapabilityChangeSnapshot DecodeCapabilityChanged(byte[] payload)
+    {
+        using JsonDocument document = ParseResponse(payload);
+        JsonElement root = document.RootElement;
+        RequireEvent(root, "capability_changed");
+        string peerId = ReadRequiredText(root, "peer_id", MaximumIdentifierLength);
+        string capability = ReadRequiredText(root, "capability", 32);
+        ValidateCapability(capability);
+        if (!root.TryGetProperty("enabled", out JsonElement enabled) ||
+            enabled.ValueKind is not JsonValueKind.True and not JsonValueKind.False)
+        {
+            throw new InvalidDataException("Invalid capability acknowledgement.");
+        }
+        return new CapabilityChangeSnapshot(peerId, capability, enabled.GetBoolean());
+    }
+
+    private static TransferQueuedSnapshot DecodeTransferQueued(byte[] payload)
+    {
+        using JsonDocument document = ParseResponse(payload);
+        JsonElement root = document.RootElement;
+        RequireEvent(root, "transfer_queued");
+        string transferId = ReadRequiredText(root, "transfer_id", 36);
+        if (!Guid.TryParseExact(transferId, "D", out Guid parsed) || parsed == Guid.Empty)
+        {
+            throw new InvalidDataException("Invalid transfer acknowledgement.");
+        }
+        string canonical = parsed.ToString("D");
+        return new TransferQueuedSnapshot($"••••••••-{canonical[^8..]}");
+    }
+
     private static JsonDocument ParseResponse(byte[] payload) =>
         JsonDocument.Parse(payload, new JsonDocumentOptions
         {
@@ -243,6 +417,11 @@ internal sealed class AgentClient
         if (actual == "error")
         {
             string code = ReadRequiredText(root, "code", 128);
+            _ = ReadRequiredText(root, "message", MaximumErrorMessageLength);
+            if (!AllowedAgentErrorCodes.Contains(code))
+            {
+                throw new InvalidDataException("Unknown local IPC error code.");
+            }
             throw new AgentProtocolException(code);
         }
         if (!string.Equals(actual, expected, StringComparison.Ordinal))
@@ -269,6 +448,14 @@ internal sealed class AgentClient
             !string.Equals(text, text.Trim(), StringComparison.Ordinal) || text.Any(char.IsControl))
         {
             throw new InvalidDataException($"Invalid local IPC field: {field}.");
+        }
+    }
+
+    private static void ValidateCapability(string capability)
+    {
+        if (!AllowedPairingCapabilities.Contains(capability))
+        {
+            throw new InvalidDataException("Invalid capability.");
         }
     }
 
@@ -309,6 +496,20 @@ internal sealed class AgentClient
         [property: JsonPropertyName("command")] string Command,
         [property: JsonPropertyName("pairing_id")] string PairingId,
         [property: JsonPropertyName("accepted")] bool Accepted);
+
+    private sealed record SetCapabilityEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("peer_id")] string PeerId,
+        [property: JsonPropertyName("capability")] string Capability,
+        [property: JsonPropertyName("enabled")] bool Enabled);
+
+    private sealed record RevokePeerEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("peer_id")] string PeerId);
+
+    private sealed record SendFilesEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("paths")] string[] Paths);
 }
 
 internal sealed class AgentProtocolException(string code)

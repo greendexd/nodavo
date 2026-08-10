@@ -19,9 +19,72 @@
   <data name="RefreshButton.Content" xml:space="preserve"><value>Refresh status</value></data>
   <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Emergency stop</value></data>
   <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha shell</value></data>
-  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Pairing and reconnect are pre-alpha. Input, clipboard, and files are not available yet.</value></data>
+  <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Pairing, trust management, and selected-path transfers are pre-alpha. Input and clipboard runtime remain under qualification.</value></data>
   <data name="DevicesTitle.Text" xml:space="preserve"><value>Devices</value></data>
   <data name="DevicesSubtitle.Text" xml:space="preserve"><value>Pair directly on your local network and confirm the same six-digit code on both computers.</value></data>
+  <data name="TrustedDevicesHeading.Text" xml:space="preserve"><value>Trusted devices</value></data>
+  <data name="TrustedDevicesRefresh.Content" xml:space="preserve"><value>Refresh trusted devices</value></data>
+  <data name="TrustedDevicesLoadingTitle" xml:space="preserve"><value>Loading trusted devices</value></data>
+  <data name="TrustedDevicesLoadingMessage" xml:space="preserve"><value>Reading the bounded local trust summary from the per-user agent.</value></data>
+  <data name="TrustedDevicesLoadedTitle" xml:space="preserve"><value>Trusted devices loaded</value></data>
+  <data name="TrustedDevicesLoadedMessage" xml:space="preserve"><value>Select a device to review or change its local grants.</value></data>
+  <data name="TrustedDevicesEmptyTitle" xml:space="preserve"><value>No trusted devices</value></data>
+  <data name="TrustedDevicesEmptyMessage" xml:space="preserve"><value>Complete code-confirmed pairing to create trust.</value></data>
+  <data name="TrustedDevicesTimeoutTitle" xml:space="preserve"><value>Agent did not respond</value></data>
+  <data name="TrustedDevicesTimeoutMessage" xml:space="preserve"><value>The trusted-device request reached its local deadline.</value></data>
+  <data name="TrustedDevicesFailedTitle" xml:space="preserve"><value>Trusted devices unavailable</value></data>
+  <data name="TrustedDevicesFailedMessage" xml:space="preserve"><value>Start the per-user agent and try again.</value></data>
+  <data name="TrustedStateActive" xml:space="preserve"><value>Active trust</value></data>
+  <data name="TrustedStateRevoked" xml:space="preserve"><value>Revoked</value></data>
+  <data name="TrustedAllowInput.Header" xml:space="preserve"><value>Remote input on this PC</value></data>
+  <data name="TrustedAllowClipboardRead.Header" xml:space="preserve"><value>Read this PC's clipboard</value></data>
+  <data name="TrustedAllowClipboardWrite.Header" xml:space="preserve"><value>Write this PC's clipboard</value></data>
+  <data name="TrustedAllowFiles.Header" xml:space="preserve"><value>Send files to this PC</value></data>
+  <data name="TrustedPermissionsHelp.Text" xml:space="preserve"><value>Each change is committed only after the agent returns an exact acknowledgement. Revoked trust cannot be re-enabled here.</value></data>
+  <data name="TrustedRevoke.Content" xml:space="preserve"><value>Revoke device trust…</value></data>
+  <data name="TrustedPermissionSavingTitle" xml:space="preserve"><value>Saving permission</value></data>
+  <data name="TrustedPermissionSavingMessage" xml:space="preserve"><value>The switch remains transactional until the agent acknowledges the exact change.</value></data>
+  <data name="TrustedPermissionSavedTitle" xml:space="preserve"><value>Permission saved</value></data>
+  <data name="TrustedPermissionSavedMessage" xml:space="preserve"><value>The agent acknowledged the exact device, permission, and state.</value></data>
+  <data name="TrustedPermissionFailedTitle" xml:space="preserve"><value>Permission unchanged</value></data>
+  <data name="TrustedPermissionFailedMessage" xml:space="preserve"><value>The change was not acknowledged and the switch was restored.</value></data>
+  <data name="TrustedPermissionRejectedTitle" xml:space="preserve"><value>Permission rejected</value></data>
+  <data name="TrustedPermissionRejectedMessage" xml:space="preserve"><value>The agent returned an explicit error, so the previous authoritative switch state is retained.</value></data>
+  <data name="TrustedPermissionReconcilingTitle" xml:space="preserve"><value>Permission outcome unknown</value></data>
+  <data name="TrustedPermissionReconcilingMessage" xml:space="preserve"><value>The acknowledgement was lost or invalid. Controls are disabled while Nodavo waits for the bounded agent window and reloads authoritative trust.</value></data>
+  <data name="TrustedPermissionReconciledAppliedTitle" xml:space="preserve"><value>Permission confirmed after reload</value></data>
+  <data name="TrustedPermissionReconciledAppliedMessage" xml:space="preserve"><value>The authoritative trusted-device list contains the requested state.</value></data>
+  <data name="TrustedPermissionReconciledNotAppliedTitle" xml:space="preserve"><value>Permission not applied</value></data>
+  <data name="TrustedPermissionReconciledNotAppliedMessage" xml:space="preserve"><value>The authoritative trusted-device list retained the previous state.</value></data>
+  <data name="TrustedMutationPeerMissingTitle" xml:space="preserve"><value>Device state unavailable</value></data>
+  <data name="TrustedMutationPeerMissingMessage" xml:space="preserve"><value>The authoritative list no longer contains this device. No local outcome is assumed.</value></data>
+  <data name="TrustedMutationPeerRevokedTitle" xml:space="preserve"><value>Device trust changed</value></data>
+  <data name="TrustedMutationPeerRevokedMessage" xml:space="preserve"><value>The authoritative list now marks this device revoked, so its controls remain disabled.</value></data>
+  <data name="TrustedMutationOutcomeUnknownTitle" xml:space="preserve"><value>Trust outcome still unknown</value></data>
+  <data name="TrustedMutationOutcomeUnknownMessage" xml:space="preserve"><value>Authoritative reload failed after the bounded completion window. This device stays disabled until a later trusted-device refresh succeeds.</value></data>
+  <data name="TrustedRevokeConfirmTitle" xml:space="preserve"><value>Revoke device trust?</value></data>
+  <data name="TrustedRevokeConfirmMessage" xml:space="preserve"><value>{0} will lose all grants and must pair again. This cannot be undone.</value></data>
+  <data name="TrustedRevokeConfirmAction" xml:space="preserve"><value>Revoke trust</value></data>
+  <data name="TrustedRevokeConfirmCancel" xml:space="preserve"><value>Keep device</value></data>
+  <data name="TrustedRevokeStateChangedTitle" xml:space="preserve"><value>Device state changed</value></data>
+  <data name="TrustedRevokeStateChangedMessage" xml:space="preserve"><value>The trusted-device selection or refresh state changed while confirmation was open. Review the current device and confirm again.</value></data>
+  <data name="TrustedRevokingTitle" xml:space="preserve"><value>Revoking trust</value></data>
+  <data name="TrustedRevokingMessage" xml:space="preserve"><value>Waiting for the local agent to remove this device's grants.</value></data>
+  <data name="TrustedRevokeVerifyingTitle" xml:space="preserve"><value>Verifying revocation</value></data>
+  <data name="TrustedRevokeVerifyingMessage" xml:space="preserve"><value>The agent responded; Nodavo is reloading authoritative trust before reporting the result.</value></data>
+  <data name="TrustedRevokeReconcilingTitle" xml:space="preserve"><value>Revocation outcome unknown</value></data>
+  <data name="TrustedRevokeReconcilingMessage" xml:space="preserve"><value>The response was lost or invalid. Controls are disabled while Nodavo waits for the bounded agent window and reloads authoritative trust.</value></data>
+  <data name="TrustedRevokedTitle" xml:space="preserve"><value>Trust revoked</value></data>
+  <data name="TrustedRevokedMessage" xml:space="preserve"><value>The device is retained as a revoked local record with no usable grants.</value></data>
+  <data name="TrustedRevokeFailedTitle" xml:space="preserve"><value>Trust was not revoked</value></data>
+  <data name="TrustedRevokeFailedMessage" xml:space="preserve"><value>The agent did not acknowledge revocation. No success is assumed.</value></data>
+  <data name="TrustedRevokeRejectedTitle" xml:space="preserve"><value>Revocation rejected</value></data>
+  <data name="TrustedRevokeRejectedMessage" xml:space="preserve"><value>The agent returned an explicit error and did not acknowledge revocation.</value></data>
+  <data name="TrustedRevokeReconciledNotAppliedTitle" xml:space="preserve"><value>Trust remains active</value></data>
+  <data name="TrustedRevokeReconciledNotAppliedMessage" xml:space="preserve"><value>After the ambiguous response, the authoritative list still marks this device active.</value></data>
+  <data name="TrustedRevokeVerificationFailedTitle" xml:space="preserve"><value>Revocation verification failed</value></data>
+  <data name="TrustedRevokeVerificationFailedMessage" xml:space="preserve"><value>The command response and authoritative list disagree. The device remains disabled for safety.</value></data>
+  <data name="PairingHeading.Text" xml:space="preserve"><value>Pair a new device</value></data>
   <data name="PairingListen.Content" xml:space="preserve"><value>Wait for another device</value></data>
   <data name="PairingEndpoint.Header" xml:space="preserve"><value>Other computer</value></data>
   <data name="PairingEndpoint.PlaceholderText" xml:space="preserve"><value>192.168.1.20:44310 or mdns:Nodavo-Mac</value></data>
@@ -31,13 +94,13 @@
   <data name="PairingAllowClipboardRead.Content" xml:space="preserve"><value>Read clipboard content from this PC</value></data>
   <data name="PairingAllowClipboardWrite.Content" xml:space="preserve"><value>Write clipboard content to this PC</value></data>
   <data name="PairingAllowFiles.Content" xml:space="preserve"><value>Send files to this PC</value></data>
-  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>All permissions start off. Your selection is bound to the confirmed code and signed trust. Changing it currently requires pairing again.</value></data>
+  <data name="PairingPermissionsHelp.Text" xml:space="preserve"><value>All permissions start off. Your selection is bound to the confirmed code and signed trust; you can later change each grant above.</value></data>
   <data name="PairingPeerLabel.Text" xml:space="preserve"><value>Device</value></data>
   <data name="PairingCodeLabel.Text" xml:space="preserve"><value>Does this code match on both computers?</value></data>
   <data name="PairingConfirm.Content" xml:space="preserve"><value>Codes match</value></data>
   <data name="PairingCancel.Content" xml:space="preserve"><value>Cancel</value></data>
   <data name="PairingPreAlpha.Title" xml:space="preserve"><value>Pre-alpha pairing</value></data>
-  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Pairing-time permissions and pinned trust are implemented. Post-pair changes, trusted-device list, input, clipboard, and files are not available yet.</value></data>
+  <data name="PairingPreAlpha.Message" xml:space="preserve"><value>Pairing, trusted-device summaries, per-grant changes, and revocation are implemented in source. Qualified Windows runtime evidence is still pending.</value></data>
   <data name="PairingIdleTitle" xml:space="preserve"><value>Ready to pair</value></data>
   <data name="PairingIdleMessage" xml:space="preserve"><value>Choose listening mode on one computer and connect from the other.</value></data>
   <data name="PairingCancelled" xml:space="preserve"><value>Pairing was cancelled. Local input remains on this PC.</value></data>
@@ -61,6 +124,40 @@
   <data name="LayoutTitle.Text" xml:space="preserve"><value>Layout</value></data>
   <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Display arrangement and edge switching are under implementation.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Transfers</value></data>
+  <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Queue only files and folders you explicitly select on this PC.</value></data>
+  <data name="TransferAddFiles.Content" xml:space="preserve"><value>Add files…</value></data>
+  <data name="TransferAddFolder.Content" xml:space="preserve"><value>Add folder…</value></data>
+  <data name="TransferRemoveSelection.Content" xml:space="preserve"><value>Remove selected</value></data>
+  <data name="TransferClearSelection.Content" xml:space="preserve"><value>Clear</value></data>
+  <data name="TransferBoundsHelp.Text" xml:space="preserve"><value>Up to 32 explicit absolute selections; each path is limited to 4 KiB of UTF-8. Nodavo does not log or include filenames in the queue acknowledgement.</value></data>
+  <data name="TransferSend.Content" xml:space="preserve"><value>Queue selected items</value></data>
+  <data name="TransferQueueing.Text" xml:space="preserve"><value>Preparing the bounded transfer request…</value></data>
+  <data name="TransfersPreAlpha.Title" xml:space="preserve"><value>Pre-alpha transfer source</value></data>
+  <data name="TransfersPreAlpha.Message" xml:space="preserve"><value>A connected peer with the required grant is necessary. Windows runtime interoperability is not yet qualified.</value></data>
+  <data name="TransferIdleTitle" xml:space="preserve"><value>Select files or folders</value></data>
+  <data name="TransferIdleMessage" xml:space="preserve"><value>Nothing is sent until you select local items and choose Queue.</value></data>
+  <data name="TransferSelectionReadyTitle" xml:space="preserve"><value>Selection ready</value></data>
+  <data name="TransferSelectionReadyMessage" xml:space="preserve"><value>Review the visible selection before queuing it.</value></data>
+  <data name="TransferTooManyTitle" xml:space="preserve"><value>Too many selections</value></data>
+  <data name="TransferTooManyMessage" xml:space="preserve"><value>Select no more than 32 files and folders in one request.</value></data>
+  <data name="TransferUnsafeSelectionTitle" xml:space="preserve"><value>Selection rejected</value></data>
+  <data name="TransferUnsafeSelectionMessage" xml:space="preserve"><value>A path was empty, duplicate, non-absolute, or exceeded the local byte limit.</value></data>
+  <data name="TransferPickerFailedTitle" xml:space="preserve"><value>Windows picker unavailable</value></data>
+  <data name="TransferPickerFailedMessage" xml:space="preserve"><value>Nodavo could not open the local file or folder picker. No selection was added.</value></data>
+  <data name="TransferSelectionCount" xml:space="preserve"><value>Selected: {0} of {1}</value></data>
+  <data name="TransferSelectedRoot" xml:space="preserve"><value>Selected root</value></data>
+  <data name="TransferSendingTitle" xml:space="preserve"><value>Queuing transfer</value></data>
+  <data name="TransferSendingMessage" xml:space="preserve"><value>Waiting for the agent's bounded preparation acknowledgement.</value></data>
+  <data name="TransferQueuedTitle" xml:space="preserve"><value>Transfer queued</value></data>
+  <data name="TransferQueuedMessage" xml:space="preserve"><value>Redacted transfer ID: {0}</value></data>
+  <data name="TransferTimedOutTitle" xml:space="preserve"><value>Transfer not confirmed</value></data>
+  <data name="TransferTimedOutMessage" xml:space="preserve"><value>The local request reached its deadline; no success is assumed.</value></data>
+  <data name="TransferFailedTitle" xml:space="preserve"><value>Transfer not queued</value></data>
+  <data name="TransferFailedMessage" xml:space="preserve"><value>Check the connection and file grant, then select the items again if needed.</value></data>
+  <data name="TransferRejectedTitle" xml:space="preserve"><value>Transfer rejected</value></data>
+  <data name="TransferRejectedMessage" xml:space="preserve"><value>The agent returned an explicit error instead of a queue acknowledgement.</value></data>
+  <data name="TransferOutcomeUnknownTitle" xml:space="preserve"><value>Transfer outcome unknown</value></data>
+  <data name="TransferOutcomeUnknownMessage" xml:space="preserve"><value>The acknowledgement was lost or invalid, so the transfer may already be queued. This selection cannot be retried; explicitly choose a fresh file or folder selection.</value></data>
   <data name="TransfersUnavailable.Text" xml:space="preserve"><value>The safe file-transfer queue is under implementation.</value></data>
   <data name="UnavailableBadge.Title" xml:space="preserve"><value>Not available in this build</value></data>
   <data name="UnavailableBadge.Message" xml:space="preserve"><value>This screen does not perform an action yet.</value></data>

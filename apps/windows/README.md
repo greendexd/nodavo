@@ -1,10 +1,10 @@
-<!-- doc-id: windows-app; lang: en; revision: 5 -->
+<!-- doc-id: windows-app; lang: en; revision: 7 -->
 
 # Nodavo for Windows
 
 [English](README.md) · [Русский](README.ru.md)
 
-This directory contains the first native WinUI 3 shell for Nodavo. It provides bilingual overview, devices, layout, transfers, and settings screens. The overview implements bounded status and emergency-stop requests. The Devices screen implements listening/manual pairing, explicit per-capability selection, six-digit code comparison, bilateral confirmation, cancellation, and honest pre-alpha states; unfinished screens say that they are unavailable instead of simulating a working feature.
+This directory contains the first native WinUI 3 shell for Nodavo. It provides bilingual overview, devices, layout, transfers, and settings screens. The overview implements bounded status and emergency-stop requests. The Devices screen implements listening/manual pairing, code comparison and confirmation, a bounded trusted-device list, transactional changes for all four local grants, and confirmed destructive revocation. Transfers accepts only explicit Windows file/folder picker results, enforces the local 32-path/4-KiB-per-path bounds before IPC, and displays only a redacted transfer identifier after acknowledgement. These are source and CI claims, not qualified Windows runtime claims.
 
 ## Supported source targets
 
@@ -26,6 +26,12 @@ For an unpackaged development build:
 
 ```powershell
 dotnet build apps/windows/Nodavo.Windows.sln -c Release -p:Platform=x64 -p:NodavoPackageMode=Unpackaged
+```
+
+The cross-host static safety check validates bilingual resources, XAML XML, IPC deadline ordering, separate trust-operation ownership, reconciliation markers, and ambiguous-transfer retry lockout:
+
+```bash
+python3 apps/windows/tests/check_product_ui.py
 ```
 
 Use `ARM64` and `win-arm64` for a direct native Windows ARM64 build. The packaging workflow may cross-build that payload on an x64 Windows runner, but only real ARM64 hardware can qualify its runtime. The included publish profiles are development inputs, not signed release definitions.
@@ -67,13 +73,13 @@ The separate Windows packaging workflow proves only that the self-signed develop
 
 ## Local IPC contract
 
-The UI connects to `\\.\pipe\nodavo-agent-{current-user-SID}` using .NET's current-user-only named-pipe option. Each message is a four-byte unsigned big-endian length followed by UTF-8 JSON, with a hard 64 KiB limit. The shell sends `get_status`, `emergency_stop`, `begin_pairing`, and `confirm_pairing`; long pairing requests have a bounded deadline and are cancellable from the UI. All permissions default to off and the explicit selection is signed into pairing trust. The shell does not log response bodies, peer traffic, input, clipboard data, filenames, pairing codes, keys, or stable network identifiers.
+The UI connects to `\\.\pipe\nodavo-agent-{current-user-SID}` using .NET's current-user-only named-pipe option. Each message is a four-byte unsigned big-endian length followed by UTF-8 JSON, with a hard 64 KiB limit. The shell sends bounded status, emergency-stop, pairing, trusted-peer listing, grant mutation, revocation, and selected-path transfer commands. Long pairing requests have a bounded deadline and are cancellable from the UI. All permissions default to off and the explicit selection is signed into pairing trust. Trusted-list refresh and trust mutation have separate serialized ownership. A grant switch is committed after an exact echo; an explicit agent error restores the previous authoritative value. A lost, timed-out, or invalid mutation response is instead treated as unknown: the affected peer remains disabled while the UI waits beyond the agent's two sequential five-second safety windows and reconciles from a new authoritative trusted-peer list. File requests contain one to 32 unique absolute paths explicitly returned by Windows pickers; each UTF-8 path is at most 4 KiB, and the response is reduced to a redacted transfer ID before it reaches the view. The transfer client waits beyond the agent's five-minute preparation deadline. If that response is ambiguous, the existing selection is locked against retry until the user explicitly makes a fresh picker selection. The shell does not log response bodies, peer traffic, input, clipboard data, filenames, pairing codes, keys, or stable network identifiers.
 
 ## Current limitations
 
 This source cannot be compiled, linked, or run on the current macOS development host. The x64 WinUI source is compile-checked by Windows CI, while the packaging workflow is the required build evidence for the complete x64/ARM64 development bundle. CI remains compile/package evidence rather than interactive runtime qualification.
 
-The Rust source now includes a same-user/session validated named-pipe server and DPAPI-protected identity/trust storage, and this shell includes the matching pairing flow. They compile or pass source/XML checks, but have not yet been run together on qualified real Windows x64 and ARM64 systems; runtime success is therefore not claimed. The packaged agent lifecycle/autostart UX, trusted-device permissions/revocation UI, layout editing, full input routing, clipboard, transfers, tray integration, diagnostics, updates, and production signing remain under implementation. `Package.appxmanifest` is development-only and uses a separate identity so it cannot be confused with or upgrade over a public release.
+The Rust source now includes a same-user/session validated named-pipe server and DPAPI-protected identity/trust storage, and this shell includes the matching pairing, trust-management, and explicit transfer-queue flows. They compile or pass source/XML checks, but have not yet been run together on qualified real Windows x64 and ARM64 systems; runtime success is therefore not claimed. The transfer screen proves only selection and queue acknowledgement, not end-to-end delivery. Packaged agent lifecycle/autostart UX, layout editing, full input routing, clipboard UX, transfer progress/resume/cancel UX, tray integration, diagnostics, updates, and production signing remain under implementation. `Package.appxmanifest` is development-only and uses a separate identity so it cannot be confused with or upgrade over a public release.
 
 Remaining release gates are exact and external: reserve/freeze the final Microsoft Store package identity and publisher in Partner Center; obtain Store approval for `runFullTrust` or use an identity-validated direct-distribution certificate; configure protected signing credentials and a reliable RFC 3161 endpoint; run clean install, upgrade, downgrade rejection, uninstall, certificate-expiry, tamper, rollback, and real x64/ARM64 runtime matrices; publish stable HTTPS artifacts and hashes before authoring a WinGet manifest. No MSI is emitted because Nodavo has not yet justified a second installer technology, tested its per-user upgrade/uninstall semantics, or qualified a WiX/MSI toolchain. MSI and portable ZIP remain optional decisions, not release claims.
 

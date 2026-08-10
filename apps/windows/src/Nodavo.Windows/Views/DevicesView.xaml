@@ -4,7 +4,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <Grid Padding="32">
         <ScrollViewer HorizontalScrollBarVisibility="Disabled">
-            <StackPanel MaxWidth="620" HorizontalAlignment="Center" Spacing="14">
+            <StackPanel MaxWidth="680" HorizontalAlignment="Center" Spacing="14">
                 <FontIcon FontSize="44" Glyph="&#xE770;" />
                 <TextBlock
                     x:Uid="DevicesTitle"
@@ -15,6 +15,79 @@
                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                     TextAlignment="Center"
                     TextWrapping="Wrap" />
+
+                <TextBlock
+                    x:Uid="TrustedDevicesHeading"
+                    FontWeight="SemiBold"
+                    Margin="0,12,0,0" />
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <Button
+                        x:Name="RefreshTrustedButton"
+                        x:Uid="TrustedDevicesRefresh"
+                        Click="RefreshTrustedButton_Click" />
+                    <ProgressRing
+                        x:Name="TrustedDevicesProgress"
+                        Width="24"
+                        Height="24"
+                        IsActive="False"
+                        Visibility="Collapsed" />
+                </StackPanel>
+                <InfoBar
+                    x:Name="TrustedDevicesStatus"
+                    IsClosable="False"
+                    IsOpen="True"
+                    Severity="Informational" />
+                <ListView
+                    x:Name="TrustedPeersList"
+                    MaxHeight="180"
+                    SelectionChanged="TrustedPeersList_SelectionChanged">
+                    <ListView.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding DisplayText}" TextWrapping="Wrap" />
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+                <Border
+                    x:Name="TrustedPeerDetails"
+                    Padding="16"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                    CornerRadius="8"
+                    Visibility="Collapsed">
+                    <StackPanel Spacing="10">
+                        <TextBlock x:Name="TrustedPeerName" FontWeight="SemiBold" TextWrapping="Wrap" />
+                        <TextBlock x:Name="TrustedPeerState" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <ToggleSwitch
+                            x:Name="TrustedInputGrant"
+                            x:Uid="TrustedAllowInput"
+                            Toggled="TrustedGrant_Toggled" />
+                        <ToggleSwitch
+                            x:Name="TrustedClipboardReadGrant"
+                            x:Uid="TrustedAllowClipboardRead"
+                            Toggled="TrustedGrant_Toggled" />
+                        <ToggleSwitch
+                            x:Name="TrustedClipboardWriteGrant"
+                            x:Uid="TrustedAllowClipboardWrite"
+                            Toggled="TrustedGrant_Toggled" />
+                        <ToggleSwitch
+                            x:Name="TrustedFilesGrant"
+                            x:Uid="TrustedAllowFiles"
+                            Toggled="TrustedGrant_Toggled" />
+                        <TextBlock
+                            x:Uid="TrustedPermissionsHelp"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            TextWrapping="Wrap" />
+                        <Button
+                            x:Name="RevokePeerButton"
+                            x:Uid="TrustedRevoke"
+                            Click="RevokePeerButton_Click"
+                            HorizontalAlignment="Left" />
+                    </StackPanel>
+                </Border>
+
+                <TextBlock
+                    x:Uid="PairingHeading"
+                    FontWeight="SemiBold"
+                    Margin="0,18,0,0" />
 
                 <InfoBar
                     x:Name="PairingStatus"
