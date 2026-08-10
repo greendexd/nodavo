@@ -17,6 +17,8 @@ pub const MAX_TRUSTED_PEERS: usize = 32;
 pub const MAX_SELECTED_PATHS: usize = 32;
 /// Maximum UTF-8 bytes accepted for one local selected path.
 pub const MAX_SELECTED_PATH_BYTES: usize = 4 * 1024;
+/// Maximum public semantic-version text returned by updater IPC.
+pub const MAX_UPDATE_VERSION_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -54,6 +56,16 @@ pub enum UiCommand {
     LocalLocked,
     /// Reports a trusted local system-sleep notification.
     LocalSleeping,
+    /// Returns the current public updater state without starting network work.
+    GetUpdateStatus,
+    /// Starts an explicitly requested update check.
+    CheckForUpdate,
+    /// Records a decision for exactly the currently offered update identifier.
+    DecideUpdate {
+        #[serde(deserialize_with = "deserialize_offer_id")]
+        offer_id: String,
+        accepted: bool,
+    },
     EmergencyStop,
     Shutdown,
 }
@@ -110,6 +122,7 @@ pub enum AgentEvent {
     TransferQueued {
         transfer_id: String,
     },
+    UpdateStatus(UpdateSnapshot),
     Error {
         code: String,
         message: String,
@@ -154,6 +167,223 @@ pub enum AgentPhase {
 pub enum InputOwner {
     Local,
     Remote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    Idle,
+    Checking,
+    UpToDate,
+    OfferAvailable,
+    ConsentRecorded,
+    Downloading,
+    DownloadPaused,
+    VerifiedStaged,
+    Declined,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateFailureCode {
+    NotConfigured,
+    Busy,
+    ManifestRejected,
+    Network,
+    Staging,
+    Verification,
+    Internal,
+}
+
+/// Bounded updater state exposed to the local UI.
+///
+/// URLs, local paths, artifact digests, signing keys, and remote filenames are
+/// deliberately absent. Construction validates phase-specific field
+/// invariants so byte counters and exact-consent identifiers cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateSnapshot {
+    phase: UpdatePhase,
+    offer_id: Option<String>,
+    version: Option<String>,
+    received_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    failure: Option<UpdateFailureCode>,
+}
+
+impl UpdateSnapshot {
+    /// Creates a public updater snapshot after validating its bounded shape.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical offer identifiers, unbounded version text,
+    /// inconsistent byte counters, and fields that are invalid for the phase.
+    pub fn new(
+        phase: UpdatePhase,
+        offer_id: Option<String>,
+        version: Option<String>,
+        received_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        failure: Option<UpdateFailureCode>,
+    ) -> Result<Self, UpdateSnapshotError> {
+        let snapshot = Self {
+            phase,
+            offer_id,
+            version,
+            received_bytes,
+            total_bytes,
+            failure,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> UpdatePhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub fn offer_id(&self) -> Option<&str> {
+        self.offer_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    #[must_use]
+    pub const fn received_bytes(&self) -> Option<u64> {
+        self.received_bytes
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> Option<u64> {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub const fn failure(&self) -> Option<UpdateFailureCode> {
+        self.failure
+    }
+
+    fn validate(&self) -> Result<(), UpdateSnapshotError> {
+        if self
+            .offer_id
+            .as_deref()
+            .is_some_and(|value| !is_canonical_offer_id(value))
+            || self.version.as_deref().is_some_and(|value| {
+                value.is_empty()
+                    || value.len() > MAX_UPDATE_VERSION_BYTES
+                    || match semver::Version::parse(value) {
+                        Ok(parsed) => parsed.to_string() != value,
+                        Err(_) => true,
+                    }
+            })
+        {
+            return Err(UpdateSnapshotError::InvalidPublicField);
+        }
+
+        let empty = self.offer_id.is_none()
+            && self.version.is_none()
+            && self.received_bytes.is_none()
+            && self.total_bytes.is_none();
+        let offered = self.offer_id.is_some()
+            && self.version.is_some()
+            && self.received_bytes.is_none()
+            && self.total_bytes.is_some_and(|total| total > 0);
+        let progress = self.offer_id.is_some()
+            && self.version.is_some()
+            && self
+                .received_bytes
+                .zip(self.total_bytes)
+                .is_some_and(|(received, total)| total > 0 && received <= total);
+        let complete = progress && self.received_bytes == self.total_bytes;
+
+        let valid = match self.phase {
+            UpdatePhase::Idle
+            | UpdatePhase::Checking
+            | UpdatePhase::UpToDate
+            | UpdatePhase::Declined => empty && self.failure.is_none(),
+            UpdatePhase::OfferAvailable | UpdatePhase::ConsentRecorded => {
+                offered && self.failure.is_none()
+            }
+            UpdatePhase::Downloading | UpdatePhase::DownloadPaused => {
+                progress && self.failure.is_none()
+            }
+            UpdatePhase::VerifiedStaged => complete && self.failure.is_none(),
+            UpdatePhase::Unavailable | UpdatePhase::Failed => empty && self.failure.is_some(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(UpdateSnapshotError::InvalidPhaseFields)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for UpdateSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WireSnapshot {
+            phase: UpdatePhase,
+            offer_id: Option<String>,
+            version: Option<String>,
+            received_bytes: Option<u64>,
+            total_bytes: Option<u64>,
+            failure: Option<UpdateFailureCode>,
+        }
+
+        let wire = WireSnapshot::deserialize(deserializer)?;
+        Self::new(
+            wire.phase,
+            wire.offer_id,
+            wire.version,
+            wire.received_bytes,
+            wire.total_bytes,
+            wire.failure,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum UpdateSnapshotError {
+    #[error("the public updater snapshot contains an invalid bounded field")]
+    InvalidPublicField,
+    #[error("the public updater snapshot fields are inconsistent with its phase")]
+    InvalidPhaseFields,
+}
+
+fn is_canonical_offer_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+}
+
+fn deserialize_offer_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if is_canonical_offer_id(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "update offer identifier must be a canonical lowercase UUID",
+        ))
+    }
 }
 
 #[derive(Debug, Error)]
@@ -266,7 +496,9 @@ pub mod unix {
 mod tests {
     use super::{
         AgentEvent, CapabilityName, IpcError, MAX_IPC_MESSAGE_SIZE, MAX_TRUSTED_PEERS,
-        TrustedPeerState, TrustedPeerSummary, UiCommand, read_frame, write_frame,
+        MAX_UPDATE_VERSION_BYTES, TrustedPeerState, TrustedPeerSummary, UiCommand,
+        UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
+        write_frame,
     };
 
     #[tokio::test]
@@ -395,5 +627,90 @@ mod tests {
 
         let encoded = serde_json::to_value(status).unwrap();
         assert_eq!(encoded["focus_state"], "local");
+    }
+
+    #[test]
+    fn updater_commands_have_stable_exact_offer_shape() {
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(r#"{"command":"get_update_status"}"#).unwrap(),
+            UiCommand::GetUpdateStatus
+        );
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(r#"{"command":"check_for_update"}"#).unwrap(),
+            UiCommand::CheckForUpdate
+        );
+        let decision = UiCommand::DecideUpdate {
+            offer_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            accepted: true,
+        };
+        assert_eq!(
+            serde_json::from_slice::<UiCommand>(&serde_json::to_vec(&decision).unwrap()).unwrap(),
+            decision
+        );
+        assert!(serde_json::from_str::<UiCommand>(
+            r#"{"command":"decide_update","offer_id":"01234567-89AB-CDEF-0123-456789ABCDEF","accepted":true}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn updater_snapshot_enforces_public_bounds_and_progress_invariants() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef".to_owned();
+        let progress = UpdateSnapshot::new(
+            UpdatePhase::Downloading,
+            Some(id.clone()),
+            Some("1.2.3".to_owned()),
+            Some(4),
+            Some(10),
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(AgentEvent::UpdateStatus(progress)).unwrap();
+        assert_eq!(encoded["phase"], "downloading");
+        assert!(encoded.get("artifact_url").is_none());
+        assert!(encoded.get("artifact_sha256").is_none());
+        assert!(encoded.get("path").is_none());
+
+        assert_eq!(
+            UpdateSnapshot::new(
+                UpdatePhase::Downloading,
+                Some(id.clone()),
+                Some("1.2.3".to_owned()),
+                Some(11),
+                Some(10),
+                None,
+            ),
+            Err(UpdateSnapshotError::InvalidPhaseFields)
+        );
+        assert_eq!(
+            UpdateSnapshot::new(
+                UpdatePhase::OfferAvailable,
+                Some(id.to_uppercase()),
+                Some("1.2.3".to_owned()),
+                None,
+                Some(10),
+                None,
+            ),
+            Err(UpdateSnapshotError::InvalidPublicField)
+        );
+        assert!(
+            UpdateSnapshot::new(
+                UpdatePhase::Unavailable,
+                None,
+                None,
+                None,
+                None,
+                Some(UpdateFailureCode::NotConfigured),
+            )
+            .is_ok()
+        );
+
+        let invalid_semver = r#"{"phase":"offer_available","offer_id":"01234567-89ab-cdef-0123-456789abcdef","version":"01.2.3","received_bytes":null,"total_bytes":10,"failure":null}"#;
+        assert!(serde_json::from_str::<UpdateSnapshot>(invalid_semver).is_err());
+        let overbound = format!(
+            r#"{{"phase":"offer_available","offer_id":"01234567-89ab-cdef-0123-456789abcdef","version":"{}","received_bytes":null,"total_bytes":10,"failure":null}}"#,
+            "1".repeat(MAX_UPDATE_VERSION_BYTES + 1)
+        );
+        assert!(serde_json::from_str::<UpdateSnapshot>(&overbound).is_err());
     }
 }

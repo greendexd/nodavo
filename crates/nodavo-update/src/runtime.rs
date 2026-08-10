@@ -34,6 +34,22 @@ pub struct ArtifactId {
 }
 
 impl ArtifactId {
+    /// Creates a bounded content-addressed staging identifier.
+    ///
+    /// This constructor does not authenticate the digest. Production callers
+    /// should normally obtain identifiers from a [`VerifiedRelease`]; it is
+    /// exposed so effect adapters can be tested independently.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero-length and oversized artifacts.
+    pub const fn new(sha256: [u8; 32], size: u64) -> Result<Self, UpdateRuntimeError> {
+        if size == 0 || size > MAX_ARTIFACT_BYTES {
+            return Err(UpdateRuntimeError::CorruptPersistentState);
+        }
+        Ok(Self { sha256, size })
+    }
+
     #[must_use]
     pub const fn sha256(&self) -> &[u8; 32] {
         &self.sha256
@@ -772,7 +788,9 @@ impl UpdateSession {
                 self.status = UpdateStatus::Staged;
                 Ok(artifact)
             } else {
-                let _ = staging.discard(artifact);
+                staging
+                    .discard(artifact)
+                    .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
                 Err(self.fail(UpdateRuntimeError::ArtifactVerificationFailed))
             };
         }
@@ -829,10 +847,12 @@ impl UpdateSession {
                 return Err(self.fail(UpdateRuntimeError::DownloadResponseRejected));
             }
             let chunk = &buffer[..read];
-            verifier.update(chunk).map_err(|_| {
-                let _ = staging.discard(artifact);
-                self.fail(UpdateRuntimeError::ArtifactVerificationFailed)
-            })?;
+            if verifier.update(chunk).is_err() {
+                staging
+                    .discard(artifact)
+                    .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
+                return Err(self.fail(UpdateRuntimeError::ArtifactVerificationFailed));
+            }
             staging
                 .append(artifact, offset, chunk)
                 .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
@@ -1084,7 +1104,9 @@ impl UpdateSession {
             StagedArtifactState::Partial(length) | StagedArtifactState::Sealed(length) => length,
         };
         if length > artifact.size {
-            let _ = staging.discard(artifact);
+            staging
+                .discard(artifact)
+                .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
             return Err(self.fail(UpdateRuntimeError::ArtifactVerificationFailed));
         }
         let mut verifier = self.release.artifact_verifier();
@@ -1099,10 +1121,12 @@ impl UpdateSession {
             if read == 0 || read > remaining {
                 return Err(self.fail(UpdateRuntimeError::StagingFailed));
             }
-            verifier.update(&buffer[..read]).map_err(|_| {
-                let _ = staging.discard(artifact);
-                self.fail(UpdateRuntimeError::ArtifactVerificationFailed)
-            })?;
+            if verifier.update(&buffer[..read]).is_err() {
+                staging
+                    .discard(artifact)
+                    .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
+                return Err(self.fail(UpdateRuntimeError::ArtifactVerificationFailed));
+            }
             offset = verifier.observed_size();
         }
         Ok((verifier, offset))
@@ -1115,7 +1139,9 @@ impl UpdateSession {
         verifier: ArtifactVerifier,
     ) -> Result<ArtifactId, UpdateRuntimeError> {
         if verifier.finish().is_err() {
-            let _ = staging.discard(artifact);
+            staging
+                .discard(artifact)
+                .map_err(|_| self.fail(UpdateRuntimeError::StagingFailed))?;
             return Err(self.fail(UpdateRuntimeError::ArtifactVerificationFailed));
         }
         staging
@@ -1551,6 +1577,7 @@ mod tests {
         sealed: bool,
         resets: usize,
         discards: usize,
+        fail_discard: bool,
     }
 
     impl ArtifactStaging for FakeStage {
@@ -1612,6 +1639,9 @@ mod tests {
         }
 
         fn discard(&mut self, _artifact: ArtifactId) -> Result<(), ExternalEffectError> {
+            if self.fail_discard {
+                return Err(ExternalEffectError);
+            }
             self.bytes.clear();
             self.sealed = false;
             self.discards += 1;
@@ -1831,6 +1861,30 @@ mod tests {
         );
         assert!(staging.bytes.is_empty());
         assert_eq!(staging.discards, 1);
+    }
+
+    #[test]
+    fn rejected_artifact_cleanup_failure_is_not_silently_ignored() {
+        let expected = b"expected artifact";
+        let delivered = b"tampered artifact";
+        assert_eq!(expected.len(), delivered.len());
+        let mut session = UpdateSession::new(verified_release(expected, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        let mut staging = FakeStage {
+            fail_discard: true,
+            ..FakeStage::default()
+        };
+
+        assert_eq!(
+            session.stage_download(&mut FakeDownloader::new(delivered), &mut staging),
+            Err(UpdateRuntimeError::StagingFailed)
+        );
+        assert_eq!(
+            session.status(),
+            UpdateStatus::Failed(UpdateRuntimeError::StagingFailed)
+        );
     }
 
     #[test]

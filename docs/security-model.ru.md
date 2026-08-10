@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 9 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 10 -->
 
 # Модель безопасности
 
@@ -104,17 +104,22 @@ Pre-alpha receiver пишет через capability-rooted no-follow handles к�
 - UI requests проходят capability checks; UI не читает private network keys напрямую.
 - Listing доверенных устройств ограничен 32 публичными summaries, содержащими только локальный peer identifier, ограниченное display name, состояние active/revoked и локально выданные grants. Сертификаты, endpoints, private material и независимо выданные peer grants исключены.
 
-Текущий pre-alpha Unix socket аутентифицирует только credential владельца, а Windows pipe — тот же SID/session. Это блокирует cross-user и remote clients, но пока не отличает подписанный UI Nodavo от другого процесса, уже работающего от того же пользователя. Поэтому signed-client или launch-bound authentication остаётся stable-release gate; чувствительные локальные запросы должны быть узко ограничены, а release storage не должно открывать UI приватные сетевые ключи.
+Текущий pre-alpha Unix socket аутентифицирует только credential владельца, а Windows pipe — тот же SID/session. Это блокирует cross-user и remote clients, но пока не отличает подписанный UI Nodavo от другого процесса, уже работающего от того же пользователя. Это относится и к командам проверки обновлений и согласия на точное предложение, которые изменяют состояние updater. Поэтому signed-client или launch-bound authentication остаётся stable-release gate; чувствительные локальные запросы должны быть узко ограничены, а release storage не должно открывать UI приватные сетевые ключи.
 
 ## Обновления и supply chain
 
-Pre-alpha crate обновлений проверяет ограниченные подписанные manifests и предоставляет effect-isolated contracts для HTTPS response policy, resumable content-addressed staging, streaming-проверки размера/digest, явного согласия пользователя, монотонного rollback persistence и восстановления через restart/health/rollback. Сам crate никогда не загружает и не запускает содержимое. Конкретные network adapters, OS-protected persistence состояния обновлений, подписанные platform installers, restart orchestration и product UI не интегрированы и остаются release gates.
+Агент теперь интегрирует намеренно не активирующий обновления Unix/macOS slice вокруг pre-alpha crate обновлений. Сборка остаётся ненастроенной, если HTTPS endpoint манифеста и публичный ключ Ed25519 не были явно встроены при компиляции. В настроенной сборке клиент использует нативную платформенную проверку TLS и root store, отключает redirects, ambient proxy discovery, cookies, credentials и decompression, а также применяет ограниченные правила status, length, range, timeout и body. Подписанный манифест должен совпадать с channel, target и install identity сборки, а origin его артефакта — с origin манифеста. Согласие привязано к точному canonical UUID предложения.
+
+Принятые артефакты возобновляемо загружаются в приватный capability-rooted content-addressed staging под межпроцессной exclusive lease и ограничениями quota/retention. Запись проходит потоковые проверки точного offset, размера и digest; файлы и поддерживаемые изменения каталогов синхронизируются до сообщения о verified staging. Staged content не открывается, не запускается, не устанавливается и не активируется. Двуязычный раздел Settings macOS умеет вручную проверять или обновлять статус, опрашивать ограниченный progress через отдельный client, показывать результат up-to-date, принимать или отклонять точное предложение и возобновлять приостановленную загрузку, не отображая endpoint, filesystem path или digest. Для Windows соответствующей интеграции updater staging и UI нет.
+
+Репозиторий не содержит production endpoint, приватного release signing key или доказательства live production update check. В нём также нет защищённого production Keychain-журнала состояния обновлений и durable rollback floor. Контракты state machine для restart, health checking и rollback не подключены, потому что отсутствуют installer, activation step, restart handoff, health supervisor и rollback supervisor. Это release gates, а не свойства текущего потока staged artifacts.
 
 Ниже перечислены обязательные требования к релизу:
 
 - Артефакты релиза будут подписаны; сборки macOS пройдут notarization, а Windows будет использовать Authenticode.
 - Манифесты обновлений будут подписаны отдельным офлайн-ключом релиза.
 - Механизм обновления будет запрещать откат ниже зафиксированной безопасной версии без документированного восстановления пользователем.
+- Изменяющий updater local IPC будет аутентифицировать разрешённый signed/provisioned UI Nodavo, а не только другой процесс того же пользователя.
 - Релизы будут содержать контрольные суммы, SBOM, данные о происхождении сборки, lock-файлы и исходный коммит.
 - Политика зависимостей, аудиты, CodeQL, фаззинг и поиск секретов будут работать постоянно до появления поддерживаемого релиза.
 

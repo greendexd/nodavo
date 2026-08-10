@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: en; revision: 6 -->
+<!-- doc-id: macos-app; lang: en; revision: 7 -->
 
 # Nodavo for macOS
 
@@ -12,6 +12,14 @@ swift run --package-path apps/macos Nodavo
 ```
 
 All pairing permissions default to off. The selected permissions are bound to the confirmed pairing transcript and signed device trust. Post-pair switches update only after the agent acknowledges the exact change; revoked devices cannot be edited and must be paired again. The UI never sends inferred filesystem paths: only absolute paths returned by an explicit local picker selection are accepted.
+
+## Updates
+
+Settings exposes the current non-activating updater slice. A user can manually check or refresh, see an up-to-date result, explicitly choose **Download and stage** or **Decline** for the exact offer, follow bounded download progress, and resume a paused download. One generation-owned polling loop uses a separate agent client after consent or while downloading, so it does not block pairing, transfers, or emergency stop and stops at a terminal or paused state. The interface never displays the manifest URL, staging path, or digest. A verified result is reported honestly as staged; automatic installation is unavailable in the development build.
+
+The agent side is unconfigured by default. Only a build that explicitly embeds a pinned HTTPS manifest endpoint and Ed25519 public key can contact an update service; the repository contains neither a production endpoint nor the private signing key, and no live production check or signing ceremony is claimed. The current macOS/Unix path uses native platform TLS without redirects or decompression, verifies a bounded signed manifest and same-origin artifact, binds consent to its canonical offer UUID, and resumably writes digest-verified content to a private capability-rooted staging root with a cross-process lease, quotas, retention, and fsync.
+
+There is no installer handoff, activation, application or agent restart, health/rollback supervisor, protected production Keychain update journal, or durable rollback floor. Nothing staged is executed. Update-mutating IPC is restricted to the same local user but does not yet authenticate a signed/provisioned Nodavo UI against other processes of that user; that stronger client authentication remains a stable-release gate. Windows updater staging and UI integration are also absent.
 
 ## Packaging
 

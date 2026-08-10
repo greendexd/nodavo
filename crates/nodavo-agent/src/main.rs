@@ -11,6 +11,7 @@ mod storage;
 mod topology_runtime;
 mod transfer_runtime;
 mod transfer_worker;
+mod update;
 #[cfg(target_os = "windows")]
 mod windows;
 mod wire;
@@ -278,6 +279,40 @@ where
                 Ok(status) => AgentEvent::Status(status),
                 Err(error) => agent_error_event(&error),
             },
+            UiCommand::GetUpdateStatus => {
+                AgentEvent::UpdateStatus(update::coordinator().snapshot())
+            }
+            UiCommand::CheckForUpdate => {
+                let coordinator = update::coordinator();
+                match tokio::task::spawn_blocking(move || coordinator.check_for_update()).await {
+                    Ok(Ok(snapshot)) => AgentEvent::UpdateStatus(snapshot),
+                    Ok(Err(error)) => update_error_event(error),
+                    Err(_) => update_error_event(update::CoordinatorError::Internal),
+                }
+            }
+            UiCommand::DecideUpdate { offer_id, accepted } => {
+                let coordinator = update::coordinator();
+                match coordinator.record_decision(&offer_id, accepted) {
+                    Ok(update::DecisionOutcome::Complete(snapshot)) => {
+                        AgentEvent::UpdateStatus(snapshot)
+                    }
+                    Ok(update::DecisionOutcome::StartDownload { snapshot, token }) => {
+                        let worker_coordinator = Arc::clone(&coordinator);
+                        tokio::spawn(async move {
+                            let blocking_coordinator = Arc::clone(&worker_coordinator);
+                            let result = tokio::task::spawn_blocking(move || {
+                                blocking_coordinator.download_offer(token)
+                            })
+                            .await;
+                            if !matches!(result, Ok(Ok(_))) {
+                                worker_coordinator.publish_internal_failure();
+                            }
+                        });
+                        AgentEvent::UpdateStatus(snapshot)
+                    }
+                    Err(error) => update_error_event(error),
+                }
+            }
             UiCommand::EmergencyStop => match runtime.emergency_stop().await {
                 Ok(status) => AgentEvent::Status(status),
                 Err(error) => agent_error_event(&error),
@@ -366,6 +401,20 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::FocusRejected => "focus_rejected",
         AgentError::SafetyRecoveryFailed => "safety_recovery_failed",
         AgentError::TransferFailed => "transfer_failed",
+    };
+    AgentEvent::Error {
+        code: code.to_owned(),
+        message: error.to_string(),
+    }
+}
+
+fn update_error_event(error: update::CoordinatorError) -> AgentEvent {
+    let code = match error {
+        update::CoordinatorError::NotConfigured => "update_not_configured",
+        update::CoordinatorError::Busy => "update_busy",
+        update::CoordinatorError::OfferMismatch => "update_offer_mismatch",
+        update::CoordinatorError::InvalidTransition => "update_invalid_transition",
+        update::CoordinatorError::Internal => "update_internal",
     };
     AgentEvent::Error {
         code: code.to_owned(),

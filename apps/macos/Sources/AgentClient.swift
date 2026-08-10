@@ -20,7 +20,7 @@ enum PairingCapability: String, CaseIterable, Hashable, Identifiable, Codable {
     var id: String { rawValue }
 }
 
-private struct AgentCommand: Encodable {
+struct AgentCommand: Encodable {
     let command: String
     let endpoint: String?
     let pairingID: String?
@@ -31,6 +31,7 @@ private struct AgentCommand: Encodable {
     let capabilities: [String]?
     let paths: [String]?
     let ttlMs: UInt32?
+    let offerID: String?
 
     enum CodingKeys: String, CodingKey {
         case command
@@ -43,6 +44,7 @@ private struct AgentCommand: Encodable {
         case capabilities
         case paths
         case ttlMs = "ttl_ms"
+        case offerID = "offer_id"
     }
 
     init(
@@ -55,7 +57,8 @@ private struct AgentCommand: Encodable {
         enabled: Bool? = nil,
         capabilities: [String]? = nil,
         paths: [String]? = nil,
-        ttlMs: UInt32? = nil
+        ttlMs: UInt32? = nil,
+        offerID: String? = nil
     ) {
         self.command = command
         self.endpoint = endpoint
@@ -67,10 +70,15 @@ private struct AgentCommand: Encodable {
         self.capabilities = capabilities
         self.paths = paths
         self.ttlMs = ttlMs
+        self.offerID = offerID
     }
 
     static func simple(_ command: String) -> Self {
         Self(command: command)
+    }
+
+    static func updateDecision(offerID: String, accepted: Bool) -> Self {
+        Self(command: "decide_update", accepted: accepted, offerID: offerID)
     }
 }
 
@@ -104,6 +112,11 @@ struct AgentResponse: Decodable {
     let peers: [AgentPeerResponse]?
     let transferID: String?
     let message: String?
+    let offerID: String?
+    let version: String?
+    let receivedBytes: UInt64?
+    let totalBytes: UInt64?
+    let failure: String?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -121,6 +134,11 @@ struct AgentResponse: Decodable {
         case peers
         case transferID = "transfer_id"
         case message
+        case offerID = "offer_id"
+        case version
+        case receivedBytes = "received_bytes"
+        case totalBytes = "total_bytes"
+        case failure
     }
 }
 
@@ -159,10 +177,66 @@ struct QueuedTransferReference: Equatable {
     let redactedID: String
 }
 
+enum UpdatePhase: String, CaseIterable, Equatable {
+    case idle
+    case checking
+    case upToDate = "up_to_date"
+    case offerAvailable = "offer_available"
+    case consentRecorded = "consent_recorded"
+    case downloading
+    case downloadPaused = "download_paused"
+    case verifiedStaged = "verified_staged"
+    case declined
+    case unavailable
+    case failed
+
+    var acceptsPositiveDecision: Bool {
+        self == .offerAvailable || self == .downloadPaused
+    }
+
+    var acceptsDecline: Bool {
+        self == .offerAvailable
+    }
+
+    var requiresAutomaticPolling: Bool {
+        self == .consentRecorded || self == .downloading
+    }
+}
+
+enum UpdateFailureCode: String, CaseIterable, Equatable {
+    case notConfigured = "not_configured"
+    case busy
+    case manifestRejected = "manifest_rejected"
+    case network
+    case staging
+    case verification
+    case `internal`
+}
+
+struct UpdateStatusSnapshot: Equatable {
+    let phase: UpdatePhase
+    let offerID: String?
+    let version: String?
+    let receivedBytes: UInt64?
+    let totalBytes: UInt64?
+    let failure: UpdateFailureCode?
+
+    static let idle = Self(
+        phase: .idle,
+        offerID: nil,
+        version: nil,
+        receivedBytes: nil,
+        totalBytes: nil,
+        failure: nil
+    )
+}
+
 enum AgentResponseDecoder {
     static let maximumTrustedPeers = 32
     static let maximumPeerIDBytes = 128
     static let maximumDisplayNameBytes = 256
+    static let maximumUpdateVersionBytes = 128
+    static let maximumUpdateArtifactBytes: UInt64 = 16 * 1024 * 1024 * 1024
 
     static func trustedPeers(_ response: AgentResponse) throws -> [TrustedPeerSummary] {
         guard response.event == "trusted_peers", let peers = response.peers,
@@ -201,6 +275,172 @@ enum AgentResponseDecoder {
             throw AgentClientError.invalidResponse
         }
         return QueuedTransferReference(redactedID: String(transferID.prefix(8)) + "…")
+    }
+
+    static func updateStatus(_ response: AgentResponse) throws -> UpdateStatusSnapshot {
+        guard response.event == "update_status",
+              let phaseText = response.phase,
+              let phase = UpdatePhase(rawValue: phaseText)
+        else {
+            throw AgentClientError.invalidResponse
+        }
+
+        let offerID = try response.offerID.map(validateCanonicalOfferID)
+        let version = try response.version.map(validateSemanticVersion)
+        let failure = try response.failure.map { value in
+            guard let code = UpdateFailureCode(rawValue: value) else {
+                throw AgentClientError.invalidResponse
+            }
+            return code
+        }
+
+        guard validUpdateShape(
+            phase: phase,
+            offerID: offerID,
+            version: version,
+            received: response.receivedBytes,
+            total: response.totalBytes,
+            failure: failure
+        ) else {
+            throw AgentClientError.invalidResponse
+        }
+
+        return UpdateStatusSnapshot(
+            phase: phase,
+            offerID: offerID,
+            version: version,
+            receivedBytes: response.receivedBytes,
+            totalBytes: response.totalBytes,
+            failure: failure
+        )
+    }
+
+    static func validateCanonicalOfferID(_ value: String) throws -> String {
+        guard value.utf8.count == 36,
+              let parsed = UUID(uuidString: value),
+              parsed.uuidString.lowercased() == value
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        return value
+    }
+
+    private static func validateSemanticVersion(_ value: String) throws -> String {
+        guard isSemanticVersion(value) else {
+            throw AgentClientError.invalidResponse
+        }
+        return value
+    }
+
+    private static func validUpdateShape(
+        phase: UpdatePhase,
+        offerID: String?,
+        version: String?,
+        received: UInt64?,
+        total: UInt64?,
+        failure: UpdateFailureCode?
+    ) -> Bool {
+        switch phase {
+        case .idle, .checking, .upToDate, .declined:
+            offerID == nil
+                && version == nil
+                && received == nil
+                && total == nil
+                && failure == nil
+        case .offerAvailable, .consentRecorded:
+            offerID != nil
+                && version != nil
+                && received == nil
+                && validTotal(total)
+                && failure == nil
+        case .downloading, .downloadPaused:
+            offerID != nil
+                && version != nil
+                && validProgress(received: received, total: total, mustBeComplete: false)
+                && failure == nil
+        case .verifiedStaged:
+            offerID != nil
+                && version != nil
+                && validProgress(received: received, total: total, mustBeComplete: true)
+                && failure == nil
+        case .unavailable, .failed:
+            offerID == nil
+                && version == nil
+                && received == nil
+                && total == nil
+                && failure != nil
+        }
+    }
+
+    private static func validTotal(_ total: UInt64?) -> Bool {
+        guard let total else { return false }
+        return total > 0 && total <= maximumUpdateArtifactBytes
+    }
+
+    private static func validProgress(
+        received: UInt64?,
+        total: UInt64?,
+        mustBeComplete: Bool
+    ) -> Bool {
+        guard let received, let total, validTotal(total), received <= total else {
+            return false
+        }
+        return !mustBeComplete || received == total
+    }
+
+    private static func isSemanticVersion(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.utf8.count <= maximumUpdateVersionBytes,
+              value.unicodeScalars.allSatisfy(\.isASCII)
+        else {
+            return false
+        }
+
+        let buildSplit = value.split(separator: "+", omittingEmptySubsequences: false)
+        guard buildSplit.count <= 2,
+              buildSplit.last.map({ validIdentifiers($0, rejectLeadingZeroNumbers: false) }) != false
+        else {
+            return false
+        }
+
+        let precedence = buildSplit[0]
+        let prereleaseSplit = precedence.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard prereleaseSplit.count <= 2,
+              prereleaseSplit.last.map({ part in
+                  prereleaseSplit.count == 1 || validIdentifiers(part, rejectLeadingZeroNumbers: true)
+              }) != false
+        else {
+            return false
+        }
+
+        let core = prereleaseSplit[0].split(separator: ".", omittingEmptySubsequences: false)
+        return core.count == 3 && core.allSatisfy(validCoreNumber)
+    }
+
+    private static func validCoreNumber(_ value: Substring) -> Bool {
+        !value.isEmpty
+            && value.allSatisfy { $0.isASCII && $0.isNumber }
+            && (value == "0" || value.first != "0")
+    }
+
+    private static func validIdentifiers(
+        _ value: Substring,
+        rejectLeadingZeroNumbers: Bool
+    ) -> Bool {
+        let identifiers = value.split(separator: ".", omittingEmptySubsequences: false)
+        return !identifiers.isEmpty && identifiers.allSatisfy { identifier in
+            guard !identifier.isEmpty,
+                  identifier.allSatisfy({ character in
+                      character.isASCII && (character.isLetter || character.isNumber || character == "-")
+                  })
+            else {
+                return false
+            }
+            return !rejectLeadingZeroNumbers
+                || !identifier.allSatisfy(\.isNumber)
+                || identifier == "0"
+                || identifier.first != "0"
+        }
     }
 }
 
@@ -318,6 +558,32 @@ actor AgentClient {
         return try AgentResponseDecoder.transferReference(
             request(AgentCommand(command: "send_files", paths: paths))
         )
+    }
+
+    func updateStatus() throws -> UpdateStatusSnapshot {
+        try AgentResponseDecoder.updateStatus(
+            request(AgentCommand.simple("get_update_status"))
+        )
+    }
+
+    func checkForUpdate() throws -> UpdateStatusSnapshot {
+        try AgentResponseDecoder.updateStatus(
+            request(AgentCommand.simple("check_for_update"))
+        )
+    }
+
+    func decideUpdate(offerID: String, accepted: Bool) throws -> UpdateStatusSnapshot {
+        let canonicalOfferID = try AgentResponseDecoder.validateCanonicalOfferID(offerID)
+        let status = try AgentResponseDecoder.updateStatus(
+            request(AgentCommand.updateDecision(
+                offerID: canonicalOfferID,
+                accepted: accepted
+            ))
+        )
+        if let returnedOfferID = status.offerID, returnedOfferID != canonicalOfferID {
+            throw AgentClientError.invalidResponse
+        }
+        return status
     }
 
     static func validateSelectedPaths(_ paths: [String]) throws {

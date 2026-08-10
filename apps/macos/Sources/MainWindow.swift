@@ -476,12 +476,93 @@ private struct SettingsView: View {
                         .foregroundStyle(.orange)
                 }
             }
+            Section("software_update") {
+                Label(model.updateStatusText, systemImage: model.updateStatusSymbol)
+                    .foregroundStyle(model.updateStatusColor)
+
+                if let version = model.updateStatus.version {
+                    LabeledContent("update_version", value: version)
+                }
+
+                if model.updateStatus.receivedBytes == nil,
+                   let total = model.updateStatus.totalBytes {
+                    LabeledContent(
+                        "update_download_size",
+                        value: ByteCountFormatter.string(
+                            fromByteCount: Int64(total),
+                            countStyle: .file
+                        )
+                    )
+                }
+
+                if let received = model.updateStatus.receivedBytes,
+                   let total = model.updateStatus.totalBytes {
+                    ProgressView(value: Double(received), total: Double(total))
+                    Text(String.localizedStringWithFormat(
+                        String(localized: "update_progress_format"),
+                        ByteCountFormatter.string(
+                            fromByteCount: Int64(received),
+                            countStyle: .file
+                        ),
+                        ByteCountFormatter.string(
+                            fromByteCount: Int64(total),
+                            countStyle: .file
+                        )
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+
+                if model.updateOperationInProgress {
+                    ProgressView("update_request_in_progress")
+                }
+
+                HStack {
+                    Button("update_check") { model.checkForUpdate() }
+                        .disabled(!model.updateCanCheck)
+                    Button("update_refresh") { model.refreshUpdateStatus() }
+                        .disabled(model.updateOperationInProgress)
+                }
+
+                if model.updateCanDecide {
+                    HStack {
+                        Button(
+                            model.updateStatus.phase == .downloadPaused
+                                ? "update_resume_download"
+                                : "update_download_stage"
+                        ) {
+                            model.decideUpdate(accepted: true)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        if model.updateCanDecline {
+                            Button("update_decline", role: .cancel) {
+                                model.decideUpdate(accepted: false)
+                            }
+                        }
+                    }
+                }
+
+                if model.updateStatus.phase == .verifiedStaged {
+                    Label("update_staged_development_notice", systemImage: "hammer")
+                        .foregroundStyle(.secondary)
+                }
+
+                if let failure = model.updateFailureText {
+                    Label(failure, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+
+                Text("update_privacy_notice")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("safety") {
                 Button("emergency_stop", role: .destructive) { model.emergencyStop() }
             }
         }
         .formStyle(.grouped)
         .navigationTitle("section_settings")
+        .onAppear { model.refreshUpdateStatus() }
     }
 }
 

@@ -1,4 +1,4 @@
-<!-- doc-id: readme; lang: en; revision: 11 -->
+<!-- doc-id: readme; lang: en; revision: 12 -->
 
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="Nodavo logo">
@@ -47,6 +47,7 @@ The implementation will be written from scratch. Existing software KVM projects 
 | Discovery | mDNS with manual IP fallback | The agent resolves bounded mDNS records and accepts manual addresses; automatic device-list UX is missing |
 | Pairing | User-confirmed short code and pinned device identities | Pairing-time grants, signed trust, pinned mutual TLS reconnect, directional grant epochs, transactional post-pair changes, bounded trusted-device listing, and revocation work in focused tests. Both native shells expose this UX. Signed/provisioned Keychain success and real Windows runtime validation remain |
 | Transport | QUIC with TLS 1.3 | Pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback, clipboard, and bounded file channels run over one mutually authenticated connection in focused/virtual tests. Real two-device loss/reorder/performance qualification is missing |
+| Updates | Signed checks, explicit consent, safe install and rollback | The agent has an unconfigured-by-default, non-activating update slice: compile-time pinned manifest endpoint and Ed25519 public key, native platform TLS, a signed manifest with same-origin artifacts, exact offer consent, resumable verified private staging on macOS, and a pollable bilingual macOS Settings flow with up-to-date and resume states. No production endpoint or signing key has been used; installation, activation, restart/rollback supervision, protected update-state persistence, and Windows staging/UI are absent |
 | Platforms | macOS 13+ and Windows 10 22H2/11, x64 and ARM64 | SwiftUI and WinUI 3 x64 compile in CI; Rust checks for macOS arm64/x64 and Windows x64, a universal development macOS app/DMG is reproducibly assembled, and a fail-closed Windows x64+ARM64 development MSIXBundle workflow exists. Windows runtime/ARM64 execution, Developer ID/notarization, production Authenticode, and clean installer matrices remain unproven |
 
 Screen streaming, internet relay, mobile clients, Linux support, and Windows secure-desktop control are not part of the initial 1.0 scope.
@@ -60,12 +61,12 @@ Screen streaming, internet relay, mobile clients, Linux support, and Windows sec
 - Original macOS and Windows input/clipboard runtimes wired into the agent, with default-off suppression, injected-event rejection, bounded relative motion, lifecycle recovery, deterministic release, and content-redacted failures.
 - Authenticated bounded file channels, a four-reservation process worker, cooperative scan cancellation, peer-scoped cleanup, private capability-rooted receiver staging, and an outbound filesystem source with exact hashes, mutation detection, no-follow handles, Windows birth-time DACLs, and conservative no-overwrite publication.
 - A universal development macOS app/DMG pipeline and a fail-closed Developer ID/provisioning/notarization release path. Release credentials are unavailable, so only the explicitly non-distributable development artifact has been built.
-- A signed-update state-machine core with bounded HTTPS/staging contracts, explicit consent, rollback floors, and restart/health recovery. It has no concrete network, protected persistence, installer, or product-UI adapters yet.
+- A non-activating signed-update slice in the agent and macOS Settings: when an endpoint and Ed25519 public key are explicitly embedded at compile time, the agent uses native platform TLS without redirects or decompression, verifies a bounded signed manifest and same-origin artifact, records consent for the exact offer UUID, and resumes digest-verified downloads into private capability-rooted staging with a cross-process lease, quotas, retention, and file/directory synchronization. It is unconfigured by default and has no production endpoint, private signing key, protected Keychain update journal, durable rollback floor, installer, activation, restart/rollback supervisor, or Windows staging/UI integration.
 
 ### What still blocks a usable build
 
 - Real interactive Mac ↔ Windows validation of input, relative edge crossing, DPI, lifecycle, clipboard, DPAPI, named-pipe/WinUI flow, and recovery; Windows ARM64 evidence is also missing.
-- Real peer file-transfer qualification, user-selected receive destinations, detailed progress/cancel history, durable peer/outbound ownership across agent restart, hot-plug layout editing, onboarding, diagnostics, and updater installation.
+- Real peer file-transfer qualification, user-selected receive destinations, detailed progress/cancel history, durable peer/outbound ownership across agent restart, hot-plug layout editing, onboarding, diagnostics, and updater installation/activation/restart/rollback supervision, including Windows updater staging and UI.
 - A signed/provisioned macOS run proving Keychain/TCC stability, plus Developer ID/notarization and Authenticode/MSIX/MSI release credentials and clean install/upgrade/uninstall matrices.
 - The full security, fuzz, stress, compatibility, accessibility, long-running beta, external-review, SBOM/provenance, and real-hardware gates required for 1.0.
 

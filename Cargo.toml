@@ -19,9 +19,11 @@ bytes = { version = "1", features = ["serde"] }
 core-foundation = "0.10"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "serde", "zeroize"] }
+fs2 = "0.4"
 macos-accessibility-client = "0.0.2"
 mdns-sd = { version = "0.20.3", default-features = false }
 minicbor = { version = "2", features = ["alloc", "derive", "std"] }
+native-tls = "0.2"
 postcard = { version = "1", features = ["alloc"] }
 quinn = "0.11.11"
 rand = "0.9"
@@ -36,6 +38,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ureq = { version = "2.12", default-features = false, features = ["native-tls"] }
+url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 unicode-normalization = "0.1"
 windows = "0.62.2"

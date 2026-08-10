@@ -1,4 +1,4 @@
-<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 11 -->
+<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 12 -->
 
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="Логотип Nodavo">
@@ -47,6 +47,7 @@ Nodavo создаётся, чтобы Mac и Windows-компьютер ощущ
 | Обнаружение | mDNS и запасной вариант с ручным IP | Агент разрешает ограниченные записи mDNS и принимает ручные адреса; автоматического списка устройств в интерфейсе пока нет |
 | Сопряжение | Подтверждаемый пользователем короткий код и закреплённые идентификаторы устройств | Pairing-time grants, signed trust, pinned mutual TLS reconnect, directional grant epochs, транзакционные post-pair changes, bounded trusted-device list и revocation работают в focused tests. Этот UX есть в обеих native shells. Остаются signed/provisioned Keychain success и реальная Windows runtime validation |
 | Транспорт | QUIC с TLS 1.3 | Через одно mutually authenticated соединение в focused/virtual tests работают pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback, clipboard и bounded file channels. Нет реальной квалификации двух устройств с loss/reorder/performance |
+| Обновления | Подписанные проверки, явное согласие, безопасная установка и откат | В агенте есть выключенный по умолчанию, не активирующий обновления slice: закреплённые при компиляции endpoint манифеста и публичный ключ Ed25519, нативный платформенный TLS, подписанный манифест с артефактами того же origin, согласие на точный offer и возобновляемый проверяемый приватный staging в macOS, а также опрашиваемый двуязычный раздел Settings macOS с состояниями up-to-date и resume. Production endpoint и signing key не использовались; отсутствуют установка, активация, supervisor перезапуска/отката, защищённое сохранение состояния обновлений и Windows staging/UI |
 | Платформы | macOS 13+ и Windows 10 22H2/11, x64 и ARM64 | SwiftUI и WinUI 3 x64 компилируются в CI; Rust проверяется для macOS arm64/x64 и Windows x64, reproducibly собирается universal development app/DMG macOS, а также существует fail-closed Windows x64+ARM64 development MSIXBundle workflow. Windows runtime/ARM64 execution, Developer ID/notarization, production Authenticode и clean installer matrices не доказаны |
 
 Трансляция экрана, сервер-посредник в интернете, мобильные клиенты, Linux и управление Windows Secure Desktop не входят в первоначальный объём 1.0.
@@ -60,12 +61,12 @@ Nodavo создаётся, чтобы Mac и Windows-компьютер ощущ
 - Оригинальные macOS/Windows input и clipboard runtimes, подключённые к agent, с default-off suppression, injected-event rejection, bounded relative motion, lifecycle recovery, deterministic release и content-redacted failures.
 - Authenticated bounded file channels, process worker с четырьмя reservations, cooperative scan cancellation, peer-scoped cleanup, private capability-rooted receiver staging и outbound filesystem source с exact hashes, mutation detection, no-follow handles, Windows birth-time DACL и консервативной no-overwrite publication.
 - Universal development app/DMG pipeline для macOS и fail-closed release path Developer ID/provisioning/notarization. Release credentials недоступны, поэтому собран только явно непригодный для распространения development artifact.
-- Core state machine подписанных обновлений с bounded HTTPS/staging contracts, explicit consent, rollback floors и restart/health recovery. Конкретных network, protected persistence, installer и product-UI adapters пока нет.
+- Не активирующий обновления slice в агенте и Settings macOS: если endpoint и публичный ключ Ed25519 явно встроены при компиляции, агент использует нативный платформенный TLS без redirects и decompression, проверяет ограниченный подписанный манифест и артефакт того же origin, фиксирует согласие для точного UUID предложения и возобновляет загрузку с проверкой digest в приватный capability-rooted staging с межпроцессной арендой, квотами, retention и синхронизацией файлов/каталогов. По умолчанию он не настроен; нет production endpoint, приватного signing key, защищённого Keychain-журнала обновлений, durable rollback floor, installer, activation, restart/rollback supervisor и интеграции Windows staging/UI.
 
 ### Чего не хватает до рабочей сборки
 
 - Реальная интерактивная Mac ↔ Windows проверка input, relative edge crossing, DPI, lifecycle, clipboard, DPAPI, named-pipe/WinUI flow и recovery; также отсутствует Windows ARM64 evidence.
-- Реальная проверка peer file transfer, выбираемые пользователем receive destinations, подробный progress/cancel history, durable peer/outbound ownership между перезапусками агента, hot-plug layout editor, onboarding, diagnostics и updater installation.
+- Реальная проверка peer file transfer, выбираемые пользователем receive destinations, подробный progress/cancel history, durable peer/outbound ownership между перезапусками агента, hot-plug layout editor, onboarding, diagnostics и updater installation/activation/restart/rollback supervision, включая Windows updater staging и UI.
 - Signed/provisioned запуск macOS, подтверждающий стабильность Keychain/TCC, а также Developer ID/notarization и Authenticode/MSIX/MSI credentials с clean install/upgrade/uninstall matrices.
 - Полные security, fuzz, stress, compatibility, accessibility, long-running beta, external-review, SBOM/provenance и real-hardware gates версии 1.0.
 

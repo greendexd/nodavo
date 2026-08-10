@@ -1,5 +1,32 @@
 import SwiftUI
 
+struct UpdatePollingOwner {
+    private(set) var generation: UInt64 = 0
+    private(set) var isActive = false
+
+    mutating func begin(for phase: UpdatePhase) -> UInt64? {
+        guard phase.requiresAutomaticPolling, !isActive else { return nil }
+        generation &+= 1
+        isActive = true
+        return generation
+    }
+
+    func owns(_ candidate: UInt64) -> Bool {
+        isActive && candidate == generation
+    }
+
+    mutating func finish(_ candidate: UInt64) -> Bool {
+        guard owns(candidate) else { return false }
+        isActive = false
+        return true
+    }
+
+    mutating func stop() {
+        generation &+= 1
+        isActive = false
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum ConnectionState {
@@ -42,6 +69,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var queuedTransferReference: QueuedTransferReference?
     @Published private(set) var transferErrorKey: String?
     @Published private(set) var agentRegistrationStatus: BundledAgentRegistrationStatus
+    @Published private(set) var updateStatus = UpdateStatusSnapshot.idle
+    @Published private(set) var updateOperationInProgress = false
+    @Published private(set) var updateClientErrorKey: String?
 
     private let statusClient = AgentClient()
     private let safetyClient = AgentClient()
@@ -49,6 +79,13 @@ final class AppModel: ObservableObject {
     private let focusClient = AgentClient()
     private let trustedDevicesClient = AgentClient()
     private let transferClient = AgentClient()
+    private let updateClient = AgentClient()
+    private let updatePollingClient = AgentClient()
+    private var updateRequestGeneration: UInt64 = 0
+    private var updatePollingOwner = UpdatePollingOwner()
+    private var updatePollingTask: Task<Void, Never>?
+    private static let updatePollingInterval = Duration.milliseconds(750)
+    private static let maximumUpdatePollAttempts = 14_400
 
     init() {
         agentRegistrationStatus = BundledAgentRegistration.ensureRegistered()
@@ -131,6 +168,86 @@ final class AppModel: ObservableObject {
         case "controlled_by_peer": "focus_controlled_by_peer"
         default: "focus_local"
         }
+    }
+
+    var updateStatusText: LocalizedStringKey {
+        switch updateStatus.phase {
+        case .idle: "update_status_idle"
+        case .checking: "update_status_checking"
+        case .upToDate: "update_status_up_to_date"
+        case .offerAvailable: "update_status_offer_available"
+        case .consentRecorded: "update_status_consent_recorded"
+        case .downloading: "update_status_downloading"
+        case .downloadPaused: "update_status_download_paused"
+        case .verifiedStaged: "update_status_verified_staged"
+        case .declined: "update_status_declined"
+        case .unavailable: "update_status_unavailable"
+        case .failed: "update_status_failed"
+        }
+    }
+
+    var updateStatusSymbol: String {
+        switch updateStatus.phase {
+        case .idle: "arrow.triangle.2.circlepath"
+        case .checking, .consentRecorded, .downloading: "hourglass"
+        case .upToDate: "checkmark.circle.fill"
+        case .offerAvailable: "arrow.down.circle"
+        case .downloadPaused: "pause.circle"
+        case .verifiedStaged: "checkmark.shield.fill"
+        case .declined: "xmark.circle"
+        case .unavailable: "minus.circle"
+        case .failed: "exclamationmark.triangle.fill"
+        }
+    }
+
+    var updateStatusColor: Color {
+        switch updateStatus.phase {
+        case .upToDate, .verifiedStaged: .green
+        case .unavailable, .downloadPaused: .orange
+        case .failed: .red
+        default: .secondary
+        }
+    }
+
+    var updateFailureText: LocalizedStringKey? {
+        if let updateClientErrorKey {
+            return LocalizedStringKey(updateClientErrorKey)
+        }
+        guard let failure = updateStatus.failure else { return nil }
+        let key = switch failure {
+        case .notConfigured: "update_failure_not_configured"
+        case .busy: "update_failure_busy"
+        case .manifestRejected: "update_failure_manifest_rejected"
+        case .network: "update_failure_network"
+        case .staging: "update_failure_staging"
+        case .verification: "update_failure_verification"
+        case .internal: "update_failure_internal"
+        }
+        return LocalizedStringKey(key)
+    }
+
+    var updateCanCheck: Bool {
+        guard !updateOperationInProgress else { return false }
+        return switch updateStatus.phase {
+        case .consentRecorded, .downloading, .downloadPaused:
+            false
+        default:
+            true
+        }
+    }
+
+    var updateCanDecide: Bool {
+        !updateOperationInProgress
+            && updateStatus.phase.acceptsPositiveDecision
+            && updateStatus.offerID != nil
+            && updateStatus.version != nil
+    }
+
+    var updateCanDecline: Bool {
+        !updateOperationInProgress
+            && updateStatus.phase.acceptsDecline
+            && updateStatus.offerID != nil
+            && updateStatus.version != nil
     }
 
     func refresh() {
@@ -361,6 +478,59 @@ final class AppModel: ObservableObject {
         transferErrorKey = nil
     }
 
+    func refreshUpdateStatus() {
+        guard let generation = beginUpdateRequest() else { return }
+        Task {
+            do {
+                let status = try await updateClient.updateStatus()
+                finishUpdateRequest(status, generation: generation)
+            } catch {
+                failUpdateRequest(error, generation: generation)
+            }
+        }
+    }
+
+    func checkForUpdate() {
+        guard updateCanCheck, let generation = beginUpdateRequest() else { return }
+        updateStatus = UpdateStatusSnapshot(
+            phase: .checking,
+            offerID: nil,
+            version: nil,
+            receivedBytes: nil,
+            totalBytes: nil,
+            failure: nil
+        )
+        Task {
+            do {
+                let status = try await updateClient.checkForUpdate()
+                finishUpdateRequest(status, generation: generation)
+            } catch {
+                failUpdateRequest(error, generation: generation)
+            }
+        }
+    }
+
+    func decideUpdate(accepted: Bool) {
+        guard (accepted ? updateCanDecide : updateCanDecline),
+              let offerID = updateStatus.offerID,
+              let generation = beginUpdateRequest()
+        else { return }
+        Task {
+            do {
+                let status = try await updateClient.decideUpdate(
+                    offerID: offerID,
+                    accepted: accepted
+                )
+                guard status.offerID == nil || status.offerID == offerID else {
+                    throw AgentClientError.invalidResponse
+                }
+                finishUpdateRequest(status, generation: generation)
+            } catch {
+                failUpdateRequest(error, generation: generation)
+            }
+        }
+    }
+
     private func beginPairing(endpoint: String, capabilities: [PairingCapability]) {
         guard !endpoint.isEmpty, !pairingIsBusy else {
             pairingState = .failed
@@ -389,5 +559,142 @@ final class AppModel: ObservableObject {
         inputOwner = response.inputOwner
         focusState = response.focusState
         connectionState = response.connectedPeer == nil ? .ready : .connected
+    }
+
+    private func beginUpdateRequest() -> UInt64? {
+        guard !updateOperationInProgress else { return nil }
+        stopUpdatePolling()
+        updateRequestGeneration &+= 1
+        updateOperationInProgress = true
+        updateClientErrorKey = nil
+        return updateRequestGeneration
+    }
+
+    private func finishUpdateRequest(_ status: UpdateStatusSnapshot, generation: UInt64) {
+        guard generation == updateRequestGeneration else { return }
+        updateStatus = status
+        updateOperationInProgress = false
+        reconcileUpdatePolling()
+    }
+
+    private func failUpdateRequest(_ error: Error, generation: UInt64) {
+        guard generation == updateRequestGeneration else { return }
+        updateOperationInProgress = false
+        updateStatus = UpdateStatusSnapshot(
+            phase: .failed,
+            offerID: nil,
+            version: nil,
+            receivedBytes: nil,
+            totalBytes: nil,
+            failure: nil
+        )
+        if let clientError = error as? AgentClientError,
+           case .agentUnavailable = clientError {
+            updateStatus = UpdateStatusSnapshot(
+                phase: .unavailable,
+                offerID: nil,
+                version: nil,
+                receivedBytes: nil,
+                totalBytes: nil,
+                failure: nil
+            )
+            updateClientErrorKey = "update_agent_unavailable"
+        } else {
+            updateClientErrorKey = "update_request_failed"
+        }
+    }
+
+    private func reconcileUpdatePolling() {
+        guard updateStatus.phase.requiresAutomaticPolling,
+              let expectedOfferID = updateStatus.offerID,
+              let generation = updatePollingOwner.begin(for: updateStatus.phase)
+        else {
+            if !updateStatus.phase.requiresAutomaticPolling {
+                stopUpdatePolling()
+            }
+            return
+        }
+
+        updatePollingTask = Task { [weak self] in
+            await self?.runUpdatePolling(
+                generation: generation,
+                expectedOfferID: expectedOfferID
+            )
+        }
+    }
+
+    private func runUpdatePolling(
+        generation: UInt64,
+        expectedOfferID: String
+    ) async {
+        for _ in 0 ..< Self.maximumUpdatePollAttempts {
+            do {
+                try await Task.sleep(for: Self.updatePollingInterval)
+            } catch {
+                finishUpdatePolling(generation)
+                return
+            }
+
+            let status: UpdateStatusSnapshot
+            do {
+                status = try await updatePollingClient.updateStatus()
+            } catch {
+                failUpdatePolling(error, generation: generation)
+                return
+            }
+
+            guard updatePollingOwner.owns(generation) else { return }
+            if let offerID = status.offerID, offerID != expectedOfferID {
+                failUpdatePolling(AgentClientError.invalidResponse, generation: generation)
+                return
+            }
+
+            updateStatus = status
+            updateClientErrorKey = nil
+            guard status.phase.requiresAutomaticPolling else {
+                finishUpdatePolling(generation)
+                return
+            }
+        }
+
+        finishUpdatePolling(generation)
+    }
+
+    private func failUpdatePolling(_ error: Error, generation: UInt64) {
+        guard updatePollingOwner.owns(generation) else { return }
+        finishUpdatePolling(generation)
+        updateStatus = UpdateStatusSnapshot(
+            phase: .failed,
+            offerID: nil,
+            version: nil,
+            receivedBytes: nil,
+            totalBytes: nil,
+            failure: nil
+        )
+        if let clientError = error as? AgentClientError,
+           case .agentUnavailable = clientError {
+            updateStatus = UpdateStatusSnapshot(
+                phase: .unavailable,
+                offerID: nil,
+                version: nil,
+                receivedBytes: nil,
+                totalBytes: nil,
+                failure: nil
+            )
+            updateClientErrorKey = "update_agent_unavailable"
+        } else {
+            updateClientErrorKey = "update_request_failed"
+        }
+    }
+
+    private func finishUpdatePolling(_ generation: UInt64) {
+        guard updatePollingOwner.finish(generation) else { return }
+        updatePollingTask = nil
+    }
+
+    private func stopUpdatePolling() {
+        updatePollingOwner.stop()
+        updatePollingTask?.cancel()
+        updatePollingTask = nil
     }
 }

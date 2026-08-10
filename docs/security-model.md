@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 9 -->
+<!-- doc-id: security-model; lang: en; revision: 10 -->
 
 # Security model
 
@@ -104,17 +104,22 @@ The running agent associates inbound transfer identifiers only after an authenti
 - UI requests are capability checked; the UI does not directly read private network keys.
 - Trusted-device listing is bounded to 32 public summaries containing only the local peer identifier, bounded display name, active/revoked state, and locally issued grants. It excludes certificates, endpoints, private material, and the peer's independently issued grants.
 
-The current pre-alpha Unix socket authenticates only the owning user credential, and the Windows pipe authenticates the same SID/session. That blocks cross-user and remote clients but does not yet distinguish the signed Nodavo UI from another process already running as the same user. Signed-client or launch-bound authentication is therefore a stable-release gate; sensitive local requests remain narrowly bounded and release storage must not expose network private keys to the UI.
+The current pre-alpha Unix socket authenticates only the owning user credential, and the Windows pipe authenticates the same SID/session. That blocks cross-user and remote clients but does not yet distinguish the signed Nodavo UI from another process already running as the same user. This also applies to update-check and exact-offer consent commands that mutate updater state. Signed-client or launch-bound authentication is therefore a stable-release gate; sensitive local requests remain narrowly bounded and release storage must not expose network private keys to the UI.
 
 ## Updates and supply chain
 
-The pre-alpha update crate verifies bounded signed manifests and exposes effect-isolated contracts for HTTPS response policy, resumable content-addressed staging, streaming size/digest verification, explicit user consent, monotonic rollback persistence, and restart/health/rollback recovery. It never downloads or executes content by itself. Concrete network adapters, OS-protected update-state persistence, signed platform installers, restart orchestration, and product UI are not integrated and remain release gates.
+The agent now integrates a deliberately non-activating Unix/macOS slice around the pre-alpha update crate. Builds are unconfigured unless a manifest HTTPS endpoint and Ed25519 public key are explicitly embedded at compile time. When configured, the client uses the native platform TLS verifier/root store, disables redirects, ambient proxy discovery, cookies, credentials, and decompression, and applies bounded status, length, range, timeout, and body rules. The signed manifest must match the build's channel, target, and install identity, and its artifact must share the manifest origin. Consent is bound to the exact canonical offer UUID.
+
+Accepted artifacts are resumed into a private capability-rooted content-addressed staging area, under a cross-process exclusive lease and bounded quota/retention policy. Writes are streamed through exact offset, size, and digest checks; files and supported directory mutations are synchronized before verified staging is reported. Staged content is not opened, executed, installed, or activated. The bilingual macOS Settings UI can manually check or refresh, poll bounded progress on a separate client, report an up-to-date result, accept or decline an exact offer, and resume a paused download without displaying the endpoint, filesystem path, or digest. Windows has no corresponding updater staging or UI integration.
+
+This repository supplies no production endpoint, release private signing key, or evidence of a live production update check. It also has no protected production Keychain update journal or durable rollback floor. The state-machine contracts for restart, health checking, and rollback remain unconnected because there is no installer, activation step, restart handoff, health supervisor, or rollback supervisor. These are release gates rather than properties of the current staged artifact flow.
 
 The following are mandatory release requirements:
 
 - Release artifacts will be code signed; macOS will be notarized and Windows will use Authenticode.
 - Update manifests will be signed with an offline-controlled release key.
 - Update state will reject rollback below the recorded safe version unless the user performs a documented recovery action.
+- Update-mutating local IPC will authenticate an authorized signed/provisioned Nodavo UI, not merely another process running as the same user.
 - Releases will publish checksums, SBOM, provenance, dependency lockfiles, and source commit.
 - Dependency policy, audits, CodeQL, fuzzing, and secret scanning will run continuously before a supported release exists.
 
