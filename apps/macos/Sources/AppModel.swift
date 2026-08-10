@@ -20,18 +20,35 @@ final class AppModel: ObservableObject {
         case failed
     }
 
+    enum TrustedPeersState {
+        case idle
+        case loading
+        case ready
+        case unavailable
+        case failed
+    }
+
     @Published private(set) var connectionState: ConnectionState = .checking
     @Published private(set) var connectedPeer: String?
     @Published private(set) var inputOwner = "local"
     @Published private(set) var focusState = "local"
     @Published private(set) var pairingState: PairingState = .idle
     @Published private(set) var pairingPrompt: PairingPrompt?
+    @Published private(set) var trustedPeersState: TrustedPeersState = .idle
+    @Published private(set) var trustedPeers = [TrustedPeerSummary]()
+    @Published private(set) var deviceOperationPeerIDs = Set<String>()
+    @Published private(set) var devicesErrorKey: String?
+    @Published private(set) var transferIsBusy = false
+    @Published private(set) var queuedTransferReference: QueuedTransferReference?
+    @Published private(set) var transferErrorKey: String?
     @Published private(set) var agentRegistrationStatus: BundledAgentRegistrationStatus
 
     private let statusClient = AgentClient()
     private let safetyClient = AgentClient()
     private let pairingClient = AgentClient()
     private let focusClient = AgentClient()
+    private let trustedDevicesClient = AgentClient()
+    private let transferClient = AgentClient()
 
     init() {
         agentRegistrationStatus = BundledAgentRegistration.ensureRegistered()
@@ -84,6 +101,10 @@ final class AppModel: ObservableObject {
 
     var pairingIsBusy: Bool {
         pairingState == .waiting || pairingState == .confirming
+    }
+
+    var trustedPeersIsLoading: Bool {
+        trustedPeersState == .loading
     }
 
     var agentRegistrationStatusText: LocalizedStringKey {
@@ -208,6 +229,9 @@ final class AppModel: ObservableObject {
                 pairingPrompt = nil
                 pairingState = paired ? .paired : .declined
                 refresh()
+                if paired {
+                    refreshTrustedPeers()
+                }
             } catch AgentClientError.agentUnavailable {
                 pairingPrompt = nil
                 pairingState = .failed
@@ -223,6 +247,118 @@ final class AppModel: ObservableObject {
         guard !pairingIsBusy else { return }
         pairingPrompt = nil
         pairingState = .idle
+    }
+
+    func refreshTrustedPeers() {
+        guard trustedPeersState != .loading else { return }
+        trustedPeersState = .loading
+        devicesErrorKey = nil
+        Task {
+            do {
+                trustedPeers = try await trustedDevicesClient.listTrustedPeers()
+                trustedPeersState = .ready
+            } catch AgentClientError.agentUnavailable {
+                trustedPeersState = .unavailable
+                devicesErrorKey = "trusted_devices_agent_unavailable"
+                connectionState = .unavailable
+            } catch {
+                trustedPeersState = .failed
+                devicesErrorKey = "trusted_devices_load_failed"
+            }
+        }
+    }
+
+    func setCapability(
+        peerID: String,
+        capability: PairingCapability,
+        enabled: Bool
+    ) {
+        guard let peer = trustedPeers.first(where: { $0.peerID == peerID }),
+              peer.state == .active,
+              peer.localGrants.contains(capability) != enabled,
+              !deviceOperationPeerIDs.contains(peerID)
+        else { return }
+
+        deviceOperationPeerIDs.insert(peerID)
+        devicesErrorKey = nil
+        Task {
+            defer { deviceOperationPeerIDs.remove(peerID) }
+            do {
+                try await trustedDevicesClient.setCapability(
+                    peerID: peerID,
+                    capability: capability,
+                    enabled: enabled
+                )
+                guard let index = trustedPeers.firstIndex(where: { $0.peerID == peerID }),
+                      trustedPeers[index].state == .active
+                else { return }
+                if enabled {
+                    trustedPeers[index].localGrants.insert(capability)
+                } else {
+                    trustedPeers[index].localGrants.remove(capability)
+                }
+            } catch AgentClientError.agentUnavailable {
+                devicesErrorKey = "trusted_devices_agent_unavailable"
+                connectionState = .unavailable
+            } catch {
+                devicesErrorKey = "trusted_devices_capability_failed"
+            }
+        }
+    }
+
+    func revokePeer(peerID: String) {
+        guard let peer = trustedPeers.first(where: { $0.peerID == peerID }),
+              peer.state == .active,
+              !deviceOperationPeerIDs.contains(peerID)
+        else { return }
+
+        deviceOperationPeerIDs.insert(peerID)
+        devicesErrorKey = nil
+        Task {
+            defer { deviceOperationPeerIDs.remove(peerID) }
+            do {
+                let response = try await trustedDevicesClient.revokePeer(peerID: peerID)
+                if let index = trustedPeers.firstIndex(where: { $0.peerID == peerID }) {
+                    trustedPeers[index].state = .revoked
+                }
+                applyStatus(response)
+            } catch AgentClientError.agentUnavailable {
+                devicesErrorKey = "trusted_devices_agent_unavailable"
+                connectionState = .unavailable
+            } catch {
+                devicesErrorKey = "trusted_devices_revoke_failed"
+            }
+        }
+    }
+
+    func sendFiles(paths: [String]) {
+        guard !transferIsBusy else { return }
+        transferIsBusy = true
+        transferErrorKey = nil
+        queuedTransferReference = nil
+        Task {
+            defer { transferIsBusy = false }
+            do {
+                queuedTransferReference = try await transferClient.sendFiles(paths: paths)
+            } catch AgentClientError.unsafeValue {
+                transferErrorKey = "transfer_selection_invalid"
+            } catch AgentClientError.agentUnavailable {
+                transferErrorKey = "transfer_agent_unavailable"
+                connectionState = .unavailable
+            } catch {
+                transferErrorKey = "transfer_queue_failed"
+            }
+        }
+    }
+
+    func rejectOversizedTransferSelection() {
+        queuedTransferReference = nil
+        transferErrorKey = "transfer_selection_too_many"
+    }
+
+    func clearTransferFeedback() {
+        queuedTransferReference = nil
+        transferErrorKey = nil
     }
 
     private func beginPairing(endpoint: String, capabilities: [PairingCapability]) {
@@ -246,5 +382,12 @@ final class AppModel: ObservableObject {
                 pairingState = .failed
             }
         }
+    }
+
+    private func applyStatus(_ response: AgentStatusResponse) {
+        connectedPeer = response.connectedPeer
+        inputOwner = response.inputOwner
+        focusState = response.focusState
+        connectionState = response.connectedPeer == nil ? .ready : .connected
     }
 }

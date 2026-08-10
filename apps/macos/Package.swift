@@ -15,6 +15,12 @@ let package = Package(
             path: "Sources",
             resources: [.process("Resources")],
             swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "NodavoMacTests",
+            dependencies: ["NodavoMac"],
+            path: "Tests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
         )
     ]
 )

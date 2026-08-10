@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 private enum ProductSection: String, CaseIterable, Identifiable {
@@ -48,11 +49,7 @@ struct MainWindow: View {
                     message: "layout_in_progress"
                 )
             case .transfers:
-                PlaceholderSection(
-                    title: "section_transfers",
-                    symbol: "arrow.left.arrow.right",
-                    message: "transfers_in_progress"
-                )
+                TransfersView(model: model)
             case .settings:
                 SettingsView(model: model)
             }
@@ -67,6 +64,7 @@ private struct DevicesView: View {
     @State private var allowClipboardRead = false
     @State private var allowClipboardWrite = false
     @State private var allowFiles = false
+    @State private var peerPendingRevocation: TrustedPeerSummary?
 
     var body: some View {
         Form {
@@ -146,9 +144,48 @@ private struct DevicesView: View {
                 }
             }
 
-            Section("trusted_devices") {
-                Text("trusted_devices_in_progress")
-                    .foregroundStyle(.secondary)
+            Section {
+                if model.trustedPeersIsLoading && model.trustedPeers.isEmpty {
+                    ProgressView("trusted_devices_loading")
+                } else if model.trustedPeers.isEmpty {
+                    Text("trusted_devices_empty")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(model.trustedPeers) { peer in
+                        TrustedPeerView(
+                            peer: peer,
+                            isBusy: model.deviceOperationPeerIDs.contains(peer.peerID),
+                            setCapability: { capability, enabled in
+                                model.setCapability(
+                                    peerID: peer.peerID,
+                                    capability: capability,
+                                    enabled: enabled
+                                )
+                            },
+                            requestRevocation: {
+                                peerPendingRevocation = peer
+                            }
+                        )
+                    }
+                }
+
+                if let errorKey = model.devicesErrorKey {
+                    Label(LocalizedStringKey(errorKey), systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                HStack {
+                    Text("trusted_devices")
+                    Spacer()
+                    if model.trustedPeersIsLoading && !model.trustedPeers.isEmpty {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button("trusted_devices_refresh") {
+                        model.refreshTrustedPeers()
+                    }
+                    .disabled(model.trustedPeersIsLoading)
+                }
             }
 
             Section {
@@ -158,6 +195,32 @@ private struct DevicesView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("section_devices")
+        .onAppear {
+            if model.trustedPeersState == .idle {
+                model.refreshTrustedPeers()
+            }
+        }
+        .alert(
+            "trusted_device_revoke_title",
+            isPresented: Binding(
+                get: { peerPendingRevocation != nil },
+                set: { if !$0 { peerPendingRevocation = nil } }
+            ),
+            presenting: peerPendingRevocation
+        ) { peer in
+            Button("trusted_device_revoke_confirm", role: .destructive) {
+                model.revokePeer(peerID: peer.peerID)
+                peerPendingRevocation = nil
+            }
+            Button("cancel", role: .cancel) {
+                peerPendingRevocation = nil
+            }
+        } message: { peer in
+            Text(String.localizedStringWithFormat(
+                String(localized: "trusted_device_revoke_message"),
+                peer.displayName
+            ))
+        }
     }
 
     private var pairingSymbol: String {
@@ -178,6 +241,178 @@ private struct DevicesView: View {
         if allowClipboardWrite { capabilities.append(.clipboardWrite) }
         if allowFiles { capabilities.append(.files) }
         return capabilities
+    }
+}
+
+private struct TrustedPeerView: View {
+    let peer: TrustedPeerSummary
+    let isBusy: Bool
+    let setCapability: (PairingCapability, Bool) -> Void
+    let requestRevocation: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(peer.displayName)
+                        .font(.headline)
+                        .lineLimit(1)
+                    Text(peer.redactedID)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel(Text("trusted_device_redacted_id"))
+                }
+                Spacer()
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(Text("trusted_device_saving"))
+                }
+                Label(peer.state.localizedKey, systemImage: peer.state.symbol)
+                    .foregroundStyle(peer.state == .active ? .green : .secondary)
+            }
+
+            Text("trusted_device_local_grants")
+                .font(.subheadline.weight(.semibold))
+
+            ForEach(PairingCapability.allCases) { capability in
+                Toggle(
+                    capability.localizedKey,
+                    isOn: Binding(
+                        get: { peer.localGrants.contains(capability) },
+                        set: { setCapability(capability, $0) }
+                    )
+                )
+                .disabled(peer.state == .revoked || isBusy)
+            }
+
+            Button("trusted_device_revoke", role: .destructive, action: requestRevocation)
+                .disabled(peer.state == .revoked || isBusy)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+private extension PairingCapability {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .input: "trusted_grant_input"
+        case .clipboardRead: "trusted_grant_clipboard_read"
+        case .clipboardWrite: "trusted_grant_clipboard_write"
+        case .files: "trusted_grant_files"
+        }
+    }
+}
+
+private extension TrustedPeerState {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .active: "trusted_device_active"
+        case .revoked: "trusted_device_revoked"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .active: "checkmark.shield.fill"
+        case .revoked: "xmark.shield"
+        }
+    }
+}
+
+private struct TransfersView: View {
+    @ObservedObject var model: AppModel
+    @State private var selectedPaths = [String]()
+
+    var body: some View {
+        Form {
+            Section("transfer_selection") {
+                Text("transfer_selection_help")
+                    .foregroundStyle(.secondary)
+
+                Button("transfer_choose") {
+                    chooseFilesAndFolders()
+                }
+                .disabled(model.transferIsBusy)
+
+                if !selectedPaths.isEmpty {
+                    LabeledContent(
+                        "transfer_selected",
+                        value: String.localizedStringWithFormat(
+                            String(localized: "transfer_selection_count"),
+                            selectedPaths.count,
+                            AgentClient.maximumSelectedPaths
+                        )
+                    )
+                }
+
+                Button("transfer_send_selected") {
+                    model.sendFiles(paths: selectedPaths)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    selectedPaths.isEmpty
+                        || model.transferIsBusy
+                        || model.connectedPeer == nil
+                )
+
+                if model.connectedPeer == nil {
+                    Label("transfer_requires_connection", systemImage: "link.badge.plus")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Section("transfer_queue_status") {
+                if model.transferIsBusy {
+                    ProgressView("transfer_queueing")
+                } else if let reference = model.queuedTransferReference {
+                    Label("transfer_queued", systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    LabeledContent("transfer_queued_id", value: reference.redactedID)
+                } else {
+                    Text("transfer_not_queued")
+                        .foregroundStyle(.secondary)
+                }
+
+                if let errorKey = model.transferErrorKey {
+                    Label(LocalizedStringKey(errorKey), systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Section {
+                Label("transfer_prealpha_notice", systemImage: "hammer")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("safety") {
+                Button("emergency_stop", role: .destructive) { model.emergencyStop() }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("section_transfers")
+        .onAppear { model.refresh() }
+    }
+
+    private func chooseFilesAndFolders() {
+        let panel = NSOpenPanel()
+        panel.title = String(localized: "transfer_picker_title")
+        panel.message = String(localized: "transfer_picker_message")
+        panel.prompt = String(localized: "transfer_picker_confirm")
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.canCreateDirectories = false
+
+        guard panel.runModal() == .OK else { return }
+        let paths = panel.urls.map { $0.standardizedFileURL.path }
+        guard paths.count <= AgentClient.maximumSelectedPaths else {
+            selectedPaths.removeAll()
+            model.rejectOversizedTransferSelection()
+            return
+        }
+        selectedPaths = paths
+        model.clearTransferFeedback()
     }
 }
 

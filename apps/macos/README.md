@@ -1,17 +1,17 @@
-<!-- doc-id: macos-app; lang: en; revision: 5 -->
+<!-- doc-id: macos-app; lang: en; revision: 6 -->
 
 # Nodavo for macOS
 
 [English](README.md) · [Русский](README.ru.md)
 
-The current SwiftUI menu-bar shell connects to the per-user Rust agent through its private Unix socket. It displays bounded status/focus metadata, exposes local emergency stop and manual focus controls, and implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation. Pairing, pinned reconnect, the authenticated input session, and the macOS native capture/injection bridge run in pre-alpha. Edge switching, cross-device display mapping, trusted-device management, post-pair permission changes, and transfers remain under implementation.
+The current SwiftUI menu-bar shell connects to the per-user Rust agent through its private Unix socket. It displays bounded status/focus and trusted-device summaries, exposes local emergency stop and manual focus controls, implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation, and supports transactional post-pair grant changes plus confirmed trust revocation. The Transfers page queues up to 32 files or folders chosen explicitly with the macOS open panel and displays only a redacted queue reference. Pairing, pinned reconnect, the authenticated input session, native macOS capture/injection, and the bounded file-transfer queue run in pre-alpha. Edge switching, cross-device display mapping, detailed transfer progress in local IPC, and broad cross-platform validation remain under implementation.
 
 ```bash
 cargo run -p nodavo-agent
 swift run --package-path apps/macos Nodavo
 ```
 
-All pairing permissions default to off. The selected permissions are bound to the confirmed pairing transcript and signed device trust.
+All pairing permissions default to off. The selected permissions are bound to the confirmed pairing transcript and signed device trust. Post-pair switches update only after the agent acknowledges the exact change; revoked devices cannot be edited and must be paired again. The UI never sends inferred filesystem paths: only absolute paths returned by an explicit local picker selection are accepted.
 
 ## Packaging
 
