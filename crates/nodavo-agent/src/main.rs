@@ -11,6 +11,7 @@ mod session_runtime;
 mod storage;
 mod topology_runtime;
 mod transfer_runtime;
+mod transfer_status;
 mod transfer_worker;
 mod update;
 #[cfg(target_os = "windows")]
@@ -439,6 +440,13 @@ async fn dispatch_ui_command(command: UiCommand, runtime: Arc<AgentRuntime>) -> 
             },
             Err(error) => agent_error_event(&error),
         },
+        UiCommand::ListTransfers {} => transfer_listing_event(runtime.transfer_listing()),
+        UiCommand::CancelTransfer { transfer_id } => {
+            match runtime.cancel_transfer(&transfer_id).await {
+                Ok(listing) => transfer_listing_event(listing),
+                Err(error) => agent_error_event(&error),
+            }
+        }
         UiCommand::RequestRemoteFocus { ttl_ms } => {
             match runtime.request_remote_focus(ttl_ms).await {
                 Ok(status) => AgentEvent::Status(status),
@@ -572,10 +580,21 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::FocusRejected => "focus_rejected",
         AgentError::SafetyRecoveryFailed => "safety_recovery_failed",
         AgentError::TransferFailed => "transfer_failed",
+        AgentError::TransferNotFound => "transfer_not_found",
+        AgentError::TransferNotCancellable => "transfer_not_cancellable",
     };
     AgentEvent::Error {
         code: code.to_owned(),
         message: error.to_string(),
+    }
+}
+
+fn transfer_listing_event(listing: crate::transfer_status::TransferListing) -> AgentEvent {
+    AgentEvent::Transfers {
+        instance_id: listing.instance_id,
+        revision: listing.revision,
+        truncated: listing.truncated,
+        transfers: listing.transfers,
     }
 }
 

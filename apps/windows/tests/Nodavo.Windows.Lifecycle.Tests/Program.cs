@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Nodavo.Windows.Models;
 using Nodavo.Windows.Services;
+using Nodavo.Windows.ViewModels;
 
 await LifecycleTests.RunAllAsync();
 
@@ -16,6 +17,12 @@ internal static class LifecycleTests
         StatusReadinessDecoderIsStrictAndRedacted();
         ReadinessReducerKeepsSignalsIndependent();
         ClientDeadlinesExceedServerBudgetsAndRemainDistinct();
+        TransferSnapshotDecoderAcceptsOnlyExactBoundedWireData();
+        TransferSnapshotDecoderRejectsPrivateAndMalformedDataGenerically();
+        TransferReducerGuardsInstanceRevisionGenerationAndCancelOwnership();
+        TransferAdmissionReconciliationIsBoundedAndNeverResends();
+        TransferPollLifecycleQueuesRefreshAcrossReload();
+        TransferUiHasPollingProgressPrivacyAndAccessibilityAuthority();
         OverviewXamlHasBilingualReadinessResourcesAndNoAccessibilityAction();
         StartupReducerCoversEveryState();
         LaunchReducerIsFailClosed();
@@ -190,6 +197,493 @@ internal static class LifecycleTests
                 russian.Any(name => name.StartsWith(resourcePrefix, StringComparison.Ordinal)),
                 $"missing Russian XAML resource: {resourcePrefix}");
         }
+    }
+
+    private static void TransferSnapshotDecoderAcceptsOnlyExactBoundedWireData()
+    {
+        const string instanceId = "11111111-1111-1111-1111-111111111111";
+        const string transferId = "22222222-2222-2222-2222-222222222222";
+        TransferListSnapshot preparing = DecodeTransfers(
+            TransferEnvelope(
+                instanceId,
+                1,
+                false,
+                TransferRow(transferId, "outbound", "preparing", "null", "null", true, "null")));
+        Assert(preparing.InstanceId == instanceId && preparing.Revision == 1,
+            "transfer instance and revision must decode exactly");
+        Assert(preparing.Transfers.Count == 1 &&
+            preparing.Transfers[0].RedactedTransferId == "••••••••-22222222" &&
+            !preparing.Transfers[0].RedactedTransferId.Contains(transferId, StringComparison.Ordinal),
+            "the decoder must expose only the required redacted transfer ID");
+
+        TransferListSnapshot zero = DecodeTransfers(
+            TransferEnvelope(
+                instanceId,
+                2,
+                false,
+                TransferRow(transferId, "inbound", "transferring", "0", "0", true, "null")));
+        Assert(zero.Transfers[0].ProcessedBytes == 0 && zero.Transfers[0].TotalBytes == 0 &&
+            !zero.Transfers[0].IsTerminal,
+            "zero-byte nonterminal progress must remain an explicit nonterminal state");
+
+        foreach (string failure in new[]
+        {
+            "admission_failed",
+            "source_unavailable",
+            "authorization_revoked",
+            "transport_failed",
+            "cleanup_failed",
+            "internal",
+        })
+        {
+            TransferListSnapshot failed = DecodeTransfers(
+                TransferEnvelope(
+                    instanceId,
+                    3,
+                    false,
+                    TransferRow(transferId, "inbound", "failed", "null", "null", false,
+                        $"\"{failure}\"")));
+            Assert(failed.Transfers[0].Failure.HasValue,
+                $"bounded failure value must decode: {failure}");
+        }
+
+        TransferListSnapshot completed = DecodeTransfers(
+            TransferEnvelope(
+                instanceId,
+                4,
+                true,
+                TransferRow(transferId, "outbound", "completed", "0", "0", false, "null")));
+        Assert(completed.Truncated && completed.Transfers[0].IsTerminal,
+            "zero-byte completion must remain explicitly terminal and preserve truncation");
+
+        TransferListSnapshot preManifestCancelled = DecodeTransfers(
+            TransferEnvelope(
+                instanceId,
+                5,
+                false,
+                TransferRow(transferId, "outbound", "cancelled", "null", "null", false, "null")));
+        Assert(preManifestCancelled.Transfers[0].IsTerminal &&
+            !preManifestCancelled.Transfers[0].ProcessedBytes.HasValue,
+            "pre-manifest cancellation may carry two null counters");
+
+        TransferListSnapshot manifestedFailure = DecodeTransfers(
+            TransferEnvelope(
+                instanceId,
+                6,
+                false,
+                TransferRow(transferId, "outbound", "failed", "4", "9", false,
+                    "\"internal\"")));
+        Assert(manifestedFailure.Transfers[0].Failure == TransferFailure.Internal &&
+            manifestedFailure.Transfers[0].ProcessedBytes == 4,
+            "manifested terminal failure may preserve bounded byte counters");
+    }
+
+    private static void TransferSnapshotDecoderRejectsPrivateAndMalformedDataGenerically()
+    {
+        const string instanceId = "11111111-1111-1111-1111-111111111111";
+        const string transferId = "22222222-2222-2222-2222-222222222222";
+        string validRow = TransferRow(
+            transferId,
+            "outbound",
+            "transferring",
+            "5",
+            "10",
+            true,
+            "null");
+        var rejected = new List<(string Json, string Detail)>
+        {
+            (TransferEnvelope(instanceId, 0, false, validRow), transferId),
+            (TransferEnvelope(instanceId.ToUpperInvariant(), 1, false, validRow), instanceId),
+            (TransferEnvelope(Guid.Empty.ToString("D"), 1, false, validRow), instanceId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId.ToUpperInvariant(), "outbound", "transferring", "5", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(Guid.Empty.ToString("D"), "outbound", "transferring", "5", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false, validRow + "," + validRow), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                validRow[..^1] + ",\"private_path\":\"C:\\\\private.txt\"}"), "private.txt"),
+            (TransferEnvelope(instanceId, 1, false,
+                validRow.Replace("\"phase\":\"transferring\"", "\"phase\":\"transferring\",\"phase\":\"paused\"")), "paused"),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "sideways", "transferring", "5", "10", true, "null")), "sideways"),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "future_phase", "5", "10", true, "null")), "future_phase"),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "transferring", "null", "null", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "preparing", "null", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "cancel_requested", "5", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "transferring", "11", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "transferring", "0", "10737418241", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "completed", "9", "10", false, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "completed", "10", "10", true, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "transferring", "5", "10", true, "\"transport_failed\"")), "transport_failed"),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "failed", "null", "null", false, "null")), transferId),
+            (TransferEnvelope(instanceId, 1, false,
+                TransferRow(transferId, "outbound", "failed", "null", "null", false, "\"future_failure\"")), "future_failure"),
+            ($"{{\"event\":\"transfers\",\"instance_id\":\"{instanceId}\",\"revision\":1,\"truncated\":false,\"transfers\":[],\"peer_name\":\"private-peer\"}}", "private-peer"),
+            ("{", transferId),
+        };
+
+        string maximumRows = string.Join(",", Enumerable.Range(1, 161).Select(index =>
+            TransferRow(
+                $"00000000-0000-0000-0000-{index:000000000000}",
+                "outbound",
+                "queued",
+                "0",
+                "1",
+                true,
+                "null")));
+        rejected.Add((TransferEnvelope(instanceId, 1, false, maximumRows), transferId));
+
+        foreach ((string json, string detail) in rejected)
+        {
+            AssertTransferRejected(json, detail);
+        }
+    }
+
+    private static void TransferReducerGuardsInstanceRevisionGenerationAndCancelOwnership()
+    {
+        const string firstInstance = "11111111-1111-1111-1111-111111111111";
+        const string secondInstance = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        const string firstTransfer = "22222222-2222-2222-2222-222222222222";
+        const string secondTransfer = "33333333-3333-3333-3333-333333333333";
+        TransfersState state = TransfersViewModel.Start(TransfersState.Empty);
+        long generation = state.Generation;
+        state = TransfersViewModel.ApplySnapshot(
+            state,
+            Snapshot(firstInstance, 5, false,
+                Transfer(firstTransfer, TransferPhase.Transferring, true, 4, 8),
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 1, 8)),
+            generation);
+        Assert(state.Rows.Count == 2 && state.HasPollingWork,
+            "a current transfer snapshot must start bounded polling work");
+
+        TransfersState stale = TransfersViewModel.MarkPollFailure(state, generation);
+        Assert(stale.IsStale && stale.Rows.Count == 2,
+            "poll failure must preserve authoritative rows and mark them stale");
+        TransfersState lower = TransfersViewModel.ApplySnapshot(
+            stale,
+            Snapshot(firstInstance, 4, false),
+            generation);
+        Assert(ReferenceEquals(lower, stale), "lower revisions must be ignored without clearing rows");
+        TransfersState wrongGeneration = TransfersViewModel.ApplySnapshot(
+            stale,
+            Snapshot(firstInstance, 6, false),
+            generation + 1);
+        Assert(ReferenceEquals(wrongGeneration, stale),
+            "late poll generations must not mutate transfer state");
+
+        TransfersState ambiguous = TransfersViewModel.BeginCancel(stale, firstTransfer);
+        ambiguous = TransfersViewModel.MarkCancelOutcomeUnknown(
+            ambiguous,
+            firstTransfer,
+            generation);
+        TransfersState truncatedEqual = TransfersViewModel.ApplySnapshot(
+            ambiguous,
+            Snapshot(firstInstance, 5, true,
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 7, 8)),
+            generation);
+        Assert(!truncatedEqual.IsStale && truncatedEqual.CancelOwnerId == firstTransfer &&
+            truncatedEqual.CancelOutcomeUnknown,
+            "equal fresh truncated revisions clear stale state without inferring an omitted cancel owner");
+        TransfersState exactEqual = TransfersViewModel.ApplySnapshot(
+            ambiguous,
+            Snapshot(firstInstance, 5, false,
+                Transfer(firstTransfer, TransferPhase.Paused, true, 7, 8),
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 7, 8)),
+            generation);
+        Assert(!exactEqual.IsStale && exactEqual.CancelOwnerId == firstTransfer &&
+            exactEqual.CancelOutcomeUnknown &&
+            TransfersViewModel.CanCancel(exactEqual, firstTransfer) &&
+            !TransfersViewModel.CanCancel(exactEqual, secondTransfer) &&
+            ReferenceEquals(exactEqual.Rows, ambiguous.Rows) &&
+            exactEqual.Rows[0].Snapshot.Phase == TransferPhase.Transferring &&
+            exactEqual.Rows[0].Snapshot.ProcessedBytes == 4,
+            "equal revisions must retain row payload and same-ID authority while the owner remains active");
+        TransfersState terminalEqual = TransfersViewModel.ApplySnapshot(
+            ambiguous,
+            Snapshot(firstInstance, 5, false,
+                Transfer(firstTransfer, TransferPhase.CancelRequested, false, 0, 0),
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 7, 8)),
+            generation);
+        Assert(terminalEqual.CancelOwnerId is null && !terminalEqual.CancelOutcomeUnknown &&
+            ReferenceEquals(terminalEqual.Rows, ambiguous.Rows),
+            "equal revisions may reconcile only exact cancel-requested or terminal owner evidence");
+        TransfersState absentEqual = TransfersViewModel.ApplySnapshot(
+            ambiguous,
+            Snapshot(firstInstance, 5, false,
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 7, 8)),
+            generation);
+        Assert(absentEqual.CancelOwnerId is null && !absentEqual.CancelOutcomeUnknown,
+            "an untruncated equal revision may reconcile an owner that is authoritatively absent");
+
+        TransfersState acceptedWithoutPhase = TransfersViewModel.CompleteCancelSnapshot(
+            TransfersViewModel.BeginCancel(state, firstTransfer),
+            Snapshot(firstInstance, 6, false,
+                Transfer(firstTransfer, TransferPhase.Transferring, true, 5, 8),
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 2, 8)),
+            firstTransfer,
+            generation);
+        Assert(acceptedWithoutPhase.CancelOwnerId == firstTransfer &&
+            acceptedWithoutPhase.CancelOutcomeUnknown &&
+            TransfersViewModel.CanCancel(acceptedWithoutPhase, firstTransfer) &&
+            !TransfersViewModel.CanCancel(acceptedWithoutPhase, secondTransfer),
+            "a successful cancel response without phase evidence must keep global ownership on the same ID");
+        TransfersState deterministicallyRejected = TransfersViewModel.RejectCancel(
+            acceptedWithoutPhase,
+            firstTransfer,
+            generation);
+        Assert(deterministicallyRejected.CancelOwnerId is null &&
+            !deterministicallyRejected.CancelOutcomeUnknown,
+            "an explicit deterministic agent rejection may release cancel ownership");
+
+        state = TransfersViewModel.BeginCancel(state, firstTransfer);
+        Assert(state.CancelOwnerId == firstTransfer && state.CancelInFlight &&
+            !TransfersViewModel.CanCancel(state, secondTransfer),
+            "only one transfer row may own a cancellation mutation");
+        state = TransfersViewModel.MarkCancelOutcomeUnknown(state, firstTransfer, generation);
+        Assert(state.CancelOutcomeUnknown && TransfersViewModel.CanCancel(state, firstTransfer) &&
+            !TransfersViewModel.CanCancel(state, secondTransfer),
+            "ambiguous cancellation may retry only the same transfer ID");
+
+        state = TransfersViewModel.ApplySnapshot(
+            state,
+            Snapshot(firstInstance, 6, true,
+                Transfer(secondTransfer, TransferPhase.Transferring, true, 2, 8)),
+            generation);
+        Assert(state.CancelOwnerId == firstTransfer,
+            "truncated snapshots must not infer that an omitted cancel owner disappeared");
+        state = TransfersViewModel.ApplySnapshot(
+            state,
+            Snapshot(firstInstance, 7, false,
+                Transfer(firstTransfer, TransferPhase.Cancelled, false, 4, 8),
+                Transfer(secondTransfer, TransferPhase.Completed, false, 8, 8)),
+            generation);
+        Assert(state.CancelOwnerId is null && !state.HasPollingWork,
+            "terminal phases must reconcile cancellation and stop polling");
+
+        state = TransfersViewModel.ApplySnapshot(
+            state,
+            Snapshot(firstInstance, 8, false),
+            generation);
+        Assert(state.Rows.Count == 2 && state.Rows.All(row => row.Snapshot.IsTerminal),
+            "terminal rows observed in this agent session must remain recent in-memory rows");
+        state = TransfersViewModel.ApplySnapshot(
+            state,
+            Snapshot(secondInstance, 1, false),
+            generation);
+        Assert(state.InstanceId == secondInstance && state.Rows.Count == 0 && state.Revision == 1,
+            "a new agent instance must clear prior in-session rows and accept its lower revision");
+
+        TransfersState stopped = TransfersViewModel.Stop(state);
+        TransfersState late = TransfersViewModel.ApplySnapshot(
+            stopped,
+            Snapshot(secondInstance, 2, false,
+                Transfer(firstTransfer, TransferPhase.Completed, false, 8, 8)),
+            generation);
+        Assert(ReferenceEquals(late, stopped),
+            "unload generation changes must reject late poll results");
+    }
+
+    private static void TransferAdmissionReconciliationIsBoundedAndNeverResends()
+    {
+        TransfersState state = TransfersViewModel.Start(TransfersState.Empty);
+        long generation = state.Generation;
+        state = TransfersViewModel.BeginAdmissionReconciliation(state);
+        Assert(state.AdmissionReconciliationPending &&
+            state.AdmissionReconciliationAttemptsRemaining ==
+                TransfersState.MaximumAdmissionReconciliationAttempts &&
+            state.HasPollingWork,
+            "local admission must create bounded authoritative-list polling even with no rows");
+
+        for (int attempt = 1;
+             attempt < TransfersState.MaximumAdmissionReconciliationAttempts;
+             attempt++)
+        {
+            state = TransfersViewModel.MarkPollFailure(state, generation);
+            Assert(state.HasPollingWork,
+                "a transient or explicit protocol list failure must continue bounded admission polling");
+        }
+        state = TransfersViewModel.MarkPollFailure(state, generation);
+        Assert(state.AdmissionReconciliationPending &&
+            state.AdmissionReconciliationAttemptsRemaining == 0 && !state.HasPollingWork,
+            "automatic admission reconciliation must stop after its exact bounded attempt count");
+
+        state = TransfersViewModel.RestartAdmissionReconciliation(state);
+        Assert(state.AdmissionReconciliationAttemptsRemaining ==
+                TransfersState.MaximumAdmissionReconciliationAttempts && state.HasPollingWork,
+            "explicit Refresh transfers must start another bounded reconciliation window");
+        TransferListSnapshot authoritative = Snapshot(
+            "11111111-1111-1111-1111-111111111111",
+            1,
+            false);
+        Assert(TransfersViewModel.IsAuthoritativeSnapshot(state, authoritative, generation),
+            "the first valid instance snapshot must be authoritative");
+        state = TransfersViewModel.ApplySnapshot(state, authoritative, generation);
+        Assert(!state.AdmissionReconciliationPending &&
+            state.AdmissionReconciliationAttemptsRemaining == 0,
+            "an authoritative list must end pending-admission reconciliation");
+    }
+
+    private static void TransferPollLifecycleQueuesRefreshAcrossReload()
+    {
+        TransferPollSchedule schedule = TransferPollLifecycle.Load(TransferPollSchedule.Empty);
+        Assert(schedule.IsLoaded && schedule.ForcedRefreshPending,
+            "load must owe one authoritative refresh");
+        schedule = TransferPollLifecycle.TryStart(schedule, false, out bool started);
+        Assert(started && schedule.LoopRunning && !schedule.ForcedRefreshPending,
+            "the load refresh must start even without previously known rows");
+
+        schedule = TransferPollLifecycle.RequestForcedRefresh(schedule);
+        schedule = TransferPollLifecycle.TryStart(schedule, false, out bool overlapped);
+        Assert(!overlapped && schedule.LoopRunning && schedule.ForcedRefreshPending,
+            "a forced refresh during a loop must queue without overlapping it");
+        (TransferPollSchedule consumedSchedule, bool consumed) =
+            TransferPollLifecycle.TakeForcedRefresh(schedule);
+        schedule = consumedSchedule;
+        Assert(consumed && schedule.LoopRunning && !schedule.ForcedRefreshPending,
+            "the active sequential loop must consume an owed follow-up refresh");
+
+        schedule = TransferPollLifecycle.RequestForcedRefresh(schedule);
+        schedule = TransferPollLifecycle.Unload(schedule);
+        schedule = TransferPollLifecycle.Load(schedule);
+        schedule = TransferPollLifecycle.TryStart(schedule, false, out bool racedStart);
+        Assert(!racedStart && schedule.LoopRunning && schedule.ForcedRefreshPending,
+            "rapid unload/reload must retain the new load refresh while the old loop winds down");
+        schedule = TransferPollLifecycle.CompleteLoop(schedule);
+        schedule = TransferPollLifecycle.TryStart(schedule, false, out bool restarted);
+        Assert(restarted && schedule.LoopRunning && !schedule.ForcedRefreshPending,
+            "old-loop completion must release and start the queued reload refresh");
+
+        schedule = TransferPollLifecycle.Unload(schedule);
+        schedule = TransferPollLifecycle.RequestForcedRefresh(schedule);
+        Assert(!schedule.ForcedRefreshPending,
+            "refresh requests while unloaded must not create background polling");
+    }
+
+    private static void TransferUiHasPollingProgressPrivacyAndAccessibilityAuthority()
+    {
+        string repository = FindRepositoryRoot();
+        string client = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Services/AgentClient.cs"));
+        string view = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Views/TransfersView.xaml.cs"));
+        string xaml = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Views/TransfersView.xaml"));
+        Match listTimeout = Regex.Match(
+            client,
+            @"TransferListRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Match cancelTimeout = Regex.Match(
+            client,
+            @"TransferCancelRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Assert(listTimeout.Success && cancelTimeout.Success &&
+            listTimeout.Groups[1].Value == "8" && cancelTimeout.Groups[1].Value == "8",
+            "list and cancel must retain dedicated eight-second deadlines");
+        Assert(client.Contains("CommandEnvelope(\"list_transfers\")", StringComparison.Ordinal) &&
+            client.Contains("CancelTransferEnvelope(\"cancel_transfer\", transferId)", StringComparison.Ordinal),
+            "the client must bind the exact list and cancel wire commands");
+        Assert(view.Contains("TimeSpan.FromSeconds(1)", StringComparison.Ordinal) &&
+            view.Contains("SemaphoreSlim _transferRequestGate = new(1, 1)", StringComparison.Ordinal) &&
+            view.Contains("TransfersViewModel.Stop", StringComparison.Ordinal) &&
+            view.Contains("IsCurrentTransferGeneration", StringComparison.Ordinal) &&
+            view.Contains("TransferPollLifecycle.RequestForcedRefresh", StringComparison.Ordinal) &&
+            view.Contains("ObservePollCompletionAsync", StringComparison.Ordinal),
+            "polling must be sequential, approximately one second, unload-cancellable, and generation guarded");
+        Assert(view.Contains("AgentProtocolException", StringComparison.Ordinal) &&
+            view.Contains("TransfersViewModel.MarkPollFailure", StringComparison.Ordinal),
+            "explicit list errors must preserve rows as stale and remain in bounded polling");
+        Assert(view.Contains("BeginAdmissionReconciliation", StringComparison.Ordinal) &&
+            view.Contains("RestartAdmissionReconciliation", StringComparison.Ordinal) &&
+            Regex.Matches(view, @"_client\.SendFilesAsync\(").Count == 1,
+            "admission reconciliation must be bounded status-only work without blind resend paths");
+        Assert(view.Contains("zeroByteNonterminal", StringComparison.Ordinal) &&
+            view.Contains("(!snapshot.TotalBytes.HasValue || zeroByteNonterminal)", StringComparison.Ordinal),
+            "zero-byte nonterminal progress must remain indeterminate until a terminal phase");
+        Assert(view.Contains("completedZeroBytes ? 1", StringComparison.Ordinal) &&
+            view.Contains("TransferProgressCompleteZero", StringComparison.Ordinal),
+            "completed zero-byte progress must expose a determinate native 100 percent value");
+        Assert(!view.Contains(".Focus(", StringComparison.Ordinal) &&
+            !view.Contains("peer", StringComparison.OrdinalIgnoreCase),
+            "transfer updates must not force focus or display peer information");
+        Assert(xaml.Contains("<ProgressBar", StringComparison.Ordinal) &&
+            xaml.Contains("AutomationProperties.Name=\"{Binding ProgressAutomationName}\"", StringComparison.Ordinal) &&
+            xaml.Contains("AutomationProperties.Name=\"{Binding CancelAutomationName}\"", StringComparison.Ordinal) &&
+            xaml.Contains("Text=\"{Binding DirectionPhaseText}\"", StringComparison.Ordinal),
+            "transfer rows need native progress/cancel controls and textual direction/phase authority");
+    }
+
+    private static TransferListSnapshot DecodeTransfers(string json) =>
+        TransferSnapshotDecoder.DecodeTransfers(Encoding.UTF8.GetBytes(json));
+
+    private static void AssertTransferRejected(string json, string privateDetail)
+    {
+        try
+        {
+            _ = DecodeTransfers(json);
+        }
+        catch (InvalidDataException exception)
+        {
+            Assert(exception.Message == "Invalid transfer snapshot response." &&
+                !exception.Message.Contains(privateDetail, StringComparison.Ordinal),
+                "transfer decoder errors must be generic and redact private or malformed data");
+            return;
+        }
+        throw new InvalidOperationException("malformed transfer response must fail closed");
+    }
+
+    private static string TransferEnvelope(
+        string instanceId,
+        ulong revision,
+        bool truncated,
+        string rows) =>
+        $"{{\"event\":\"transfers\",\"instance_id\":\"{instanceId}\",\"revision\":{revision},\"truncated\":{truncated.ToString().ToLowerInvariant()},\"transfers\":[{rows}]}}";
+
+    private static string TransferRow(
+        string transferId,
+        string direction,
+        string phase,
+        string processedBytes,
+        string totalBytes,
+        bool cancellable,
+        string failure) =>
+        $"{{\"transfer_id\":\"{transferId}\",\"direction\":\"{direction}\",\"phase\":\"{phase}\",\"processed_bytes\":{processedBytes},\"total_bytes\":{totalBytes},\"cancellable\":{cancellable.ToString().ToLowerInvariant()},\"failure\":{failure}}}";
+
+    private static TransferListSnapshot Snapshot(
+        string instanceId,
+        ulong revision,
+        bool truncated,
+        params TransferSnapshot[] transfers) =>
+        new(instanceId, revision, truncated, transfers);
+
+    private static TransferSnapshot Transfer(
+        string id,
+        TransferPhase phase,
+        bool cancellable,
+        ulong processed,
+        ulong total)
+    {
+        bool countersAreNull = phase is TransferPhase.Preparing or
+            TransferPhase.CancelRequested or TransferPhase.Cancelled or TransferPhase.Failed;
+        return new TransferSnapshot(
+            id,
+            $"••••••••-{id[^8..]}",
+            TransferDirection.Outbound,
+            phase,
+            countersAreNull ? null : processed,
+            countersAreNull ? null : total,
+            cancellable,
+            phase == TransferPhase.Failed ? TransferFailure.Internal : null);
     }
 
     private static AgentStatusSnapshot DecodeStatus(string json) =>

@@ -19,6 +19,14 @@ pub const MAX_SELECTED_PATHS: usize = 32;
 pub const MAX_SELECTED_PATH_BYTES: usize = 4 * 1024;
 /// Maximum public semantic-version text returned by updater IPC.
 pub const MAX_UPDATE_VERSION_BYTES: usize = 128;
+/// Maximum aggregate payload represented by one public file-transfer record.
+pub const MAX_TRANSFER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Maximum live records retained by the process-lifetime transfer registry.
+pub const MAX_NONTERMINAL_TRANSFERS: usize = 128;
+/// Maximum terminal records retained in completion-order FIFO order.
+pub const MAX_TERMINAL_TRANSFERS: usize = 32;
+/// Absolute maximum rows returned by one transfer listing.
+pub const MAX_TRANSFER_SNAPSHOTS: usize = MAX_NONTERMINAL_TRANSFERS + MAX_TERMINAL_TRANSFERS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -48,6 +56,10 @@ pub enum UiCommand {
     /// Sends only paths explicitly selected by the local user interface.
     SendFiles {
         paths: Vec<String>,
+    },
+    ListTransfers {},
+    CancelTransfer {
+        transfer_id: String,
     },
     /// Requests a bounded focus lease on the connected peer.
     RequestRemoteFocus {
@@ -125,12 +137,210 @@ pub enum AgentEvent {
     TransferQueued {
         transfer_id: String,
     },
+    Transfers {
+        instance_id: String,
+        revision: u64,
+        truncated: bool,
+        transfers: Vec<TransferSnapshot>,
+    },
     UpdateStatus(UpdateSnapshot),
     Error {
         code: String,
         message: String,
     },
     ShutdownAccepted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferDirection {
+    Inbound,
+    Outbound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferPhase {
+    Preparing,
+    Queued,
+    Transferring,
+    Paused,
+    Finalizing,
+    CancelRequested,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TransferPhase {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
+/// Stable, bounded failure categories safe to expose across local IPC.
+///
+/// Raw platform, transport, and source errors deliberately remain inside the
+/// agent process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferFailureCode {
+    AdmissionFailed,
+    SourceUnavailable,
+    AuthorizationRevoked,
+    TransportFailed,
+    CleanupFailed,
+    Internal,
+}
+
+/// Content-free local status for one transfer.
+///
+/// The identifier is process-local and is never a peer protocol identifier.
+/// Paths, names, hashes, peer identities, endpoints, epochs, timestamps, and
+/// raw error strings cannot be represented by this type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransferSnapshot {
+    transfer_id: String,
+    direction: TransferDirection,
+    phase: TransferPhase,
+    processed_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    cancellable: bool,
+    failure: Option<TransferFailureCode>,
+}
+
+impl TransferSnapshot {
+    /// Constructs a snapshot only when its phase and counters agree.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical or nil identifiers, inconsistent counters, totals
+    /// over 10 GiB, terminal records marked cancellable, and failure fields on
+    /// any phase other than `failed`.
+    pub fn new(
+        transfer_id: String,
+        direction: TransferDirection,
+        phase: TransferPhase,
+        processed_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+        cancellable: bool,
+        failure: Option<TransferFailureCode>,
+    ) -> Result<Self, TransferSnapshotError> {
+        let snapshot = Self {
+            transfer_id,
+            direction,
+            phase,
+            processed_bytes,
+            total_bytes,
+            cancellable,
+            failure,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    #[must_use]
+    pub fn transfer_id(&self) -> &str {
+        &self.transfer_id
+    }
+
+    #[must_use]
+    pub const fn direction(&self) -> TransferDirection {
+        self.direction
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> TransferPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn processed_bytes(&self) -> Option<u64> {
+        self.processed_bytes
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> Option<u64> {
+        self.total_bytes
+    }
+
+    #[must_use]
+    pub const fn cancellable(&self) -> bool {
+        self.cancellable
+    }
+
+    #[must_use]
+    pub const fn failure(&self) -> Option<TransferFailureCode> {
+        self.failure
+    }
+
+    fn validate(&self) -> Result<(), TransferSnapshotError> {
+        let id = uuid::Uuid::parse_str(&self.transfer_id)
+            .map_err(|_| TransferSnapshotError::InvalidPublicField)?;
+        if id.is_nil() || id.hyphenated().to_string() != self.transfer_id {
+            return Err(TransferSnapshotError::InvalidPublicField);
+        }
+        let counters_valid = match (self.processed_bytes, self.total_bytes) {
+            (Some(processed), Some(total)) => processed <= total && total <= MAX_TRANSFER_BYTES,
+            (None, None) => matches!(
+                self.phase,
+                TransferPhase::Preparing
+                    | TransferPhase::CancelRequested
+                    | TransferPhase::Cancelled
+                    | TransferPhase::Failed
+            ),
+            (Some(_), None) | (None, Some(_)) => false,
+        };
+        if !counters_valid
+            || (self.phase == TransferPhase::Completed && self.processed_bytes != self.total_bytes)
+            || (self.phase.is_terminal() && self.cancellable)
+            || (self.phase == TransferPhase::CancelRequested && self.cancellable)
+            || (self.phase == TransferPhase::Failed) != self.failure.is_some()
+        {
+            return Err(TransferSnapshotError::InvalidPhaseFields);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum TransferSnapshotError {
+    #[error("a public transfer field is invalid")]
+    InvalidPublicField,
+    #[error("transfer fields do not match the phase")]
+    InvalidPhaseFields,
+}
+
+impl<'de> Deserialize<'de> for TransferSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawTransferSnapshot {
+            transfer_id: String,
+            direction: TransferDirection,
+            phase: TransferPhase,
+            processed_bytes: Option<u64>,
+            total_bytes: Option<u64>,
+            cancellable: bool,
+            failure: Option<TransferFailureCode>,
+        }
+
+        let raw = RawTransferSnapshot::deserialize(deserializer)?;
+        Self::new(
+            raw.transfer_id,
+            raw.direction,
+            raw.phase,
+            raw.processed_bytes,
+            raw.total_bytes,
+            raw.cancellable,
+            raw.failure,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,9 +774,11 @@ pub mod unix {
 mod tests {
     use super::{
         AccessibilityReadiness, AgentEvent, CapabilityName, InputReadiness, IpcError,
-        LocalTopologyReadiness, MAX_IPC_MESSAGE_SIZE, MAX_TRUSTED_PEERS, MAX_UPDATE_VERSION_BYTES,
-        ReadinessSnapshot, SessionTopologyReadiness, TrustedPeerState, TrustedPeerSummary,
-        UiCommand, UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
+        LocalTopologyReadiness, MAX_IPC_MESSAGE_SIZE, MAX_TERMINAL_TRANSFERS, MAX_TRANSFER_BYTES,
+        MAX_TRANSFER_SNAPSHOTS, MAX_TRUSTED_PEERS, MAX_UPDATE_VERSION_BYTES, ReadinessSnapshot,
+        SessionTopologyReadiness, TransferDirection, TransferFailureCode, TransferPhase,
+        TransferSnapshot, TransferSnapshotError, TrustedPeerState, TrustedPeerSummary, UiCommand,
+        UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
         write_frame,
     };
 
@@ -768,6 +980,188 @@ mod tests {
             serde_json::from_slice::<UiCommand>(&encoded).unwrap(),
             request
         );
+    }
+
+    #[test]
+    fn transfer_commands_and_event_have_exact_snake_case_wire_names() {
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(r#"{"command":"list_transfers"}"#).unwrap(),
+            UiCommand::ListTransfers {}
+        );
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(
+                r#"{"command":"cancel_transfer","transfer_id":"01234567-89ab-cdef-0123-456789abcdef"}"#,
+            )
+            .unwrap(),
+            UiCommand::CancelTransfer {
+                transfer_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            }
+        );
+        let snapshot = TransferSnapshot::new(
+            "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            TransferDirection::Outbound,
+            TransferPhase::CancelRequested,
+            Some(4),
+            Some(10),
+            false,
+            None,
+        )
+        .unwrap();
+        let event = serde_json::to_value(AgentEvent::Transfers {
+            instance_id: "fedcba98-7654-4321-8fed-cba987654321".to_owned(),
+            revision: 7,
+            truncated: false,
+            transfers: vec![snapshot],
+        })
+        .unwrap();
+        assert_eq!(event["event"], "transfers");
+        assert_eq!(event["transfers"][0]["phase"], "cancel_requested");
+        assert_eq!(event["transfers"][0]["direction"], "outbound");
+    }
+
+    #[test]
+    fn transfer_snapshot_enforces_phase_counter_failure_and_identifier_invariants() {
+        let id = "01234567-89ab-cdef-0123-456789abcdef".to_owned();
+        assert_eq!(
+            TransferSnapshot::new(
+                id.clone(),
+                TransferDirection::Inbound,
+                TransferPhase::Transferring,
+                Some(11),
+                Some(10),
+                false,
+                None,
+            ),
+            Err(TransferSnapshotError::InvalidPhaseFields)
+        );
+        assert_eq!(
+            TransferSnapshot::new(
+                id.clone(),
+                TransferDirection::Outbound,
+                TransferPhase::Completed,
+                Some(9),
+                Some(10),
+                false,
+                None,
+            ),
+            Err(TransferSnapshotError::InvalidPhaseFields)
+        );
+        assert_eq!(
+            TransferSnapshot::new(
+                id.clone(),
+                TransferDirection::Outbound,
+                TransferPhase::Failed,
+                None,
+                None,
+                false,
+                None,
+            ),
+            Err(TransferSnapshotError::InvalidPhaseFields)
+        );
+        assert_eq!(
+            TransferSnapshot::new(
+                id.clone(),
+                TransferDirection::Outbound,
+                TransferPhase::Preparing,
+                None,
+                None,
+                true,
+                Some(TransferFailureCode::Internal),
+            ),
+            Err(TransferSnapshotError::InvalidPhaseFields)
+        );
+        assert_eq!(
+            TransferSnapshot::new(
+                id,
+                TransferDirection::Inbound,
+                TransferPhase::Queued,
+                Some(0),
+                Some(MAX_TRANSFER_BYTES + 1),
+                false,
+                None,
+            ),
+            Err(TransferSnapshotError::InvalidPhaseFields)
+        );
+        for invalid in [
+            "00000000-0000-0000-0000-000000000000",
+            "01234567-89AB-CDEF-0123-456789ABCDEF",
+            "peer-wire-id",
+        ] {
+            assert_eq!(
+                TransferSnapshot::new(
+                    invalid.to_owned(),
+                    TransferDirection::Outbound,
+                    TransferPhase::Preparing,
+                    None,
+                    None,
+                    true,
+                    None,
+                ),
+                Err(TransferSnapshotError::InvalidPublicField)
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_transfer_event_is_unique_private_field_free_and_below_ipc_limit() {
+        let transfers = (0..MAX_TRANSFER_SNAPSHOTS)
+            .map(|index| {
+                let mut bytes = [0_u8; 16];
+                bytes[8..].copy_from_slice(&u64::try_from(index + 1).unwrap().to_be_bytes());
+                let id = uuid::Uuid::from_bytes(bytes).hyphenated().to_string();
+                TransferSnapshot::new(
+                    id,
+                    if index % 2 == 0 {
+                        TransferDirection::Inbound
+                    } else {
+                        TransferDirection::Outbound
+                    },
+                    if index < MAX_TERMINAL_TRANSFERS {
+                        TransferPhase::Failed
+                    } else {
+                        TransferPhase::Transferring
+                    },
+                    Some(MAX_TRANSFER_BYTES),
+                    Some(MAX_TRANSFER_BYTES),
+                    false,
+                    (index < MAX_TERMINAL_TRANSFERS).then_some(TransferFailureCode::CleanupFailed),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let event = AgentEvent::Transfers {
+            instance_id: "fedcba98-7654-4321-8fed-cba987654321".to_owned(),
+            revision: u64::MAX,
+            truncated: true,
+            transfers,
+        };
+        let encoded = serde_json::to_vec(&event).unwrap();
+        assert!(
+            encoded.len() < MAX_IPC_MESSAGE_SIZE,
+            "{} bytes",
+            encoded.len()
+        );
+        let text = String::from_utf8(encoded).unwrap();
+        for private_name in [
+            "path",
+            "name",
+            "hash",
+            "peer_id",
+            "endpoint",
+            "timestamp",
+            "epoch",
+            "raw_error",
+        ] {
+            assert!(!text.contains(private_name), "leaked field {private_name}");
+        }
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let ids = value["transfers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["transfer_id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), MAX_TRANSFER_SNAPSHOTS);
     }
 
     #[test]

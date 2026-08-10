@@ -1,10 +1,10 @@
-<!-- doc-id: macos-app; lang: en; revision: 10 -->
+<!-- doc-id: macos-app; lang: en; revision: 13 -->
 
 # Nodavo for macOS
 
 [English](README.md) · [Русский](README.ru.md)
 
-The current SwiftUI menu-bar shell connects to the per-user Rust agent through signed XPC in a release build. The packaged LaunchAgent advertises `dev.nodavo.agent.ipc`; the agent verifies the exact UI signing requirement on every received message and the UI applies the reciprocal exact helper requirement. The shell displays bounded status/focus and trusted-device summaries, exposes local emergency stop and manual focus controls, implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation, and supports transactional post-pair grant changes plus confirmed trust revocation. The Overview and Settings screens separately show agent reachability, Accessibility trust, local input readiness, local displays, and peer-topology synchronization. The Transfers page queues up to 32 explicitly selected files/folders and displays only a redacted queue reference. Broad cross-platform and signed-runtime validation remain under implementation.
+The current SwiftUI menu-bar shell connects to the per-user Rust agent through signed XPC in a release build. The packaged LaunchAgent advertises `dev.nodavo.agent.ipc`; the agent verifies the exact UI signing requirement on every received message and the UI applies the reciprocal exact helper requirement. The shell displays bounded status/focus and trusted-device summaries, exposes local emergency stop and manual focus controls, implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation, and supports transactional post-pair grant changes plus confirmed trust revocation. The Overview and Settings screens separately show agent reachability, Accessibility trust, local input readiness, local displays, and peer-topology synchronization. The Transfers page queues up to 32 explicitly selected files/folders and shows bounded byte progress plus cancellation using redacted transfer identifiers. Broad cross-platform and signed-runtime validation remain under implementation.
 
 ```bash
 cargo run -p nodavo-agent --features development-unverified-local-ipc
@@ -15,6 +15,12 @@ swift run --package-path apps/macos \
 The feature and Swift compile flag above select an explicit unsafe same-user UDS bypass for source-tree development only. It is incompatible with distribution. A default agent build without an embedded Team ID or registered Mach service fails closed and has no UDS fallback.
 
 All pairing permissions default to off. The selected permissions are bound to the confirmed pairing transcript and signed device trust. Post-pair switches update only after the agent acknowledges the exact change; revoked devices cannot be edited and must be paired again. The UI never sends inferred filesystem paths: only absolute paths returned by an explicit local picker selection are accepted.
+
+## Transfers
+
+The visible Transfers page polls a strict, bounded authoritative agent snapshot about once per second while work is nonterminal or a cancellation outcome is pending. Polling and cancellation use separate agent clients with short per-command deadlines, while local admission has its own bounded margin for two sequential preparation windows, so file progress cannot occupy pairing, readiness, update, or emergency-stop paths. Hiding the page or reaching an all-terminal snapshot stops polling. Duplicate JSON object keys are rejected from bounded raw bytes before decoding; missing, extra, private, malformed, oversized, duplicate, or noncanonical fields are also rejected. A rejected or older poll preserves the last rows as stale, retries with bounded backoff while work remains, and never invents a failed transfer. A truncated snapshot retains only bounded rows needed for a pending admission or cancellation; absence resolves an operation only in a non-truncated authoritative snapshot.
+
+The UI shows current transfers and terminal transfers first observed during this app session. This is not durable transfer history. It shows direction, localized phase, bounded counters, and the shared `••••••••-12345678` identifier form, but never names, paths, peer details, or private metadata. A completed empty transfer is rendered as determinate 100%, including its accessibility value. Cancellation applies only the exact authoritative response for the same transfer ID. If a cancellation reply is ambiguous, cancellation authority remains locked to that one ID until authoritative convergence; another transfer cannot replace it. An ambiguous admission reply locks that picker selection and requires a fresh explicit selection before another send, preventing a blind duplicate.
 
 ## Readiness and Accessibility
 

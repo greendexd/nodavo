@@ -151,7 +151,7 @@
   <data name="TransferClearSelection.Content" xml:space="preserve"><value>Clear</value></data>
   <data name="TransferBoundsHelp.Text" xml:space="preserve"><value>Up to 32 explicit absolute selections; each path is limited to 4 KiB of UTF-8. Nodavo does not log or include filenames in the queue acknowledgement.</value></data>
   <data name="TransferSend.Content" xml:space="preserve"><value>Queue selected items</value></data>
-  <data name="TransferQueueing.Text" xml:space="preserve"><value>Preparing the bounded transfer request…</value></data>
+  <data name="TransferQueueing.Text" xml:space="preserve"><value>Waiting for local transfer admission…</value></data>
   <data name="TransfersPreAlpha.Title" xml:space="preserve"><value>Pre-alpha transfer source</value></data>
   <data name="TransfersPreAlpha.Message" xml:space="preserve"><value>A connected peer with the required grant is necessary. Windows runtime interoperability is not yet qualified.</value></data>
   <data name="TransferIdleTitle" xml:space="preserve"><value>Select files or folders</value></data>
@@ -167,7 +167,7 @@
   <data name="TransferSelectionCount" xml:space="preserve"><value>Selected: {0} of {1}</value></data>
   <data name="TransferSelectedRoot" xml:space="preserve"><value>Selected root</value></data>
   <data name="TransferSendingTitle" xml:space="preserve"><value>Queuing transfer</value></data>
-  <data name="TransferSendingMessage" xml:space="preserve"><value>Waiting for the agent's bounded preparation acknowledgement.</value></data>
+  <data name="TransferSendingMessage" xml:space="preserve"><value>Waiting for the agent's immediate local-admission acknowledgement.</value></data>
   <data name="TransferQueuedTitle" xml:space="preserve"><value>Transfer queued</value></data>
   <data name="TransferQueuedMessage" xml:space="preserve"><value>Redacted transfer ID: {0}</value></data>
   <data name="TransferTimedOutTitle" xml:space="preserve"><value>Transfer not confirmed</value></data>
@@ -178,7 +178,55 @@
   <data name="TransferRejectedMessage" xml:space="preserve"><value>The agent returned an explicit error instead of a queue acknowledgement.</value></data>
   <data name="TransferOutcomeUnknownTitle" xml:space="preserve"><value>Transfer outcome unknown</value></data>
   <data name="TransferOutcomeUnknownMessage" xml:space="preserve"><value>The acknowledgement was lost or invalid, so the transfer may already be queued. This selection cannot be retried; explicitly choose a fresh file or folder selection.</value></data>
-  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>The safe file-transfer queue is under implementation.</value></data>
+  <data name="TransferActivityTitle.Text" xml:space="preserve"><value>Current and recent transfers</value></data>
+  <data name="TransferActivityHelp.Text" xml:space="preserve"><value>Recent means observed during this agent session only. Nodavo does not claim durable transfer history.</value></data>
+  <data name="TransferRefresh.Content" xml:space="preserve"><value>Refresh transfers</value></data>
+  <data name="TransferRefresh.AutomationProperties.Name" xml:space="preserve"><value>Refresh transfer status</value></data>
+  <data name="TransferActivityEmpty.Text" xml:space="preserve"><value>No transfers have been observed in this agent session.</value></data>
+  <data name="TransferActivityList.AutomationProperties.Name" xml:space="preserve"><value>Current and recent transfers</value></data>
+  <data name="TransferNewTitle.Text" xml:space="preserve"><value>Queue a new transfer</value></data>
+  <data name="TransferIdentifierFormat" xml:space="preserve"><value>Transfer {0}</value></data>
+  <data name="TransferCurrent" xml:space="preserve"><value>Current transfer</value></data>
+  <data name="TransferRecentSession" xml:space="preserve"><value>Recent in this agent session</value></data>
+  <data name="TransferDirectionInbound" xml:space="preserve"><value>Inbound</value></data>
+  <data name="TransferDirectionOutbound" xml:space="preserve"><value>Outbound</value></data>
+  <data name="TransferPhasePreparing" xml:space="preserve"><value>Preparing</value></data>
+  <data name="TransferPhaseQueued" xml:space="preserve"><value>Queued</value></data>
+  <data name="TransferPhaseTransferring" xml:space="preserve"><value>Transferring</value></data>
+  <data name="TransferPhasePaused" xml:space="preserve"><value>Paused</value></data>
+  <data name="TransferPhaseFinalizing" xml:space="preserve"><value>Finalizing</value></data>
+  <data name="TransferPhaseCancelRequested" xml:space="preserve"><value>Cancel requested</value></data>
+  <data name="TransferPhaseCompleted" xml:space="preserve"><value>Completed</value></data>
+  <data name="TransferPhaseCancelled" xml:space="preserve"><value>Cancelled</value></data>
+  <data name="TransferPhaseFailed" xml:space="preserve"><value>Failed</value></data>
+  <data name="TransferDirectionPhaseFormat" xml:space="preserve"><value>Direction: {0} · Phase: {1}</value></data>
+  <data name="TransferProgressBytesFormat" xml:space="preserve"><value>{0:N0} of {1:N0} bytes</value></data>
+  <data name="TransferProgressCompleteZero" xml:space="preserve"><value>Complete: 0 of 0 bytes (100%)</value></data>
+  <data name="TransferProgressPending" xml:space="preserve"><value>Byte progress is not available yet</value></data>
+  <data name="TransferProgressAutomationFormat" xml:space="preserve"><value>Transfer progress. Phase {0}. {1}.</value></data>
+  <data name="TransferFailureAdmission" xml:space="preserve"><value>Failure: admission failed</value></data>
+  <data name="TransferFailureSource" xml:space="preserve"><value>Failure: source unavailable</value></data>
+  <data name="TransferFailureAuthorization" xml:space="preserve"><value>Failure: authorization was revoked</value></data>
+  <data name="TransferFailureTransport" xml:space="preserve"><value>Failure: transport failed</value></data>
+  <data name="TransferFailureCleanup" xml:space="preserve"><value>Failure: cleanup failed</value></data>
+  <data name="TransferFailureInternal" xml:space="preserve"><value>Failure: internal agent error</value></data>
+  <data name="TransferCancel" xml:space="preserve"><value>Cancel</value></data>
+  <data name="TransferCancelling" xml:space="preserve"><value>Requesting cancellation…</value></data>
+  <data name="TransferRetryCancel" xml:space="preserve"><value>Retry cancellation</value></data>
+  <data name="TransferCancelAutomationFormat" xml:space="preserve"><value>Cancel transfer {0}</value></data>
+  <data name="TransferFeedStaleTitle" xml:space="preserve"><value>Transfer status may be stale</value></data>
+  <data name="TransferFeedStaleMessage" xml:space="preserve"><value>The latest refresh failed. Existing rows are preserved without assuming a new phase.</value></data>
+  <data name="TransferFeedTruncatedTitle" xml:space="preserve"><value>Transfer list is truncated</value></data>
+  <data name="TransferFeedTruncatedMessage" xml:space="preserve"><value>The agent reported more transfers than this bounded response includes.</value></data>
+  <data name="TransferCancelUnknownTitle" xml:space="preserve"><value>Cancellation outcome unknown</value></data>
+  <data name="TransferCancelUnknownMessage" xml:space="preserve"><value>The cancellation response was lost or invalid. Nodavo will reconcile status; only this same transfer can be retried while it remains cancellable.</value></data>
+  <data name="TransferCancelRejectedTitle" xml:space="preserve"><value>Cancellation rejected</value></data>
+  <data name="TransferCancelRejectedMessage" xml:space="preserve"><value>The agent explicitly rejected cancellation. The transfer status was not inferred or replaced.</value></data>
+  <data name="TransferAdmissionReconcilingTitle" xml:space="preserve"><value>Reconciling transfer admission</value></data>
+  <data name="TransferAdmissionReconcilingMessage" xml:space="preserve"><value>The transfer was admitted locally, but the authoritative list is not available yet. Nodavo will make up to five bounded status attempts and will not resend the selected items.</value></data>
+  <data name="TransferAdmissionUnresolvedTitle" xml:space="preserve"><value>Transfer admission not reconciled</value></data>
+  <data name="TransferAdmissionUnresolvedMessage" xml:space="preserve"><value>The bounded automatic attempts ended without an authoritative list. Use Refresh transfers to start another bounded status check; this does not resend the transfer.</value></data>
+  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>Transfer progress and cancellation are implemented in source; qualified Windows runtime evidence is still pending.</value></data>
   <data name="UnavailableBadge.Title" xml:space="preserve"><value>Not available in this build</value></data>
   <data name="UnavailableBadge.Message" xml:space="preserve"><value>This screen does not perform an action yet.</value></data>
   <data name="SettingsTitle.Text" xml:space="preserve"><value>Settings</value></data>

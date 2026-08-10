@@ -41,6 +41,8 @@ internal sealed class AgentClient : IAgentReadinessProbe
         "focus_rejected",
         "safety_recovery_failed",
         "transfer_failed",
+        "transfer_not_found",
+        "transfer_not_cancellable",
     };
     // The agent may use its full three-second platform-readiness probe budget.
     // Leave additional time for pipe connection, mutual authentication, IPC, and scheduling.
@@ -50,8 +52,12 @@ internal sealed class AgentClient : IAgentReadinessProbe
     private static readonly TimeSpan EmergencyRequestTimeout = TimeSpan.FromSeconds(25);
     // The agent may spend two sequential five-second safety windows applying a grant.
     private static readonly TimeSpan MutationRequestTimeout = TimeSpan.FromSeconds(15);
-    // The agent owns a five-minute bounded preparation window after command delivery.
+    // Keep the existing conservative selected-path admission deadline independent.
+    // A successful response is immediate local admission, not delivery completion.
     private static readonly TimeSpan TransferRequestTimeout = TimeSpan.FromMinutes(5.25);
+    // Snapshot reads and cancellation admission are short, independent operations.
+    private static readonly TimeSpan TransferListRequestTimeout = TimeSpan.FromSeconds(8);
+    private static readonly TimeSpan TransferCancelRequestTimeout = TimeSpan.FromSeconds(8);
     private static readonly TimeSpan PairingRequestTimeout = TimeSpan.FromMinutes(2.2);
     private readonly string _pipeName;
 
@@ -190,6 +196,26 @@ internal sealed class AgentClient : IAgentReadinessProbe
             new SendFilesEnvelope("send_files", selectedPaths),
             TransferRequestTimeout,
             DecodeTransferQueued,
+            cancellationToken);
+    }
+
+    internal Task<TransferListSnapshot> ListTransfersAsync(
+        CancellationToken cancellationToken = default) =>
+        RequestAsync(
+            new CommandEnvelope("list_transfers"),
+            TransferListRequestTimeout,
+            DecodeTransfers,
+            cancellationToken);
+
+    internal Task<TransferListSnapshot> CancelTransferAsync(
+        string transferId,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateCanonicalTransferId(transferId);
+        return RequestAsync(
+            new CancelTransferEnvelope("cancel_transfer", transferId),
+            TransferCancelRequestTimeout,
+            DecodeTransfers,
             cancellationToken);
     }
 
@@ -389,16 +415,64 @@ internal sealed class AgentClient : IAgentReadinessProbe
 
     private static TransferQueuedSnapshot DecodeTransferQueued(byte[] payload)
     {
-        using JsonDocument document = ParseResponse(payload);
-        JsonElement root = document.RootElement;
-        RequireEvent(root, "transfer_queued");
-        string transferId = ReadRequiredText(root, "transfer_id", 36);
-        if (!Guid.TryParseExact(transferId, "D", out Guid parsed) || parsed == Guid.Empty)
+        try
+        {
+            using JsonDocument document = ParseResponse(payload);
+            JsonElement root = document.RootElement;
+            RequireEvent(root, "transfer_queued");
+            RequireExactFields(root, "event", "transfer_id");
+            string transferId = ReadRequiredText(root, "transfer_id", 36);
+            ValidateCanonicalTransferId(transferId);
+            return new TransferQueuedSnapshot($"••••••••-{transferId[^8..]}");
+        }
+        catch (Exception exception) when (
+            exception is JsonException or InvalidDataException or FormatException)
         {
             throw new InvalidDataException("Invalid transfer acknowledgement.");
         }
-        string canonical = parsed.ToString("D");
-        return new TransferQueuedSnapshot($"••••••••-{canonical[^8..]}");
+    }
+
+    private static TransferListSnapshot DecodeTransfers(byte[] payload)
+    {
+        using JsonDocument document = ParseResponse(payload);
+        JsonElement root = document.RootElement;
+        if (root.ValueKind == JsonValueKind.Object &&
+            root.TryGetProperty("event", out JsonElement eventElement) &&
+            eventElement.ValueKind == JsonValueKind.String && eventElement.GetString() == "error")
+        {
+            RequireEvent(root, "transfers");
+        }
+        return TransferSnapshotDecoder.DecodeTransfers(payload);
+    }
+
+    private static void ValidateCanonicalTransferId(string transferId)
+    {
+        if (!Guid.TryParseExact(transferId, "D", out Guid parsed) || parsed == Guid.Empty ||
+            !string.Equals(transferId, parsed.ToString("D"), StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("Invalid transfer identifier.");
+        }
+    }
+
+    private static void RequireExactFields(JsonElement root, params string[] expected)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidDataException();
+        }
+        var allowed = expected.ToHashSet(StringComparer.Ordinal);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonProperty property in root.EnumerateObject())
+        {
+            if (!allowed.Contains(property.Name) || !seen.Add(property.Name))
+            {
+                throw new InvalidDataException();
+            }
+        }
+        if (seen.Count != allowed.Count)
+        {
+            throw new InvalidDataException();
+        }
     }
 
     private static JsonDocument ParseResponse(byte[] payload) =>
@@ -515,6 +589,10 @@ internal sealed class AgentClient : IAgentReadinessProbe
     private sealed record SendFilesEnvelope(
         [property: JsonPropertyName("command")] string Command,
         [property: JsonPropertyName("paths")] string[] Paths);
+
+    private sealed record CancelTransferEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("transfer_id")] string TransferId);
 }
 
 internal sealed class AgentProtocolException(string code)

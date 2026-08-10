@@ -151,7 +151,7 @@
   <data name="TransferClearSelection.Content" xml:space="preserve"><value>Очистить</value></data>
   <data name="TransferBoundsHelp.Text" xml:space="preserve"><value>До 32 явно выбранных абсолютных путей; каждый путь ограничен 4 КиБ UTF-8. Nodavo не журналирует имена файлов и не включает их в подтверждение очереди.</value></data>
   <data name="TransferSend.Content" xml:space="preserve"><value>Поставить выбранное в очередь</value></data>
-  <data name="TransferQueueing.Text" xml:space="preserve"><value>Подготовка ограниченного запроса передачи…</value></data>
+  <data name="TransferQueueing.Text" xml:space="preserve"><value>Ожидание локального admission передачи…</value></data>
   <data name="TransfersPreAlpha.Title" xml:space="preserve"><value>Pre-alpha исходники передачи</value></data>
   <data name="TransfersPreAlpha.Message" xml:space="preserve"><value>Нужно подключённое устройство с требуемым разрешением. Windows runtime-совместимость ещё не квалифицирована.</value></data>
   <data name="TransferIdleTitle" xml:space="preserve"><value>Выберите файлы или папки</value></data>
@@ -167,7 +167,7 @@
   <data name="TransferSelectionCount" xml:space="preserve"><value>Выбрано: {0} из {1}</value></data>
   <data name="TransferSelectedRoot" xml:space="preserve"><value>Выбранный корень</value></data>
   <data name="TransferSendingTitle" xml:space="preserve"><value>Постановка передачи в очередь</value></data>
-  <data name="TransferSendingMessage" xml:space="preserve"><value>Ожидание ограниченного подтверждения подготовки от агента.</value></data>
+  <data name="TransferSendingMessage" xml:space="preserve"><value>Ожидание немедленного подтверждения локального admission от агента.</value></data>
   <data name="TransferQueuedTitle" xml:space="preserve"><value>Передача поставлена в очередь</value></data>
   <data name="TransferQueuedMessage" xml:space="preserve"><value>Скрытый ID передачи: {0}</value></data>
   <data name="TransferTimedOutTitle" xml:space="preserve"><value>Передача не подтверждена</value></data>
@@ -178,7 +178,55 @@
   <data name="TransferRejectedMessage" xml:space="preserve"><value>Агент вернул явную ошибку вместо подтверждения очереди.</value></data>
   <data name="TransferOutcomeUnknownTitle" xml:space="preserve"><value>Результат передачи неизвестен</value></data>
   <data name="TransferOutcomeUnknownMessage" xml:space="preserve"><value>Подтверждение потеряно или некорректно, поэтому передача уже могла попасть в очередь. Этот выбор нельзя повторить; явно выберите новый файл или папку.</value></data>
-  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>Безопасная очередь передачи файлов ещё разрабатывается.</value></data>
+  <data name="TransferActivityTitle.Text" xml:space="preserve"><value>Текущие и недавние передачи</value></data>
+  <data name="TransferActivityHelp.Text" xml:space="preserve"><value>Недавними считаются только передачи, замеченные в этом сеансе агента. Nodavo не заявляет постоянную историю передач.</value></data>
+  <data name="TransferRefresh.Content" xml:space="preserve"><value>Обновить передачи</value></data>
+  <data name="TransferRefresh.AutomationProperties.Name" xml:space="preserve"><value>Обновить состояния передач</value></data>
+  <data name="TransferActivityEmpty.Text" xml:space="preserve"><value>В этом сеансе агента передачи ещё не замечены.</value></data>
+  <data name="TransferActivityList.AutomationProperties.Name" xml:space="preserve"><value>Текущие и недавние передачи</value></data>
+  <data name="TransferNewTitle.Text" xml:space="preserve"><value>Поставить новую передачу в очередь</value></data>
+  <data name="TransferIdentifierFormat" xml:space="preserve"><value>Передача {0}</value></data>
+  <data name="TransferCurrent" xml:space="preserve"><value>Текущая передача</value></data>
+  <data name="TransferRecentSession" xml:space="preserve"><value>Недавняя в этом сеансе агента</value></data>
+  <data name="TransferDirectionInbound" xml:space="preserve"><value>Входящая</value></data>
+  <data name="TransferDirectionOutbound" xml:space="preserve"><value>Исходящая</value></data>
+  <data name="TransferPhasePreparing" xml:space="preserve"><value>Подготовка</value></data>
+  <data name="TransferPhaseQueued" xml:space="preserve"><value>В очереди</value></data>
+  <data name="TransferPhaseTransferring" xml:space="preserve"><value>Передаётся</value></data>
+  <data name="TransferPhasePaused" xml:space="preserve"><value>Приостановлена</value></data>
+  <data name="TransferPhaseFinalizing" xml:space="preserve"><value>Завершение</value></data>
+  <data name="TransferPhaseCancelRequested" xml:space="preserve"><value>Запрошена отмена</value></data>
+  <data name="TransferPhaseCompleted" xml:space="preserve"><value>Завершена</value></data>
+  <data name="TransferPhaseCancelled" xml:space="preserve"><value>Отменена</value></data>
+  <data name="TransferPhaseFailed" xml:space="preserve"><value>Ошибка</value></data>
+  <data name="TransferDirectionPhaseFormat" xml:space="preserve"><value>Направление: {0} · Фаза: {1}</value></data>
+  <data name="TransferProgressBytesFormat" xml:space="preserve"><value>{0:N0} из {1:N0} байт</value></data>
+  <data name="TransferProgressCompleteZero" xml:space="preserve"><value>Завершено: 0 из 0 байт (100%)</value></data>
+  <data name="TransferProgressPending" xml:space="preserve"><value>Прогресс в байтах пока недоступен</value></data>
+  <data name="TransferProgressAutomationFormat" xml:space="preserve"><value>Прогресс передачи. Фаза: {0}. {1}.</value></data>
+  <data name="TransferFailureAdmission" xml:space="preserve"><value>Ошибка: не удалось принять передачу</value></data>
+  <data name="TransferFailureSource" xml:space="preserve"><value>Ошибка: источник недоступен</value></data>
+  <data name="TransferFailureAuthorization" xml:space="preserve"><value>Ошибка: разрешение отозвано</value></data>
+  <data name="TransferFailureTransport" xml:space="preserve"><value>Ошибка: сбой транспорта</value></data>
+  <data name="TransferFailureCleanup" xml:space="preserve"><value>Ошибка: не удалось выполнить очистку</value></data>
+  <data name="TransferFailureInternal" xml:space="preserve"><value>Ошибка: внутренняя ошибка агента</value></data>
+  <data name="TransferCancel" xml:space="preserve"><value>Отменить</value></data>
+  <data name="TransferCancelling" xml:space="preserve"><value>Запрос отмены…</value></data>
+  <data name="TransferRetryCancel" xml:space="preserve"><value>Повторить отмену</value></data>
+  <data name="TransferCancelAutomationFormat" xml:space="preserve"><value>Отменить передачу {0}</value></data>
+  <data name="TransferFeedStaleTitle" xml:space="preserve"><value>Состояние передач может быть устаревшим</value></data>
+  <data name="TransferFeedStaleMessage" xml:space="preserve"><value>Последнее обновление не удалось. Существующие строки сохранены без предположения о новой фазе.</value></data>
+  <data name="TransferFeedTruncatedTitle" xml:space="preserve"><value>Список передач сокращён</value></data>
+  <data name="TransferFeedTruncatedMessage" xml:space="preserve"><value>Агент сообщил о большем числе передач, чем вошло в этот ограниченный ответ.</value></data>
+  <data name="TransferCancelUnknownTitle" xml:space="preserve"><value>Результат отмены неизвестен</value></data>
+  <data name="TransferCancelUnknownMessage" xml:space="preserve"><value>Ответ на отмену потерян или некорректен. Nodavo сверит состояние; пока передача допускает отмену, повторить запрос можно только для неё же.</value></data>
+  <data name="TransferCancelRejectedTitle" xml:space="preserve"><value>Отмена отклонена</value></data>
+  <data name="TransferCancelRejectedMessage" xml:space="preserve"><value>Агент явно отклонил отмену. Состояние передачи не было выведено или заменено предположением.</value></data>
+  <data name="TransferAdmissionReconcilingTitle" xml:space="preserve"><value>Сверка admission передачи</value></data>
+  <data name="TransferAdmissionReconcilingMessage" xml:space="preserve"><value>Передача локально принята, но авторитетный список пока недоступен. Nodavo выполнит до пяти ограниченных проверок состояния и не будет повторно отправлять выбранные объекты.</value></data>
+  <data name="TransferAdmissionUnresolvedTitle" xml:space="preserve"><value>Admission передачи не сверен</value></data>
+  <data name="TransferAdmissionUnresolvedMessage" xml:space="preserve"><value>Ограниченные автоматические попытки завершились без авторитетного списка. Нажмите «Обновить передачи», чтобы начать ещё одну ограниченную проверку состояния; передача не будет отправлена повторно.</value></data>
+  <data name="TransfersUnavailable.Text" xml:space="preserve"><value>Прогресс и отмена передач реализованы в исходниках; квалифицированные свидетельства Windows runtime ещё ожидаются.</value></data>
   <data name="UnavailableBadge.Title" xml:space="preserve"><value>Недоступно в этой сборке</value></data>
   <data name="UnavailableBadge.Message" xml:space="preserve"><value>Этот экран пока не выполняет действий.</value></data>
   <data name="SettingsTitle.Text" xml:space="preserve"><value>Настройки</value></data>

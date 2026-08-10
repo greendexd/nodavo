@@ -187,7 +187,7 @@ where
         if self.active.as_ref().map(|active| active.id) != Some(transfer) {
             return Err(TransferError::TransferNotActive);
         }
-        self.staging.abort(transfer);
+        self.staging.abort_confirmed(transfer)?;
         self.active = None;
         Ok(())
     }

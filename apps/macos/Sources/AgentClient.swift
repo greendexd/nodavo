@@ -6,6 +6,7 @@ enum AgentClientError: Error, Sendable {
     case agentUnavailable
     case unsafePath
     case unsafeValue
+    case requestTooLarge
     case messageTooLarge
     case invalidResponse
     case agent(code: String, message: String)
@@ -93,6 +94,7 @@ struct AgentCommand: Encodable {
     let paths: [String]?
     let ttlMs: UInt32?
     let offerID: String?
+    let transferID: String?
 
     enum CodingKeys: String, CodingKey {
         case command
@@ -106,6 +108,7 @@ struct AgentCommand: Encodable {
         case paths
         case ttlMs = "ttl_ms"
         case offerID = "offer_id"
+        case transferID = "transfer_id"
     }
 
     init(
@@ -119,7 +122,8 @@ struct AgentCommand: Encodable {
         capabilities: [String]? = nil,
         paths: [String]? = nil,
         ttlMs: UInt32? = nil,
-        offerID: String? = nil
+        offerID: String? = nil,
+        transferID: String? = nil
     ) {
         self.command = command
         self.endpoint = endpoint
@@ -132,6 +136,7 @@ struct AgentCommand: Encodable {
         self.paths = paths
         self.ttlMs = ttlMs
         self.offerID = offerID
+        self.transferID = transferID
     }
 
     static func simple(_ command: String) -> Self {
@@ -171,7 +176,6 @@ struct AgentResponse: Decodable {
     let capability: PairingCapability?
     let enabled: Bool?
     let peers: [AgentPeerResponse]?
-    let transferID: String?
     let message: String?
     let offerID: String?
     let version: String?
@@ -194,7 +198,6 @@ struct AgentResponse: Decodable {
         case capability
         case enabled
         case peers
-        case transferID = "transfer_id"
         case message
         case offerID = "offer_id"
         case version
@@ -336,7 +339,35 @@ struct TrustedPeerSummary: Identifiable, Equatable {
 }
 
 struct QueuedTransferReference: Equatable {
-    let redactedID: String
+    let transferID: String
+
+    var redactedID: String {
+        "••••••••-" + transferID.suffix(8)
+    }
+}
+
+private struct TransferAdmissionResponse: Decodable {
+    let transferID: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case event
+        case transferID = "transfer_id"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue)),
+              try container.decode(String.self, forKey: AnyCodingKey("event")) == "transfer_queued"
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        let transferID = try container.decode(String.self, forKey: AnyCodingKey("transfer_id"))
+        guard TransferSummary.isCanonicalNonNilUUID(transferID) else {
+            throw AgentClientError.invalidResponse
+        }
+        self.transferID = transferID
+    }
 }
 
 enum UpdatePhase: String, CaseIterable, Equatable {
@@ -400,6 +431,37 @@ enum AgentResponseDecoder {
     static let maximumUpdateVersionBytes = 128
     static let maximumUpdateArtifactBytes: UInt64 = 16 * 1024 * 1024 * 1024
 
+    static func validateTransferJSON(_ payload: Data) throws {
+        do {
+            try StrictJSONDuplicateKeyValidator.validate(payload)
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
+    }
+
+    static func transferAdmission(_ payload: Data) throws -> QueuedTransferReference {
+        do {
+            try validateTransferJSON(payload)
+            let response = try JSONDecoder().decode(TransferAdmissionResponse.self, from: payload)
+            return QueuedTransferReference(transferID: response.transferID)
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
+    }
+
+    static func transferSnapshot(_ payload: Data) throws -> TransferSnapshot {
+        do {
+            try validateTransferJSON(payload)
+            return try JSONDecoder().decode(TransferSnapshot.self, from: payload)
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
+    }
+
     static func trustedPeers(_ response: AgentResponse) throws -> [TrustedPeerSummary] {
         guard response.event == "trusted_peers", let peers = response.peers,
               peers.count <= maximumTrustedPeers,
@@ -451,17 +513,6 @@ enum AgentResponseDecoder {
             focusState: focusState,
             readiness: readiness
         )
-    }
-
-    static func transferReference(_ response: AgentResponse) throws -> QueuedTransferReference {
-        guard response.event == "transfer_queued",
-              let transferID = response.transferID,
-              transferID.utf8.count == 36,
-              UUID(uuidString: transferID) != nil
-        else {
-            throw AgentClientError.invalidResponse
-        }
-        return QueuedTransferReference(redactedID: String(transferID.prefix(8)) + "…")
     }
 
     static func updateStatus(_ response: AgentResponse) throws -> UpdateStatusSnapshot {
@@ -633,9 +684,9 @@ enum AgentResponseDecoder {
 
 actor AgentClient {
     private static let maximumMessageSize = 64 * 1024
-    // Matches the agent's hard ceiling and exceeds its longest bounded command
-    // (five-minute transfer preparation), preventing ambiguous early retries.
-    private static let xpcReplyDeadlineSeconds = 360
+    // Existing non-transfer commands retain their current bounded ceiling.
+    // Admission, transfer polling, and cancellation override it below.
+    private static let defaultReplyDeadlineSeconds = 360
     private let maximumEndpointBytes = 512
     static let maximumSelectedPaths = 32
     static let maximumSelectedPathBytes = 4 * 1024
@@ -749,9 +800,36 @@ actor AgentClient {
 
     func sendFiles(paths: [String]) throws -> QueuedTransferReference {
         try Self.validateSelectedPaths(paths)
-        return try AgentResponseDecoder.transferReference(
-            request(AgentCommand(command: "send_files", paths: paths))
+        let payload = try requestData(
+            AgentCommand(command: "send_files", paths: paths),
+            deadlineSeconds: TransferCommandDeadline.admissionSeconds
         )
+        try AgentResponseDecoder.validateTransferJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        return try AgentResponseDecoder.transferAdmission(payload)
+    }
+
+    func listTransfers() throws -> TransferSnapshot {
+        let payload = try requestData(
+            AgentCommand.simple("list_transfers"),
+            deadlineSeconds: TransferCommandDeadline.statusSeconds
+        )
+        try AgentResponseDecoder.validateTransferJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        return try AgentResponseDecoder.transferSnapshot(payload)
+    }
+
+    func cancelTransfer(transferID: String) throws -> TransferSnapshot {
+        guard TransferSummary.isCanonicalNonNilUUID(transferID) else {
+            throw AgentClientError.unsafeValue
+        }
+        let payload = try requestData(
+            AgentCommand(command: "cancel_transfer", transferID: transferID),
+            deadlineSeconds: TransferCommandDeadline.statusSeconds
+        )
+        try AgentResponseDecoder.validateTransferJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        return try AgentResponseDecoder.transferSnapshot(payload)
     }
 
     func updateStatus() throws -> UpdateStatusSnapshot {
@@ -809,18 +887,31 @@ actor AgentClient {
     }
 
     private func request(_ command: AgentCommand) throws -> AgentResponse {
+        let response = try requestData(command, deadlineSeconds: Self.defaultReplyDeadlineSeconds)
+        let decoded = try JSONDecoder().decode(AgentResponse.self, from: response)
+        try throwAgentError(decoded)
+        return decoded
+    }
+
+    private func requestData(_ command: AgentCommand, deadlineSeconds: Int) throws -> Data {
         let payload = try JSONEncoder().encode(command)
         guard !payload.isEmpty, payload.count <= Self.maximumMessageSize else {
-            throw AgentClientError.messageTooLarge
+            throw AgentClientError.requestTooLarge
         }
 
         #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
-        let response = try requestOverDevelopmentSocket(payload)
+        return try requestOverDevelopmentSocket(payload, deadlineSeconds: deadlineSeconds)
         #else
-        let response = try requestOverSignedXpc(payload)
+        return try requestOverSignedXpc(payload, deadlineSeconds: deadlineSeconds)
         #endif
+    }
 
-        let decoded = try JSONDecoder().decode(AgentResponse.self, from: response)
+    private func throwAgentErrorIfPresent(_ payload: Data) throws {
+        let decoded = try JSONDecoder().decode(AgentResponse.self, from: payload)
+        try throwAgentError(decoded)
+    }
+
+    private func throwAgentError(_ decoded: AgentResponse) throws {
         if decoded.event == "error" {
             guard let code = decoded.code,
                   let message = decoded.message,
@@ -831,11 +922,10 @@ actor AgentClient {
             }
             throw AgentClientError.agent(code: code, message: message)
         }
-        return decoded
     }
 
     #if !NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
-    private func requestOverSignedXpc(_ payload: Data) throws -> Data {
+    private func requestOverSignedXpc(_ payload: Data, deadlineSeconds: Int) throws -> Data {
         let configuration = try AgentXpcConfiguration.load()
         let connection = xpc_connection_create_mach_service(
             configuration.serviceName,
@@ -872,7 +962,7 @@ actor AgentClient {
             waiter.finish(Self.decodeXpcReply(reply))
         }
 
-        guard let result = waiter.wait(seconds: Self.xpcReplyDeadlineSeconds) else {
+        guard let result = waiter.wait(seconds: deadlineSeconds) else {
             throw AgentClientError.agentUnavailable
         }
         return try result.get()
@@ -887,16 +977,14 @@ actor AgentClient {
             return .failure(.agentUnavailable)
         }
         var length = 0
-        guard let bytes = xpc_dictionary_get_data(reply, "frame", &length),
-              length > 0,
-              length <= maximumMessageSize
-        else {
+        guard let bytes = xpc_dictionary_get_data(reply, "frame", &length), length > 0 else {
             return .failure(.invalidResponse)
         }
+        guard length <= maximumMessageSize else { return .failure(.messageTooLarge) }
         return .success(Data(bytes: bytes, count: length))
     }
     #else
-    private func requestOverDevelopmentSocket(_ payload: Data) throws -> Data {
+    private func requestOverDevelopmentSocket(_ payload: Data, deadlineSeconds: Int) throws -> Data {
         let socketPath = try defaultSocketPath()
         let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
         guard descriptor >= 0 else {
@@ -904,6 +992,23 @@ actor AgentClient {
         }
         defer { close(descriptor) }
         try Self.setCloseOnExec(descriptor)
+        var timeout = timeval(tv_sec: deadlineSeconds, tv_usec: 0)
+        guard setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0,
+        setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0 else {
+            throw AgentClientError.system(errno)
+        }
 
         do {
             try connect(descriptor: descriptor, path: socketPath)

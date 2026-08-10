@@ -43,6 +43,14 @@ server_authenticator = (
 ).read_text(encoding="utf-8")
 devices = (APP / "Views/DevicesView.xaml.cs").read_text(encoding="utf-8")
 transfers = (APP / "Views/TransfersView.xaml.cs").read_text(encoding="utf-8")
+transfers_xaml = (APP / "Views/TransfersView.xaml").read_text(encoding="utf-8")
+transfer_model = (APP / "Models/TransferSnapshot.cs").read_text(encoding="utf-8")
+transfer_decoder = (
+    APP / "Services/TransferSnapshotDecoder.cs"
+).read_text(encoding="utf-8")
+transfer_reducer = (
+    APP / "ViewModels/TransfersViewModel.cs"
+).read_text(encoding="utf-8")
 overview_xaml = (APP / "Views/OverviewView.xaml").read_text(encoding="utf-8")
 rust_runtime = (ROOT / "crates/nodavo-agent/src/runtime.rs").read_text(encoding="utf-8")
 agent_main = (ROOT / "crates/nodavo-agent/src/main.rs").read_text(encoding="utf-8")
@@ -113,10 +121,24 @@ transfer_minutes = float(
         r"TransferRequestTimeout\s*=\s*TimeSpan\.FromMinutes\(([0-9.]+)\)", client
     ).group(1)
 )
+transfer_list_seconds = float(
+    re.search(
+        r"TransferListRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)",
+        client,
+    ).group(1)
+)
+transfer_cancel_seconds = float(
+    re.search(
+        r"TransferCancelRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)",
+        client,
+    ).group(1)
+)
 assert mutation_seconds > 10, "UI mutation deadline must exceed two agent 5s waits"
 assert transfer_minutes * 60 > 305, "UI transfer deadline must exceed agent 5s + 5min waits"
+assert transfer_list_seconds == 8
+assert transfer_cancel_seconds == 8
+assert "TransferListRequestTimeout" != "TransferCancelRequestTimeout"
 assert "Duration::from_secs(5)" in rust_runtime
-assert "TRANSFER_PREPARATION_DEADLINE: Duration = Duration::from_mins(5)" in rust_runtime
 
 assert "_trustedRefreshGeneration" in devices
 assert "_trustedMutationGeneration" in devices
@@ -148,6 +170,105 @@ assert "MaximumSelectedPaths = 32" in client
 assert "MaximumSelectedPathBytes = 4 * 1024" in client
 assert 'ReadRequiredText(root, "message", MaximumErrorMessageLength)' in client
 assert "AllowedAgentErrorCodes.Contains(code)" in client
+assert 'CommandEnvelope("list_transfers")' in client
+assert 'CancelTransferEnvelope("cancel_transfer", transferId)' in client
+assert "TransferListRequestTimeout" in client
+assert "TransferCancelRequestTimeout" in client
+
+assert "MaximumTransfers = 160" in transfer_decoder
+assert "10UL * 1024 * 1024 * 1024" in transfer_decoder
+assert "countersMayBeNull" in transfer_decoder
+assert "TransferPhase.CancelRequested or TransferPhase.Cancelled or TransferPhase.Failed" in (
+    transfer_decoder
+)
+assert "(!processedBytes.HasValue && !countersMayBeNull)" in transfer_decoder
+assert 'ReadCanonicalIdentifier(root, "instance_id")' in transfer_decoder
+assert 'ReadCanonicalIdentifier(element, "transfer_id")' in transfer_decoder
+assert 'parsed.ToString("D")' in transfer_decoder
+assert "parsed == Guid.Empty" in transfer_decoder
+for exact_field in (
+    '"event"',
+    '"instance_id"',
+    '"revision"',
+    '"truncated"',
+    '"transfers"',
+    '"transfer_id"',
+    '"direction"',
+    '"phase"',
+    '"processed_bytes"',
+    '"total_bytes"',
+    '"cancellable"',
+    '"failure"',
+):
+    assert exact_field in transfer_decoder, f"missing exact transfer field: {exact_field}"
+for failure in (
+    "admission_failed",
+    "source_unavailable",
+    "authorization_revoked",
+    "transport_failed",
+    "cleanup_failed",
+    "internal",
+):
+    assert f'"{failure}"' in transfer_decoder, f"missing bounded failure: {failure}"
+assert 'InvalidResponse = "Invalid transfer snapshot response."' in transfer_decoder
+assert "$\"••••••••-{transferId[^8..]}\"" in transfer_decoder
+assert "public string TransferId" not in transfer_model + transfer_reducer + transfers
+
+assert 'TimeSpan PollInterval = TimeSpan.FromSeconds(1)' in transfers
+assert "SemaphoreSlim _transferRequestGate = new(1, 1)" in transfers
+assert 'Loaded="TransfersView_Loaded"' in transfers_xaml
+assert 'Unloaded="TransfersView_Unloaded"' in transfers_xaml
+assert "TransfersViewModel.Stop(_transferState)" in transfers
+assert "IsCurrentTransferGeneration" in transfers
+assert "_transferState.HasPollingWork" in transfers
+assert "TransferPollLifecycle.RequestForcedRefresh" in transfers
+assert "TransferPollLifecycle.TakeForcedRefresh" in transfers
+assert "TransferPollLifecycle.CompleteLoop" in transfers
+assert "ObservePollCompletionAsync" in transfers
+assert "BeginAdmissionReconciliation" in transfers
+assert "RestartAdmissionReconciliation" in transfers
+assert "AdmissionReconciliationAttemptsRemaining" in transfer_reducer
+assert "MaximumAdmissionReconciliationAttempts = 5" in transfer_reducer
+assert transfers.count("_client.SendFilesAsync(") == 1, (
+    "admission reconciliation must never create a blind resend path"
+)
+poll_catch = re.search(
+    r"catch \(Exception exception\) when \(.*?AgentProtocolException.*?\)\s*\{\s*"
+    r"_transferState = TransfersViewModel\.MarkPollFailure",
+    transfers,
+    re.DOTALL,
+)
+assert poll_catch, "explicit transfer-list errors must preserve stale rows"
+assert "zeroByteNonterminal" in transfers
+assert "(!snapshot.TotalBytes.HasValue || zeroByteNonterminal)" in transfers
+assert "completedZeroBytes ? 1" in transfers
+assert 'GetString("TransferProgressCompleteZero")' in transfers
+assert ".Focus(" not in transfers
+assert "Console." not in transfers
+assert "Debug." not in transfers
+assert "peer" not in transfers.lower()
+assert "<ProgressBar" in transfers_xaml
+assert 'AutomationProperties.Name="{Binding ProgressAutomationName}"' in transfers_xaml
+assert 'AutomationProperties.Name="{Binding CancelAutomationName}"' in transfers_xaml
+assert 'Text="{Binding DirectionPhaseText}"' in transfers_xaml
+assert 'IsEnabled="{Binding CanCancel}"' in transfers_xaml
+assert "TransferFeedStaleTitle" in english
+assert "TransferFeedTruncatedTitle" in english
+assert "TransferCancelUnknownTitle" in english
+assert "TransferProgressCompleteZero" in english
+assert "TransferAdmissionReconcilingTitle" in english
+assert "TransferAdmissionUnresolvedTitle" in english
+
+test_project = (
+    ROOT / "apps/windows/tests/Nodavo.Windows.Lifecycle.Tests/"
+    "Nodavo.Windows.Lifecycle.Tests.csproj"
+).read_text(encoding="utf-8")
+for linked_source in (
+    "Models/TransferSnapshot.cs",
+    "Services/TransferSnapshotDecoder.cs",
+    "ViewModels/TransfersViewModel.cs",
+):
+    assert linked_source in test_project, f"pure transfer source is not linked: {linked_source}"
 
 connect = client.index("await pipe.ConnectAsync(deadline.Token)")
 authenticate_server = client.index(
@@ -366,5 +487,5 @@ assert architecture_loop < release_private_import, (
 
 print(
     "Windows product UI static checks passed: resources, XML, deadlines, "
-    "trust ownership/reconciliation, transfer retry lockout, and package auth policy"
+    "trust ownership/reconciliation, transfer polling/retry/progress, and package auth policy"
 )

@@ -81,7 +81,31 @@ impl FileSystemStagingArea {
     /// Returns [`TransferError::Platform`] if the destination is missing, is a
     /// symlink, is not a directory, or cannot host a private staging directory.
     pub fn new(destination_root: impl AsRef<Path>) -> Result<Self, TransferError> {
-        let destination = open_ambient_directory_no_follow(destination_root.as_ref())?;
+        Self::new_inner(destination_root.as_ref(), None)
+    }
+
+    /// Opens peer-scoped staging below the shared destination.
+    ///
+    /// Persisted state from another authenticated peer is unreachable through
+    /// this instance even when that peer chose the same wire transfer UUID.
+    /// Legacy unscoped state is deliberately not migrated in pre-alpha builds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Platform`] when either the destination, shared
+    /// staging root, or private peer namespace cannot be opened safely.
+    pub fn new_scoped(
+        destination_root: impl AsRef<Path>,
+        authenticated_owner: [u8; 32],
+    ) -> Result<Self, TransferError> {
+        Self::new_inner(destination_root.as_ref(), Some(authenticated_owner))
+    }
+
+    fn new_inner(
+        destination_root: &Path,
+        authenticated_owner: Option<[u8; 32]>,
+    ) -> Result<Self, TransferError> {
+        let destination = open_ambient_directory_no_follow(destination_root)?;
         let (staging, created) = match destination.symlink_metadata(STAGING_DIRECTORY_NAME) {
             Ok(metadata) if metadata_is_reparse(&metadata) || !metadata.is_dir() => {
                 return Err(TransferError::Platform);
@@ -131,6 +155,39 @@ impl FileSystemStagingArea {
                 Err(_) => Err(TransferError::Platform),
             };
         }
+        let staging = if let Some(owner) = authenticated_owner {
+            let owner_name = staging_owner_name(owner);
+            let (owner_staging, owner_created) = match staging
+                .symlink_metadata(Path::new(&owner_name))
+            {
+                Ok(metadata) if metadata_is_reparse(&metadata) || !metadata.is_dir() => {
+                    return Err(TransferError::Platform);
+                }
+                Ok(_) => (
+                    open_private_dir_component_no_follow(&staging, Path::new(&owner_name))?,
+                    false,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match create_private_directory_component(&staging, Path::new(&owner_name)) {
+                        Ok(directory) => (directory, true),
+                        Err(TransferError::DestinationExists) => (
+                            open_private_dir_component_no_follow(&staging, Path::new(&owner_name))?,
+                            false,
+                        ),
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(_) => return Err(TransferError::Platform),
+            };
+            require_private_directory(&owner_staging)?;
+            sync_directory(&owner_staging)?;
+            if owner_created {
+                sync_directory(&staging)?;
+            }
+            owner_staging
+        } else {
+            staging
+        };
         Ok(Self {
             destination,
             staging,
@@ -232,10 +289,10 @@ impl FileSystemStagingArea {
 
     /// Deletes safe persisted staging that has not been reopened.
     ///
-    /// The caller must obtain `transfer` from an authenticated transfer scope;
-    /// the current on-disk schema has no peer or connection-epoch owner field.
-    /// This method never follows substituted links and never affects an active
-    /// transfer.
+    /// The caller must obtain `transfer` from the authenticated peer scope used
+    /// to construct this staging instance. Scoped instances resolve only below
+    /// that peer's private namespace. This method never follows substituted
+    /// links and never affects an active transfer.
     ///
     /// # Errors
     ///
@@ -265,6 +322,9 @@ impl FileSystemStagingArea {
     /// Returns [`TransferError::TransferNotActive`] for another transfer and
     /// [`TransferError::Platform`] when cleanup could not be completed.
     pub fn try_abort(&mut self, transfer: TransferId) -> Result<(), TransferError> {
+        if self.cleanup_failed {
+            return Err(TransferError::Platform);
+        }
         let Some(active) = self.active.take() else {
             return Ok(());
         };
@@ -453,6 +513,10 @@ impl StagingArea for FileSystemStagingArea {
     fn abort(&mut self, transfer: TransferId) {
         let _ = self.try_abort(transfer);
     }
+
+    fn abort_confirmed(&mut self, transfer: TransferId) -> Result<(), TransferError> {
+        self.try_abort(transfer)
+    }
 }
 
 impl ResumableStagingArea for FileSystemStagingArea {
@@ -517,6 +581,17 @@ fn transfer_progress_path(root: &Path, transfer: TransferId) -> PathBuf {
 
 fn transfer_directory_name(transfer: TransferId) -> OsString {
     format!("{}.data", transfer.as_uuid()).into()
+}
+
+fn staging_owner_name(owner: [u8; 32]) -> OsString {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(5 + owner.len() * 2);
+    name.push_str("peer-");
+    for byte in owner {
+        name.push(char::from(HEX[usize::from(byte >> 4)]));
+        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    OsString::from(name)
 }
 
 fn transfer_progress_name(transfer: TransferId) -> OsString {
@@ -1934,7 +2009,7 @@ mod tests {
             staging.finalize(transfer).await,
             Err(TransferError::Platform)
         );
-        staging.try_abort(transfer).unwrap();
+        assert_eq!(staging.try_abort(transfer), Err(TransferError::Platform));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2183,6 +2258,42 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn peer_scopes_isolate_the_same_wire_transfer_id() {
+        let root = temporary_directory();
+        let manifest = TransferManifest::new(vec![ManifestEntry {
+            path: RelativePath::parse("received.txt").unwrap(),
+            kind: EntryKind::File,
+            size: 1,
+            hash: Some(ContentHash::digest(b"a")),
+        }])
+        .unwrap();
+        let transfer = TransferId::from_bytes([71; 16]);
+        {
+            let mut first = FileSystemStagingArea::new_scoped(&root, [1; 32]).unwrap();
+            first.begin(transfer, &manifest).await.unwrap();
+            first
+                .write(TransferChunk {
+                    transfer,
+                    entry_index: 0,
+                    offset: 0,
+                    bytes: bytes::Bytes::from_static(b"a"),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut second = FileSystemStagingArea::new_scoped(&root, [2; 32]).unwrap();
+        assert!(!second.has_persisted(transfer).unwrap());
+        assert!(second.resume(transfer, &manifest).is_err());
+        second.discard_unopened_persisted(transfer).unwrap();
+
+        let mut first = FileSystemStagingArea::new_scoped(&root, [1; 32]).unwrap();
+        assert!(first.has_persisted(transfer).unwrap());
+        first.discard_unopened_persisted(transfer).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn abort_surfaces_substituted_cleanup_and_poisoned_instance() {
@@ -2207,6 +2318,11 @@ mod tests {
         symlink(&outside, &progress).unwrap();
 
         assert_eq!(staging.try_abort(transfer), Err(TransferError::Platform));
+        assert_eq!(
+            staging.try_abort(transfer),
+            Err(TransferError::Platform),
+            "cleanup poison must be sticky and retries may never report success"
+        );
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
         assert_eq!(
             staging.begin(TransferId::new(), &manifest).await,

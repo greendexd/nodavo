@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 12 -->
+<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 13 -->
 
 # История изменений
 
@@ -32,9 +32,10 @@
 - Fail-closed Windows x64+ARM64 development MSIXBundle pipeline и core state machine подписанных updates с bounded staging, consent, rollback floor и restart/health contracts.
 - Выключенный по умолчанию, не активирующий обновления slice с закреплёнными при компиляции HTTPS endpoint манифеста и публичным ключом Ed25519, нативным платформенным TLS без redirects и decompression, проверкой подписи манифеста и same-origin артефакта, согласием на точный UUID предложения и возобновляемым private capability-root staging с проверкой digest, межпроцессной арендой, квотами, retention и fsync. Раздел Settings macOS умеет проверять, обновлять/опрашивать прогресс, показывать up-to-date, принимать или отклонять точное предложение, возобновлять приостановленную загрузку и сообщать о проверенном staging на английском и русском, не раскрывая URL, путь или hash.
 - Строгий не содержащий контента readiness contract и двуязычное представление в macOS/Windows для доступности агента, input prerequisites, локальных дисплеев и синхронизации аутентифицированной peer-топологии. macOS может запросить Accessibility от identity агента и всегда повторно проверяет фактический trust; Windows сообщает о blocked desktop без elevation. Probes никогда не регистрируют native capture, race tests не позволяют cached или in-flight probe перезаписать состояние новой сессии, а safety recovery теперь имеет единый fail-closed server budget 20 секунд с более длинными client deadlines.
+- Ограниченный transfer registry без пользовательского контента и строгий двуязычный progress UI macOS/Windows. Process-local public UUID отделён от peer wire identifier; admission отвечает до background scan, counters продвигаются только после reliable send или durable staging acknowledgement, cancellation адресно сверяется с finalization, а public snapshots не содержат file names, paths, hashes, peer identities, endpoints и raw errors.
 
 ### Пока недоступно
 
 - Рабочее или выпущенное приложение macOS ↔ Windows. Input/focus/clipboard/files объединены в pre-alpha agent и есть исходники native UX, но реальная квалификация на двух машинах ещё отсутствует.
-- Подтверждённая runtime-работа Windows agent/WinUI; также отсутствуют release signing, endpoint обновлений/private signing key, защищённое сохранение update state и rollback floor, updater installation/activation/restart/rollback supervision, Windows updater staging/UI, hot-plug layout UX, подробный transfer progress/destinations, durable restart ownership journals и Windows ARM64 execution.
+- Подтверждённая runtime-работа Windows agent/WinUI; также отсутствуют release signing, endpoint обновлений/private signing key, защищённое сохранение update state и rollback floor, updater installation/activation/restart/rollback supervision, Windows updater staging/UI, hot-plug layout UX, receive-destination UX, durable transfer history/restart ownership journals и Windows ARM64 execution.
 - Полные матрицы безопасности, фаззинга, нагрузки, совместимости, обновлений, доступности и реальных устройств; они остаются условиями релиза функционально завершённой версии 1.0.

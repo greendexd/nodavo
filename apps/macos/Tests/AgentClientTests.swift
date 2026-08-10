@@ -147,12 +147,30 @@ import Testing
         "transfer_id":"123e4567-e89b-12d3-a456-426614174000"
     }
     """#.utf8)
-    let response = try JSONDecoder().decode(AgentResponse.self, from: data)
+    let reference = try AgentResponseDecoder.transferAdmission(data)
+    #expect(reference.transferID == "123e4567-e89b-12d3-a456-426614174000")
+    #expect(reference.redactedID == "••••••••-14174000")
 
-    #expect(
-        try AgentResponseDecoder.transferReference(response)
-            == QueuedTransferReference(redactedID: "123e4567…")
-    )
+    for invalid in [
+        #"{"event":"transfer_queued","transfer_id":"123E4567-E89B-12D3-A456-426614174000"}"#,
+        #"{"event":"transfer_queued","transfer_id":"00000000-0000-0000-0000-000000000000"}"#,
+        #"{"event":"transfer_queued","transfer_id":"123e4567-e89b-12d3-a456-426614174000","path":"/private"}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.transferAdmission(Data(invalid.utf8))
+        }
+    }
+}
+
+@Test func transferAdmissionRejectsRawDuplicateKeysIncludingEscapedAliases() {
+    for payload in [
+        #"{"event":"transfer_queued","event":"transfer_queued","transfer_id":"123e4567-e89b-12d3-a456-426614174000"}"#,
+        #"{"event":"transfer_queued","transfer_id":"123e4567-e89b-12d3-a456-426614174000","transfer_\u0069d":"123e4567-e89b-12d3-a456-426614174000"}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.transferAdmission(Data(payload.utf8))
+        }
+    }
 }
 
 @Test func selectedPathsMustBeAbsoluteAndBounded() throws {

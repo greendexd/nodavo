@@ -1,4 +1,4 @@
-<!-- doc-id: privacy; lang: ru; translation-of: privacy.md; revision: 1 -->
+<!-- doc-id: privacy; lang: ru; translation-of: privacy.md; revision: 2 -->
 
 # Конфиденциальность
 
@@ -11,6 +11,8 @@ Nodavo проектируется для прямой работы между pa
 В зависимости от enabled capabilities Nodavo может обрабатывать pointer/keyboard events, clipboard representations, file metadata/content, device identities, display layouts, connection addresses, performance counters и local diagnostic logs.
 
 Input, clipboard и file data отправляются только активному paired peer и только при соответствующей capability. Содержимое не отправляется мейнтейнерам Nodavo.
+
+Локальная проекция transfer progress намеренно не содержит пользовательский контент. Она может показать случайный process-local identifier, direction, phase, ограниченные byte counters, возможность cancellation и фиксированную failure category. Она не содержит file/directory names, paths, hashes, peer identities, network endpoints, timestamps, protocol identifiers или raw platform errors. Current/recent rows ограничены и не являются durable history между перезапусками агента.
 
 ## Логи
 
@@ -27,4 +29,3 @@ Telemetry и crash upload выключены по умолчанию. Если �
 ## Paired peers
 
 Pairing предоставляет другому компьютеру технический доступ к выбранным capabilities. Пользователь должен pair только контролируемые устройства и отзывать trust при потере, передаче, переустановке или подозрении на compromise.
-

@@ -353,6 +353,7 @@ private struct TransfersView: View {
                 .disabled(
                     selectedPaths.isEmpty
                         || model.transferIsBusy
+                        || model.transferSelectionRequiresFreshPicker
                         || model.connectedPeer == nil
                 )
 
@@ -380,9 +381,60 @@ private struct TransfersView: View {
                 }
             }
 
-            Section {
-                Label("transfer_prealpha_notice", systemImage: "hammer")
-                    .foregroundStyle(.secondary)
+            if !model.currentTransfers.isEmpty {
+                Section("transfer_current") {
+                    ForEach(model.currentTransfers) { transfer in
+                        TransferRowView(
+                            transfer: transfer,
+                            cancellationInProgress: model.transferCancellationInProgress
+                                .contains(transfer.transferID),
+                            cancellationNeedsRetry: model.transferCancellationNeedsRetry
+                                .contains(transfer.transferID),
+                            cancellationBlocked: model.transferCancellationAuthority.transferID
+                                .map { $0 != transfer.transferID } ?? false,
+                            cancel: { model.cancelTransfer(transfer.transferID) }
+                        )
+                        .id(transfer.transferID)
+                    }
+                }
+            }
+
+            if !model.recentTransfers.isEmpty {
+                Section("transfer_recent_session") {
+                    ForEach(model.recentTransfers) { transfer in
+                        TransferRowView(
+                            transfer: transfer,
+                            cancellationInProgress: false,
+                            cancellationNeedsRetry: false,
+                            cancellationBlocked: false,
+                            cancel: {}
+                        )
+                        .id(transfer.transferID)
+                    }
+                }
+            }
+
+            if model.currentTransfers.isEmpty && model.recentTransfers.isEmpty {
+                Section("transfer_progress") {
+                    Text("transfer_progress_empty")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if model.transferProgressIsStale || model.transferSession.truncated {
+                Section("transfer_progress") {
+                    if model.transferProgressIsStale {
+                        Label("transfer_progress_stale", systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
+                        Button("transfer_progress_retry") {
+                            model.retryTransferProgress()
+                        }
+                    }
+                    if model.transferSession.truncated {
+                        Label("transfer_progress_truncated", systemImage: "ellipsis.circle")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Section("safety") {
@@ -391,7 +443,11 @@ private struct TransfersView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("section_transfers")
-        .onAppear { model.refresh() }
+        .onAppear {
+            model.refresh()
+            model.setTransfersVisible(true)
+        }
+        .onDisappear { model.setTransfersVisible(false) }
     }
 
     private func chooseFilesAndFolders() {
@@ -413,6 +469,114 @@ private struct TransfersView: View {
         }
         selectedPaths = paths
         model.clearTransferFeedback()
+    }
+}
+
+private struct TransferRowView: View {
+    let transfer: TransferSummary
+    let cancellationInProgress: Bool
+    let cancellationNeedsRetry: Bool
+    let cancellationBlocked: Bool
+    let cancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Label(transfer.direction.localizedKey, systemImage: transfer.direction.symbol)
+                    .font(.headline)
+                Spacer()
+                Text(transfer.phase.localizedKey)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(transfer.redactedID)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(Text("transfer_redacted_id"))
+                .accessibilityValue(Text(transfer.redactedID))
+
+            switch transfer.progressMode {
+            case .determinate(let processed, let total):
+                ProgressView(value: Double(processed), total: Double(total))
+                    .accessibilityLabel(Text("transfer_progress_accessibility"))
+                    .accessibilityValue(Text(bytesText))
+            case .completedEmpty:
+                ProgressView(value: 1, total: 1)
+                    .accessibilityLabel(Text("transfer_progress_accessibility"))
+                    .accessibilityValue(Text("transfer_progress_complete"))
+            case .indeterminate:
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel(Text("transfer_progress_accessibility"))
+                    .accessibilityValue(Text(bytesText))
+            case .hidden:
+                EmptyView()
+            }
+
+            Text(bytesText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let failure = transfer.failure {
+                Label(failure.localizedKey, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+            }
+
+            if cancellationInProgress {
+                ProgressView("transfer_cancelling")
+                    .controlSize(.small)
+            } else if !transfer.phase.isTerminal && transfer.cancellable {
+                Button(cancellationNeedsRetry ? "transfer_cancel_retry" : "transfer_cancel") {
+                    cancel()
+                }
+                .disabled(cancellationBlocked)
+            }
+        }
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var bytesText: String {
+        guard let processed = transfer.processedBytes, let total = transfer.totalBytes else {
+            return transfer.direction == .outbound
+                ? String(localized: "transfer_bytes_outbound_unavailable")
+                : String(localized: "transfer_bytes_inbound_unavailable")
+        }
+        return String.localizedStringWithFormat(
+            String(localized: transfer.direction == .outbound
+                ? "transfer_bytes_outbound"
+                : "transfer_bytes_inbound"),
+            ByteCountFormatter.string(fromByteCount: Int64(processed), countStyle: .file),
+            ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file)
+        )
+    }
+}
+
+private extension TransferDirection {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .inbound: "transfer_direction_inbound"
+        case .outbound: "transfer_direction_outbound"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .inbound: "arrow.down"
+        case .outbound: "arrow.up"
+        }
+    }
+}
+
+private extension TransferPhase {
+    var localizedKey: LocalizedStringKey {
+        LocalizedStringKey("transfer_phase_\(rawValue)")
+    }
+}
+
+private extension TransferFailure {
+    var localizedKey: LocalizedStringKey {
+        LocalizedStringKey("transfer_failure_\(rawValue)")
     }
 }
 

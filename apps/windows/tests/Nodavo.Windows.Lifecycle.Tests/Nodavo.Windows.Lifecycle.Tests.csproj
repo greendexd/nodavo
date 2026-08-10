@@ -13,7 +13,10 @@
     <Compile Include="../../src/Nodavo.Windows/Models/AgentStatusSnapshot.cs" Link="Models/AgentStatusSnapshot.cs" />
     <Compile Include="../../src/Nodavo.Windows/Models/AgentLifecycleState.cs" Link="Models/AgentLifecycleState.cs" />
     <Compile Include="../../src/Nodavo.Windows/Models/AgentServerAuthPolicy.cs" Link="Models/AgentServerAuthPolicy.cs" />
+    <Compile Include="../../src/Nodavo.Windows/Models/TransferSnapshot.cs" Link="Models/TransferSnapshot.cs" />
     <Compile Include="../../src/Nodavo.Windows/Services/AgentStatusDecoder.cs" Link="Services/AgentStatusDecoder.cs" />
+    <Compile Include="../../src/Nodavo.Windows/Services/TransferSnapshotDecoder.cs" Link="Services/TransferSnapshotDecoder.cs" />
     <Compile Include="../../src/Nodavo.Windows/Services/AgentLifecycleCoordinator.cs" Link="Services/AgentLifecycleCoordinator.cs" />
+    <Compile Include="../../src/Nodavo.Windows/ViewModels/TransfersViewModel.cs" Link="ViewModels/TransfersViewModel.cs" />
   </ItemGroup>
 </Project>

@@ -42,6 +42,7 @@ use crate::session_runtime::{
     SessionSafetyState, command_channel, run_peer_session,
 };
 use crate::storage::{DevelopmentStorage, DeviceMaterial, PeerRecord, device_id_text};
+use crate::transfer_status::{TransferListing, TransferRegistryError};
 use crate::transfer_worker::{TransferCleanupState, TransferStore};
 #[cfg(target_os = "windows")]
 use crate::windows::WindowsPlatformPort;
@@ -59,7 +60,6 @@ const SAFETY_RECOVERY_DEADLINE: Duration = Duration::from_secs(5);
 /// One end-to-end ceiling for stop delivery, acknowledgement, and all staged
 /// peer cleanup before the agent latches a fail-closed stopping state.
 const SAFETY_OPERATION_DEADLINE: Duration = Duration::from_secs(20);
-const TRANSFER_PREPARATION_DEADLINE: Duration = Duration::from_mins(5);
 const LOCAL_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
@@ -94,6 +94,10 @@ pub(crate) enum AgentError {
     SafetyRecoveryFailed,
     #[error("the selected file transfer could not be prepared or queued")]
     TransferFailed,
+    #[error("the local transfer does not exist")]
+    TransferNotFound,
+    #[error("the local transfer cannot be cancelled")]
+    TransferNotCancellable,
 }
 
 impl From<WireError> for AgentError {
@@ -419,11 +423,41 @@ impl AgentRuntime {
         .await
         .map_err(|_| AgentError::TransferFailed)?
         .map_err(|_| AgentError::NotConnected)?;
-        timeout(TRANSFER_PREPARATION_DEADLINE, received)
+        timeout(SAFETY_RECOVERY_DEADLINE, received)
             .await
             .map_err(|_| AgentError::TransferFailed)?
             .map_err(|_| AgentError::NotConnected)?
             .map_err(|_| AgentError::TransferFailed)
+    }
+
+    pub(crate) fn transfer_listing(&self) -> TransferListing {
+        self.transfer_store.transfer_listing()
+    }
+
+    pub(crate) async fn cancel_transfer(
+        &self,
+        transfer_id: &str,
+    ) -> Result<TransferListing, AgentError> {
+        let outcome =
+            self.transfer_store
+                .request_cancel(transfer_id)
+                .map_err(|error| match error {
+                    TransferRegistryError::InvalidId | TransferRegistryError::NotFound => {
+                        AgentError::TransferNotFound
+                    }
+                    TransferRegistryError::NotCancellable => AgentError::TransferNotCancellable,
+                    TransferRegistryError::Full
+                    | TransferRegistryError::LifetimeFull
+                    | TransferRegistryError::WireIdCollision => AgentError::TransferFailed,
+                })?;
+        if let Some(target) = outcome.target {
+            if let Some(sender) = self.session_commands.lock().await.clone() {
+                let _ = sender.try_send(LocalSessionCommand::WakeTransferCancellation);
+            }
+            let store = self.transfer_store.clone();
+            tokio::task::spawn_blocking(move || store.cleanup_cancelled_if_offline(target));
+        }
+        Ok(outcome.listing)
     }
 
     pub(crate) fn is_reconnect_request(endpoint: &str) -> bool {
@@ -1391,7 +1425,7 @@ async fn run_platform_session(
     let (native_sender, native_receiver) = native_input_channel();
     let (safety_sender, safety_receiver) = platform_safety_channel();
     let clipboard = native_clipboard_port().map_err(|_| SessionRuntimeError::Platform)?;
-    let transfer = native_transfer_staging(&transfer_store)?;
+    let transfer = native_transfer_staging(&transfer_store, config.peer_device)?;
 
     #[cfg(target_os = "macos")]
     let mut platform = MacPlatformPort::new(native_sender, &safety_sender);
@@ -1425,6 +1459,7 @@ async fn run_platform_session(
 
 fn native_transfer_staging(
     transfer_store: &TransferStore,
+    peer: nodavo_protocol::DeviceId,
 ) -> Result<FileSystemStagingArea, SessionRuntimeError> {
     #[cfg(unix)]
     let state_root = crate::default_state_directory().map_err(|_| SessionRuntimeError::Platform)?;
@@ -1441,9 +1476,10 @@ fn native_transfer_staging(
             .map_err(|_| SessionRuntimeError::Platform)?;
     }
     transfer_store
-        .register_staging_root(inbox.clone())
+        .register_staging_root(peer, inbox.clone())
         .map_err(|_| SessionRuntimeError::Platform)?;
-    FileSystemStagingArea::new(inbox).map_err(|_| SessionRuntimeError::Platform)
+    FileSystemStagingArea::new_scoped(inbox, *peer.as_bytes())
+        .map_err(|_| SessionRuntimeError::Platform)
 }
 
 enum ReconnectMode {
@@ -2108,7 +2144,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         runtime
             .transfer_store
-            .register_staging_root(root.clone())
+            .register_staging_root(protocol_peer, root.clone())
             .unwrap();
         let transfer = TransferId::new();
         let payload = b"offline partial";
@@ -2120,7 +2156,8 @@ mod tests {
         }])
         .unwrap();
         {
-            let mut staging = FileSystemStagingArea::new(&root).unwrap();
+            let mut staging =
+                FileSystemStagingArea::new_scoped(&root, *protocol_peer.as_bytes()).unwrap();
             staging.begin(transfer, &manifest).await.unwrap();
             staging
                 .write(TransferChunk {
@@ -2134,7 +2171,8 @@ mod tests {
         }
         runtime
             .transfer_store
-            .remember_inbound(protocol_peer, transfer);
+            .remember_inbound(protocol_peer, transfer)
+            .unwrap();
 
         runtime
             .set_capability(&peer_id, TrustedCapability::FileTransfer, false)

@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 14 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 15 -->
 
 # Модель безопасности
 
@@ -91,7 +91,8 @@ Private keys по возможности non-exportable и хранятся че
 - Symlinks, junctions, reparse points, sparse/special files отклоняются в 1.0 без отдельной спецификации и тестов.
 - Данные пишутся в private staging, проверяются BLAKE3 и атомарно finalizes.
 - Receive executor допускает к одному staging owner только одну выбранную очередью передачу. Он принимает лишь непустые ограниченные chunks строго со следующего ожидаемого offset, продвигает публичный прогресс без имён файлов только после подтверждённой staging write и запрещает completion, пока не получен каждый объявленный байт файлов.
-- Явная cancellation удаляет только совпадающую active transfer. Неверный identifier, параллельный manifest, gap/overlap offset, преждевременный completion или staging failure отклоняются без продвижения receive state.
+- Process-local public registry допускает каждый authenticated queued/active manifest до его удержания, применяет общий предел 128 nonterminal records и хранит не более 32 terminal records. Его случайный public UUID никогда не равен peer wire UUID и не переиспользуется в течение жизни процесса. Internal no-reuse/tombstone state жёстко ограничен 4 096 accepted generations и 8 192 peer/direction/wire entries; точный retained traffic остаётся idempotent на capacity, а novel identity отклоняется до mutation или acknowledgement. Snapshots не содержат names, paths, hashes, peer identities, endpoints, epochs, timestamps и raw errors и остаются ниже предела local IPC 64 КиБ.
+- Явная cancellation удаляет только совпадающую transfer и линеаризуется с finalization. `cancelled` публикуется только после успешного cleanup; cleanup failure становится sticky `failed/cleanup_failed`, блокирует последующую file work и не может быть повторно выдан за успех. Неверный identifier, параллельный manifest, gap/overlap offset, преждевременный completion или staging failure отклоняются без продвижения receive state.
 - Существующие файлы не перезаписываются молча.
 - Полученные файлы не запускаются и не открываются автоматически.
 - Per-peer quotas, cancellation, backpressure и rate limits ограничивают DoS.
@@ -100,7 +101,7 @@ Pre-alpha receiver пишет через capability-rooted no-follow handles к�
 
 Исходный выбор закрепляется no-follow handles до canonicalization. Enumeration, manifest accounting, hashing, chunks, roots, stable file identities и cooperative cancellation ограничены. Links, reparse points, sparse/special files, overlapping roots, hard-link aliases, mutations, cycles и cross-platform path collisions отклоняются fail-closed. Publication никогда не перезаписывает существующий destination. Если поздняя ошибка многофайловой publication или cleanup делает безопасный rollback неоднозначным, staging owner переходит в poisoned state, а уже опубликованные Nodavo identities сохраняются для явного исправления вместо удаления потенциально подменённого pathname.
 
-Работающий агент связывает входящий transfer ID с peer только после аутентифицированного и разрешённого manifest и сохраняет эту peer-scoped связь при потере соединения. Revocation ждёт завершения workers и освобождения staging lease, затем удаляет только IDs, известные для этого peer. Durable peer-ownership journal между перезапусками агента пока не реализован; неизвестный persisted ID никогда не удаляется лишь потому, что peer предъявил его UUID. Outbound persistence между перезапусками процесса и durable persistence poisoned state также остаются stable-release gates.
+Работающий агент связывает входящий transfer ID с peer только после аутентифицированного и разрешённого manifest и сохраняет эту peer-scoped связь при потере соединения. Каждая persistent device identity получает отдельный private staging namespace, поэтому другой peer с тем же wire UUID не может resume, finalize или discard это состояние; legacy unscoped staging не мигрируется. Revocation ждёт завершения workers и освобождения staging lease, затем удаляет только IDs, известные для этого peer. Process-lifetime completed/cancelled tombstones отклоняют reannouncement после reconnect, но public history, выбранные outbound sources, cancellation tombstones после перезапуска процесса и durable persistence poisoned state по-прежнему остаются stable-release gates.
 
 ## Локальный IPC
 

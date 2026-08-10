@@ -162,6 +162,7 @@ pub(crate) enum LocalSessionCommand {
         paths: Vec<PathBuf>,
         acknowledgement: oneshot::Sender<Result<TransferId, TransferError>>,
     },
+    WakeTransferCancellation,
     LocalInput(InputEvent),
 }
 
@@ -431,7 +432,12 @@ impl PeerSession<'_> {
                         self.force_recovery(Event::LocalEmergencyStop).await?;
                         return Err(SessionRuntimeError::Platform);
                     };
-                    self.handle_transfer_worker_event(event).await?;
+                    if let Err(error) = self.handle_transfer_worker_event(event).await {
+                        if transfer_send_failure_is_link_loss(error) {
+                            self.force_recovery(Event::LinkDisconnected).await?;
+                        }
+                        return Err(error);
+                    }
                 }
                 event = self.connection.next_event() => {
                     let event = match event {
@@ -547,6 +553,9 @@ impl PeerSession<'_> {
                 } else {
                     self.transfer.try_start_outbound(paths, acknowledgement);
                 }
+            }
+            LocalSessionCommand::WakeTransferCancellation => {
+                self.transfer.try_wake_cancellation()?;
             }
             LocalSessionCommand::LocalInput(event) => {
                 self.handle_local_input(event).await?;
@@ -1298,12 +1307,20 @@ impl PeerSession<'_> {
         event: TransferWorkerEvent,
     ) -> Result<(), SessionRuntimeError> {
         match event {
-            TransferWorkerEvent::SendManifest(payload) => {
+            TransferWorkerEvent::SendManifest { payload, update } => {
                 self.send_reliable(self.channels.file_manifest, payload)
-                    .await
+                    .await?;
+                if let Some(update) = update {
+                    self.transfer.reliable_send_succeeded(update);
+                }
+                Ok(())
             }
-            TransferWorkerEvent::SendData(payload) => {
-                self.send_reliable(self.channels.file_data, payload).await
+            TransferWorkerEvent::SendData { payload, update } => {
+                self.send_reliable(self.channels.file_data, payload).await?;
+                // Public outbound progress advances only after the reliable
+                // transport accepts the exact frame.
+                self.transfer.reliable_send_succeeded(update);
+                Ok(())
             }
             TransferWorkerEvent::Fatal(error) => Err(error.into()),
         }
@@ -1399,6 +1416,10 @@ impl PeerSession<'_> {
         publish_session_topology_readiness(self.status, self.session_safety.as_ref(), readiness)
             .await
     }
+}
+
+const fn transfer_send_failure_is_link_loss(error: SessionRuntimeError) -> bool {
+    matches!(error, SessionRuntimeError::Transport)
 }
 
 async fn publish_session_topology_readiness(
@@ -1832,6 +1853,22 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn transfer_reliable_send_transport_failure_is_link_loss_only() {
+        assert!(transfer_send_failure_is_link_loss(
+            SessionRuntimeError::Transport
+        ));
+        assert!(!transfer_send_failure_is_link_loss(
+            SessionRuntimeError::ProtocolViolation
+        ));
+        assert!(!transfer_send_failure_is_link_loss(
+            SessionRuntimeError::Platform
+        ));
+        assert!(!transfer_send_failure_is_link_loss(
+            SessionRuntimeError::SafetyRecoveryFailed
+        ));
+    }
+
     struct MemoryConnection {
         remote: Endpoint,
         inbound: mpsc::UnboundedReceiver<TransportEvent>,
@@ -1954,13 +1991,16 @@ mod tests {
         }
     }
 
-    fn test_transfer_staging() -> (FileSystemStagingArea, PathBuf) {
+    fn test_transfer_staging(owner: DeviceId) -> (FileSystemStagingArea, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "nodavo-session-transfer-test-{}",
             nodavo_transfer::TransferId::new().as_uuid()
         ));
         fs::create_dir(&root).unwrap();
-        (FileSystemStagingArea::new(&root).unwrap(), root)
+        (
+            FileSystemStagingArea::new_scoped(&root, *owner.as_bytes()).unwrap(),
+            root,
+        )
     }
 
     async fn wait_for_owner(status: &RwLock<AgentStatus>, owner: InputOwner) {
@@ -2054,15 +2094,17 @@ mod tests {
             crate::clipboard_port::VirtualClipboardPort::with_local_text(1, &clipboard_content);
         let (b_clipboard, b_clipboard_observer) =
             crate::clipboard_port::VirtualClipboardPort::empty();
-        let (a_transfer, a_transfer_root) = test_transfer_staging();
-        let (b_transfer, b_transfer_root) = test_transfer_staging();
+        let a_peer = DeviceId::new([2; 32]);
+        let b_peer = DeviceId::new([1; 32]);
+        let (a_transfer, a_transfer_root) = test_transfer_staging(a_peer);
+        let (b_transfer, b_transfer_root) = test_transfer_staging(b_peer);
         let a_transfer_store = TransferStore::default();
         a_transfer_store
-            .register_staging_root(a_transfer_root.clone())
+            .register_staging_root(a_peer, a_transfer_root.clone())
             .unwrap();
         let b_transfer_store = TransferStore::default();
         b_transfer_store
-            .register_staging_root(b_transfer_root.clone())
+            .register_staging_root(b_peer, b_transfer_root.clone())
             .unwrap();
         let outbound_path = a_transfer_root.join("session-transfer-proof.txt");
         let outbound_content = b"authenticated session file transfer proof";

@@ -22,6 +22,12 @@ use nodavo_transfer::{
 };
 use thiserror::Error;
 
+use crate::transfer_status::MAX_LIFETIME_TRANSFER_IDENTITIES;
+
+const MAX_COMPLETED_INBOUND_TOMBSTONES: usize = MAX_LIFETIME_TRANSFER_IDENTITIES;
+const MAX_REJECTED_INBOUND_TOMBSTONES: usize = MAX_LIFETIME_TRANSFER_IDENTITIES * 2;
+const MAX_CANCELLED_OUTBOUND_TOMBSTONES: usize = MAX_LIFETIME_TRANSFER_IDENTITIES;
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub(crate) enum TransferRuntimeError {
     #[error("file-transfer frame or type conversion failed validation")]
@@ -45,6 +51,10 @@ pub(crate) enum TransferRuntimeError {
 /// Filename-free actions for the session/transport integration layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransferRuntimeEffect {
+    Admitted {
+        transfer: WireTransferId,
+        total_bytes: u64,
+    },
     Started {
         transfer: WireTransferId,
     },
@@ -73,6 +83,12 @@ pub(crate) enum TransferRuntimeEffect {
     Completed {
         transfer: WireTransferId,
     },
+    /// Durable bytes and the authenticated peer terminal marker are both
+    /// present. The worker must linearize finalization against local cancel
+    /// before invoking slow integrity verification/publication.
+    FinalizeRequired {
+        transfer: WireTransferId,
+    },
     Cancelled {
         transfer: WireTransferId,
     },
@@ -97,6 +113,10 @@ pub(crate) enum TransferRuntimeEffect {
     CompletionAcknowledgementRequired {
         transfer: WireTransferId,
     },
+    RejectionAcknowledgementRequired {
+        transfer: WireTransferId,
+    },
+    AdvanceQueue,
 }
 
 #[derive(Clone, Copy)]
@@ -119,9 +139,12 @@ pub(crate) struct PeerTransferRuntime<S> {
     pending_manifests: HashMap<TransferId, TransferManifest>,
     pending_completion: HashSet<TransferId>,
     completed_inbound: HashSet<TransferId>,
+    rejected_inbound: HashSet<TransferId>,
+    cancelled_outbound: HashSet<TransferId>,
     known_persisted_inbound: HashSet<TransferId>,
     allow_untracked_persisted_resume: bool,
     backpressured: HashSet<TransferId>,
+    deferred_queue_effects: VecDeque<QueueEffect>,
     inbound_manifest_sequence: Option<Sequence>,
     inbound_resume_sequence: Option<Sequence>,
     inbound_data_sequence: Option<Sequence>,
@@ -164,9 +187,12 @@ where
             pending_manifests: HashMap::new(),
             pending_completion: HashSet::new(),
             completed_inbound: HashSet::new(),
+            rejected_inbound: HashSet::new(),
+            cancelled_outbound: HashSet::new(),
             known_persisted_inbound: HashSet::new(),
             allow_untracked_persisted_resume: true,
             backpressured: HashSet::new(),
+            deferred_queue_effects: VecDeque::new(),
             inbound_manifest_sequence: None,
             inbound_resume_sequence: None,
             inbound_data_sequence: None,
@@ -195,7 +221,7 @@ where
         if local_allows_peer_transfer {
             Ok(Vec::new())
         } else {
-            Ok(self.abort_inbound())
+            self.abort_inbound()
         }
     }
 
@@ -225,15 +251,30 @@ where
                 entry_index,
                 offset,
                 ..
-            } => Ok(vec![TransferRuntimeEffect::PeerResumeRequested {
-                transfer,
-                entry_index,
-                offset,
-            }]),
+            } => {
+                let core = transfer_from_wire(transfer)?;
+                if self.cancelled_outbound.contains(&core) {
+                    Ok(Vec::new())
+                } else {
+                    Ok(vec![TransferRuntimeEffect::PeerResumeRequested {
+                        transfer,
+                        entry_index,
+                        offset,
+                    }])
+                }
+            }
             FileManifestMessage::Cancel { transfer, .. } => {
                 let core = transfer_from_wire(transfer)?;
-                if self.queue.get(core).is_some() {
+                if self.rejected_inbound.contains(&core) {
+                    Ok(Vec::new())
+                } else if self.completed_inbound.contains(&core) {
+                    Ok(vec![
+                        TransferRuntimeEffect::CompletionAcknowledgementRequired { transfer },
+                    ])
+                } else if self.queue.get(core).is_some() {
                     self.receive_cancel(transfer).await
+                } else if self.cancelled_outbound.contains(&core) {
+                    Ok(Vec::new())
                 } else {
                     Ok(vec![TransferRuntimeEffect::PeerCancelRequested {
                         transfer,
@@ -242,8 +283,18 @@ where
             }
             FileManifestMessage::Complete { transfer, .. } => {
                 let core = transfer_from_wire(transfer)?;
-                if self.queue.get(core).is_some() {
-                    self.receive_complete(transfer).await
+                if self.rejected_inbound.contains(&core) {
+                    Ok(vec![
+                        TransferRuntimeEffect::RejectionAcknowledgementRequired { transfer },
+                    ])
+                } else if self.completed_inbound.contains(&core) {
+                    Ok(vec![
+                        TransferRuntimeEffect::CompletionAcknowledgementRequired { transfer },
+                    ])
+                } else if self.queue.get(core).is_some() {
+                    self.receive_complete(transfer)
+                } else if self.cancelled_outbound.contains(&core) {
+                    Ok(Vec::new())
                 } else {
                     Ok(vec![TransferRuntimeEffect::PeerCompleteAcknowledged {
                         transfer,
@@ -274,6 +325,9 @@ where
             return Err(TransferRuntimeError::Protocol);
         };
         let transfer = transfer_from_wire(transfer)?;
+        if self.rejected_inbound.contains(&transfer) || self.completed_inbound.contains(&transfer) {
+            return Ok(Vec::new());
+        }
         let chunk = TransferChunk {
             transfer,
             entry_index,
@@ -308,13 +362,9 @@ where
         if snapshot.completed_bytes() == snapshot.total_bytes()
             && self.pending_completion.remove(&transfer)
         {
-            self.receiver.complete(transfer).await?;
-            let queue_effects = self.queue.complete(transfer)?;
-            effects.push(TransferRuntimeEffect::Completed {
+            effects.push(TransferRuntimeEffect::FinalizeRequired {
                 transfer: transfer_to_wire(transfer),
             });
-            self.apply_queue_effects(queue_effects, &mut effects)
-                .await?;
         }
         Ok(effects)
     }
@@ -337,6 +387,41 @@ where
     #[must_use]
     pub(crate) fn outbound_authorized(&self) -> bool {
         self.peer_capabilities.contains(Capability::FILE_TRANSFER)
+    }
+
+    /// Seeds process-lifetime terminal bindings into a new authenticated
+    /// session runtime. The owning store keeps these bindings peer-scoped.
+    pub(crate) fn remember_completed_inbound(
+        &mut self,
+        transfers: &[TransferId],
+    ) -> Result<(), TransferRuntimeError> {
+        extend_bounded_tombstones(
+            &mut self.completed_inbound,
+            transfers,
+            MAX_COMPLETED_INBOUND_TOMBSTONES,
+        )
+    }
+
+    pub(crate) fn remember_rejected_inbound(
+        &mut self,
+        transfers: &[TransferId],
+    ) -> Result<(), TransferRuntimeError> {
+        extend_bounded_tombstones(
+            &mut self.rejected_inbound,
+            transfers,
+            MAX_REJECTED_INBOUND_TOMBSTONES,
+        )
+    }
+
+    pub(crate) fn remember_cancelled_outbound(
+        &mut self,
+        transfers: &[TransferId],
+    ) -> Result<(), TransferRuntimeError> {
+        extend_bounded_tombstones(
+            &mut self.cancelled_outbound,
+            transfers,
+            MAX_CANCELLED_OUTBOUND_TOMBSTONES,
+        )
     }
 
     /// Encodes one authenticated exact resume/acceptance control.
@@ -370,6 +455,22 @@ where
         encode_file_manifest(&FileManifestMessage::Cancel {
             meta: self.next_response_meta()?,
             transfer,
+            reason,
+        })
+        .map_err(|_| TransferRuntimeError::Protocol)
+    }
+
+    /// Encodes a locally initiated cancellation for a selected outbound
+    /// source on the sender's authenticated manifest sequence lane.
+    pub(crate) fn encode_outbound_cancel_frame(
+        &mut self,
+        transfer: TransferId,
+        reason: u16,
+    ) -> Result<Vec<u8>, TransferRuntimeError> {
+        self.require_peer_transfer_grant()?;
+        encode_file_manifest(&FileManifestMessage::Cancel {
+            meta: self.next_manifest_meta()?,
+            transfer: transfer_to_wire(transfer),
             reason,
         })
         .map_err(|_| TransferRuntimeError::Protocol)
@@ -450,11 +551,13 @@ where
         self.queue.len()
     }
 
-    pub(crate) fn abort_inbound(&mut self) -> Vec<TransferRuntimeEffect> {
+    pub(crate) fn abort_inbound(
+        &mut self,
+    ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
         let mut transfers = HashSet::new();
         if let Some(snapshot) = self.receiver.snapshot() {
             let transfer = snapshot.transfer();
-            let _ = self.receiver.cancel(transfer);
+            self.receiver.cancel(transfer)?;
             transfers.insert(transfer);
         }
         transfers.extend(self.pending_manifests.keys().copied());
@@ -465,12 +568,12 @@ where
         self.queue = TransferQueue::new(1).expect("the fixed active limit is valid");
         let mut transfers = transfers.into_iter().collect::<Vec<_>>();
         transfers.sort_unstable_by_key(|transfer| transfer.as_bytes());
-        transfers
+        Ok(transfers
             .into_iter()
             .map(|transfer| TransferRuntimeEffect::Cancelled {
                 transfer: transfer_to_wire(transfer),
             })
-            .collect()
+            .collect())
     }
 
     #[must_use]
@@ -480,12 +583,78 @@ where
             .map(nodavo_transfer::ActiveReceiveSnapshot::transfer)
     }
 
+    #[must_use]
+    pub(crate) fn has_inbound_transfer(&self, transfer: TransferId) -> bool {
+        self.queue.get(transfer).is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn active_inbound_progress(&self) -> Option<(TransferId, u64, u64)> {
+        self.receiver.snapshot().map(|snapshot| {
+            (
+                snapshot.transfer(),
+                snapshot.completed_bytes(),
+                snapshot.total_bytes(),
+            )
+        })
+    }
+
+    pub(crate) async fn finalize_inbound(
+        &mut self,
+        transfer: TransferId,
+    ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
+        self.receiver.complete(transfer).await?;
+        self.pending_completion.remove(&transfer);
+        let queue_effects = self.queue.complete(transfer)?;
+        if !self.deferred_queue_effects.is_empty() {
+            return Err(TransferRuntimeError::Protocol);
+        }
+        self.deferred_queue_effects.extend(queue_effects);
+        Ok(vec![
+            TransferRuntimeEffect::Completed {
+                transfer: transfer_to_wire(transfer),
+            },
+            TransferRuntimeEffect::AdvanceQueue,
+        ])
+    }
+
+    pub(crate) async fn advance_queue(
+        &mut self,
+    ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
+        let queue_effects = self.deferred_queue_effects.drain(..).collect();
+        let mut effects = Vec::new();
+        self.apply_queue_effects(queue_effects, &mut effects)
+            .await?;
+        Ok(effects)
+    }
+
+    pub(crate) async fn cancel_inbound(
+        &mut self,
+        transfer: TransferId,
+    ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
+        self.receive_cancel(transfer_to_wire(transfer)).await
+    }
+
     async fn receive_manifest(
         &mut self,
         wire_transfer: WireTransferId,
         entries: Vec<WireManifestEntry>,
     ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
         let transfer = transfer_from_wire(wire_transfer)?;
+        if self.completed_inbound.contains(&transfer) {
+            return Ok(vec![
+                TransferRuntimeEffect::CompletionAcknowledgementRequired {
+                    transfer: wire_transfer,
+                },
+            ]);
+        }
+        if self.rejected_inbound.contains(&transfer) {
+            return Ok(vec![
+                TransferRuntimeEffect::RejectionAcknowledgementRequired {
+                    transfer: wire_transfer,
+                },
+            ]);
+        }
         let manifest = manifest_from_wire(entries)?;
         self.enqueue_manifest(wire_transfer, transfer, manifest)
             .await
@@ -501,6 +670,7 @@ where
         let queue_effects = match self.queue.enqueue(transfer, total_bytes) {
             Ok(effects) => effects,
             Err(TransferError::QueueFull) => {
+                self.remember_rejected_inbound(&[transfer])?;
                 return Ok(vec![TransferRuntimeEffect::QueueSaturated {
                     transfer: wire_transfer,
                 }]);
@@ -508,7 +678,10 @@ where
             Err(error) => return Err(error.into()),
         };
         self.pending_manifests.insert(transfer, manifest);
-        let mut effects = Vec::new();
+        let mut effects = vec![TransferRuntimeEffect::Admitted {
+            transfer: wire_transfer,
+            total_bytes,
+        }];
         if queue_effects.is_empty() {
             self.backpressured.insert(transfer);
             effects.push(TransferRuntimeEffect::Backpressured {
@@ -548,7 +721,7 @@ where
         Ok(effects)
     }
 
-    async fn receive_complete(
+    fn receive_complete(
         &mut self,
         wire_transfer: WireTransferId,
     ) -> Result<Vec<TransferRuntimeEffect>, TransferRuntimeError> {
@@ -569,14 +742,9 @@ where
             self.pending_completion.insert(transfer);
             return Ok(Vec::new());
         }
-        self.receiver.complete(transfer).await?;
-        let queue_effects = self.queue.complete(transfer)?;
-        let mut effects = vec![TransferRuntimeEffect::Completed {
+        Ok(vec![TransferRuntimeEffect::FinalizeRequired {
             transfer: wire_transfer,
-        }];
-        self.apply_queue_effects(queue_effects, &mut effects)
-            .await?;
-        Ok(effects)
+        }])
     }
 
     async fn apply_queue_effects(
@@ -684,6 +852,8 @@ where
             | FileManifestMessage::Complete { transfer, .. } => {
                 let transfer = transfer_from_wire(*transfer)?;
                 self.queue.get(transfer).is_none()
+                    && !self.rejected_inbound.contains(&transfer)
+                    && !self.completed_inbound.contains(&transfer)
             }
             FileManifestMessage::Manifest { .. } | FileManifestMessage::Unknown { .. } => false,
         };
@@ -731,6 +901,23 @@ where
     }
 }
 
+fn extend_bounded_tombstones(
+    retained: &mut HashSet<TransferId>,
+    transfers: &[TransferId],
+    limit: usize,
+) -> Result<(), TransferRuntimeError> {
+    let new = transfers
+        .iter()
+        .copied()
+        .filter(|transfer| !retained.contains(transfer))
+        .collect::<HashSet<_>>();
+    if retained.len().saturating_add(new.len()) > limit {
+        return Err(TransferRuntimeError::Backpressure);
+    }
+    retained.extend(new);
+    Ok(())
+}
+
 impl<S> PeerTransferRuntime<S>
 where
     S: ResumableStagingArea,
@@ -754,6 +941,11 @@ where
         if self.completed_inbound.contains(&core_transfer) {
             return Ok(vec![
                 TransferRuntimeEffect::CompletionAcknowledgementRequired { transfer },
+            ]);
+        }
+        if self.rejected_inbound.contains(&core_transfer) {
+            return Ok(vec![
+                TransferRuntimeEffect::RejectionAcknowledgementRequired { transfer },
             ]);
         }
         let manifest = manifest_from_wire(entries)?;
@@ -793,9 +985,15 @@ where
             .receiver
             .resume_state()
             .ok_or(TransferRuntimeError::Protocol)?;
-        let mut effects = vec![TransferRuntimeEffect::Started {
-            transfer: transfer_to_wire(transfer),
-        }];
+        let mut effects = vec![
+            TransferRuntimeEffect::Admitted {
+                transfer: transfer_to_wire(transfer),
+                total_bytes: snapshot.total_bytes(),
+            },
+            TransferRuntimeEffect::Started {
+                transfer: transfer_to_wire(transfer),
+            },
+        ];
         if snapshot.completed_bytes() != 0 {
             effects.push(TransferRuntimeEffect::Progress {
                 transfer: transfer_to_wire(transfer),
@@ -813,12 +1011,6 @@ where
             });
         }
         Ok(effects)
-    }
-
-    /// Seeds process-lifetime completion tombstones into a new authenticated
-    /// session runtime. The set is bounded by the owning transfer store.
-    pub(crate) fn remember_completed_inbound(&mut self, transfers: &[TransferId]) {
-        self.completed_inbound.extend(transfers.iter().copied());
     }
 
     pub(crate) fn configure_persisted_resume(
@@ -912,6 +1104,8 @@ mod tests {
         bytes: Vec<u8>,
         completed: Vec<TransferId>,
         cancelled: Vec<TransferId>,
+        begin_count: usize,
+        fail_begin_at: Option<usize>,
     }
 
     impl StagingArea for MemoryStaging {
@@ -921,6 +1115,10 @@ mod tests {
             _manifest: &'a TransferManifest,
         ) -> TransferFuture<'a, Result<(), TransferError>> {
             Box::pin(async move {
+                if self.fail_begin_at == Some(self.begin_count) {
+                    return Err(TransferError::Platform);
+                }
+                self.begin_count = self.begin_count.saturating_add(1);
                 if self.active.replace(transfer).is_some() {
                     return Err(TransferError::TransferNotActive);
                 }
@@ -996,6 +1194,16 @@ mod tests {
         )
     }
 
+    fn response_meta(sequence: u64) -> EventMeta {
+        EventMeta::new(
+            SESSION,
+            PEER,
+            Sequence::new(sequence),
+            PEER_EPOCH,
+            Capability::FILE_TRANSFER,
+        )
+    }
+
     fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "nodavo-agent-transfer-test-{}",
@@ -1061,6 +1269,10 @@ mod tests {
         assert_eq!(
             effects,
             [
+                TransferRuntimeEffect::Admitted {
+                    transfer,
+                    total_bytes: 2,
+                },
                 TransferRuntimeEffect::Started { transfer },
                 TransferRuntimeEffect::ResumeRequired {
                     transfer,
@@ -1090,7 +1302,17 @@ mod tests {
         });
         assert_eq!(
             runtime.receive_manifest_frame(&complete).await.unwrap(),
-            [TransferRuntimeEffect::Completed { transfer }]
+            [TransferRuntimeEffect::FinalizeRequired { transfer }]
+        );
+        assert_eq!(
+            runtime
+                .finalize_inbound(TransferId::from_bytes(*transfer.as_bytes()))
+                .await
+                .unwrap(),
+            [
+                TransferRuntimeEffect::Completed { transfer },
+                TransferRuntimeEffect::AdvanceQueue,
+            ]
         );
         assert_eq!(
             runtime.receive_manifest_frame(&complete).await,
@@ -1183,7 +1405,13 @@ mod tests {
                 .receive_manifest_frame(&encode_manifest(&wire_manifest(2, second, b"b")))
                 .await
                 .unwrap(),
-            [TransferRuntimeEffect::Backpressured { transfer: second }]
+            [
+                TransferRuntimeEffect::Admitted {
+                    transfer: second,
+                    total_bytes: 1,
+                },
+                TransferRuntimeEffect::Backpressured { transfer: second },
+            ]
         );
         assert_eq!(
             runtime
@@ -1259,8 +1487,235 @@ mod tests {
                     completed_bytes: 7,
                     total_bytes: 7,
                 },
-                TransferRuntimeEffect::Completed { transfer },
+                TransferRuntimeEffect::FinalizeRequired { transfer },
             ]
+        );
+        assert_eq!(
+            runtime
+                .finalize_inbound(TransferId::from_bytes(*transfer.as_bytes()))
+                .await
+                .unwrap(),
+            [
+                TransferRuntimeEffect::Completed { transfer },
+                TransferRuntimeEffect::AdvanceQueue,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn earned_completion_precedes_a_later_queued_begin_failure() {
+        let first = wire_transfer(51);
+        let second = wire_transfer(52);
+        let mut runtime = PeerTransferRuntime::new(
+            PeerTransferConfig {
+                local_device: LOCAL,
+                peer_device: PEER,
+                session_id: SESSION,
+                local_grant_epoch: LOCAL_EPOCH,
+                peer_grant_epoch: PEER_EPOCH,
+                local_allows_peer_transfer: true,
+                peer_capabilities: Capability::FILE_TRANSFER,
+            },
+            MemoryStaging {
+                fail_begin_at: Some(1),
+                ..MemoryStaging::default()
+            },
+        );
+        runtime
+            .receive_manifest_frame(&encode_manifest(&wire_manifest(1, first, b"a")))
+            .await
+            .unwrap();
+        runtime
+            .receive_manifest_frame(&encode_manifest(&wire_manifest(2, second, b"b")))
+            .await
+            .unwrap();
+        runtime
+            .receive_data_frame(&encode_chunk(1, first, b"a"))
+            .await
+            .unwrap();
+        let complete = encode_manifest(&FileManifestMessage::Complete {
+            meta: meta(3),
+            transfer: first,
+        });
+        assert_eq!(
+            runtime.receive_manifest_frame(&complete).await.unwrap(),
+            [TransferRuntimeEffect::FinalizeRequired { transfer: first }]
+        );
+        assert_eq!(
+            runtime
+                .finalize_inbound(TransferId::from_bytes(*first.as_bytes()))
+                .await
+                .unwrap(),
+            [
+                TransferRuntimeEffect::Completed { transfer: first },
+                TransferRuntimeEffect::AdvanceQueue,
+            ]
+        );
+        assert_eq!(
+            runtime.advance_queue().await,
+            Err(TransferRuntimeError::Transfer(TransferError::Platform))
+        );
+        assert_eq!(
+            runtime.into_staging().completed,
+            [TransferId::from_bytes(*first.as_bytes())]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_inbound_absorbs_bounded_late_frames_without_affecting_unrelated_work() {
+        let cancelled = wire_transfer(53);
+        let unrelated = wire_transfer(54);
+        let mut runtime = runtime();
+        runtime
+            .remember_rejected_inbound(&[TransferId::from_bytes(*cancelled.as_bytes())])
+            .unwrap();
+
+        assert!(
+            runtime
+                .receive_data_frame(&encode_chunk(1, cancelled, b"late"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let late_complete = encode_manifest(&FileManifestMessage::Complete {
+            meta: meta(1),
+            transfer: cancelled,
+        });
+        assert_eq!(
+            runtime
+                .receive_manifest_frame(&late_complete)
+                .await
+                .unwrap(),
+            [TransferRuntimeEffect::RejectionAcknowledgementRequired {
+                transfer: cancelled,
+            }]
+        );
+        assert_eq!(
+            runtime
+                .receive_manifest_frame(&encode_manifest(&wire_manifest(2, cancelled, b"late",)))
+                .await
+                .unwrap(),
+            [TransferRuntimeEffect::RejectionAcknowledgementRequired {
+                transfer: cancelled,
+            }]
+        );
+
+        assert!(matches!(
+            runtime
+                .receive_manifest_frame(&encode_manifest(&wire_manifest(
+                    3,
+                    unrelated,
+                    b"ok",
+                )))
+                .await
+                .unwrap()
+                .as_slice(),
+            [
+                TransferRuntimeEffect::Admitted { transfer, .. },
+                TransferRuntimeEffect::Started { .. },
+                ..
+            ] if *transfer == unrelated
+        ));
+        assert!(matches!(
+            runtime
+                .receive_data_frame(&encode_chunk(2, unrelated, b"ok"))
+                .await
+                .unwrap()
+                .as_slice(),
+            [TransferRuntimeEffect::Progress {
+                transfer,
+                completed_bytes: 2,
+                total_bytes: 2,
+            }] if *transfer == unrelated
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_outbound_absorbs_only_exact_late_responses() {
+        let cancelled = wire_transfer(55);
+        let unknown = wire_transfer(56);
+        let mut runtime = runtime();
+        runtime
+            .remember_cancelled_outbound(&[TransferId::from_bytes(*cancelled.as_bytes())])
+            .unwrap();
+
+        let late_resume = encode_manifest(&FileManifestMessage::Resume {
+            meta: response_meta(1),
+            transfer: cancelled,
+            entry_index: 0,
+            offset: 0,
+        });
+        assert!(
+            runtime
+                .receive_manifest_frame(&late_resume)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let late_complete = encode_manifest(&FileManifestMessage::Complete {
+            meta: response_meta(2),
+            transfer: cancelled,
+        });
+        assert!(
+            runtime
+                .receive_manifest_frame(&late_complete)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let late_cancel = encode_manifest(&FileManifestMessage::Cancel {
+            meta: response_meta(3),
+            transfer: cancelled,
+            reason: 0,
+        });
+        assert!(
+            runtime
+                .receive_manifest_frame(&late_cancel)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let unknown_resume = encode_manifest(&FileManifestMessage::Resume {
+            meta: response_meta(4),
+            transfer: unknown,
+            entry_index: 0,
+            offset: 0,
+        });
+        assert_eq!(
+            runtime
+                .receive_manifest_frame(&unknown_resume)
+                .await
+                .unwrap(),
+            [TransferRuntimeEffect::PeerResumeRequested {
+                transfer: unknown,
+                entry_index: 0,
+                offset: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn session_tombstone_sets_fail_before_exceeding_hard_caps() {
+        let mut runtime = runtime();
+        let rejected = (0..MAX_REJECTED_INBOUND_TOMBSTONES)
+            .map(|index| {
+                let mut bytes = [0_u8; 16];
+                bytes[..8].copy_from_slice(&u64::try_from(index + 1).unwrap().to_le_bytes());
+                TransferId::from_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        runtime.remember_rejected_inbound(&rejected).unwrap();
+        runtime.remember_rejected_inbound(&rejected[..1]).unwrap();
+        let mut novel = [0_u8; 16];
+        novel[8..].copy_from_slice(&1_u64.to_le_bytes());
+        assert_eq!(
+            runtime.remember_rejected_inbound(&[TransferId::from_bytes(novel)]),
+            Err(TransferRuntimeError::Backpressure)
+        );
+        assert_eq!(
+            runtime.rejected_inbound.len(),
+            MAX_REJECTED_INBOUND_TOMBSTONES
         );
     }
 
@@ -1424,6 +1879,10 @@ mod tests {
         assert_eq!(
             effects,
             [
+                TransferRuntimeEffect::Admitted {
+                    transfer: wire_transfer(15),
+                    total_bytes: payload.len() as u64,
+                },
                 TransferRuntimeEffect::Started {
                     transfer: wire_transfer(15),
                 },

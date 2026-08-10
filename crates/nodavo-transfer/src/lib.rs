@@ -338,6 +338,21 @@ pub trait StagingArea: Send {
     fn finalize(&mut self, transfer: TransferId) -> TransferFuture<'_, Result<(), TransferError>>;
 
     fn abort(&mut self, transfer: TransferId);
+
+    /// Aborts staging and confirms that cleanup completed.
+    ///
+    /// In-memory implementations may rely on the default. Filesystem-backed
+    /// implementations must override this method so callers never publish a
+    /// cancelled terminal state after a hidden cleanup failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the staging implementation's cleanup error. Callers must treat
+    /// any error as irreversible for that staging instance.
+    fn abort_confirmed(&mut self, transfer: TransferId) -> Result<(), TransferError> {
+        self.abort(transfer);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

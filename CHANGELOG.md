@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 12 -->
+<!-- doc-id: changelog; lang: en; revision: 13 -->
 
 # Changelog
 
@@ -32,9 +32,10 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 - A fail-closed x64+ARM64 Windows development MSIXBundle pipeline, plus a signed-update state-machine core with bounded staging, consent, rollback-floor, and restart/health contracts.
 - An unconfigured-by-default, non-activating update slice with a compile-time pinned HTTPS manifest endpoint and Ed25519 public key, native platform TLS without redirects or decompression, signed-manifest and same-origin-artifact checks, exact offer-UUID consent, and resumable digest-verified private capability-root staging with a cross-process lease, quotas, retention, and fsync. The macOS Settings UI can check, refresh/poll progress, report up-to-date, consent or decline an exact offer, resume a paused download, and report verified staging in English and Russian without exposing a URL, path, or hash.
 - A strict content-free readiness contract and bilingual macOS/Windows presentation for agent reachability, input prerequisites, local displays, and authenticated peer-topology synchronization. macOS can request Accessibility from the agent identity and always rechecks actual trust; Windows reports blocked desktops without elevation. Probes never register native capture, race tests prevent cached or in-flight probes from overwriting a new session state, and safety recovery now has one fail-closed 20-second server budget with client deadlines above it.
+- A bounded content-free transfer registry and strict bilingual macOS/Windows progress UI. Process-local public UUIDs are distinct from peer wire identifiers; admission returns before background scanning, counters advance only after reliable send or durable staging acknowledgement, cancellation is targeted and reconciled against finalization, and public snapshots exclude file names, paths, hashes, peer identities, endpoints, and raw errors.
 
 ### Not yet available
 
 - A usable or released macOS ↔ Windows application. Input/focus/clipboard/files are joined in the pre-alpha agent and native UX source exists, but real two-machine runtime qualification remains.
-- Proven Windows agent/WinUI runtime behavior; release signing, an update endpoint/private signing key, protected update-state persistence and rollback floor, updater installation/activation/restart/rollback supervision, Windows updater staging/UI, hot-plug layout UX, detailed transfer progress/destinations, durable restart ownership journals, and Windows ARM64 execution are also missing.
+- Proven Windows agent/WinUI runtime behavior; release signing, an update endpoint/private signing key, protected update-state persistence and rollback floor, updater installation/activation/restart/rollback supervision, Windows updater staging/UI, hot-plug layout UX, receive-destination UX, durable transfer history/restart ownership journals, and Windows ARM64 execution are also missing.
 - Full security, fuzz, stress, compatibility, upgrade, accessibility, and real-device test matrices; these remain release gates for feature-complete 1.0.

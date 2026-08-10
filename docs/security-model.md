@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 14 -->
+<!-- doc-id: security-model; lang: en; revision: 15 -->
 
 # Security model
 
@@ -91,7 +91,8 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Symlinks, junctions, reparse points, sparse files, and special files are rejected in 1.0 unless separately specified and tested.
 - Data is written to private staging, checked with BLAKE3, then atomically finalized.
 - The receive executor admits one queue-selected transfer to a staging owner at a time. It accepts only nonempty bounded chunks at the exact next offset, advances public filename-free progress only after the staging write is acknowledged, and refuses completion until every declared file byte is present.
-- Explicit cancellation discards only the matching active transfer. A wrong identifier, parallel manifest, offset gap/overlap, incomplete completion, or staging failure is rejected without advancing receive state.
+- The process-local public registry admits every authenticated queued/active manifest before retaining it, enforces one combined 128-nonterminal limit, and retains at most 32 terminal records. Its random public UUID is never a peer wire UUID and is never reused during the process. Internal no-reuse/tombstone state is hard-capped at 4,096 accepted generations and 8,192 peer/direction/wire entries; exact retained traffic stays idempotent at capacity, while a novel identity is rejected before mutation or acknowledgement. Snapshots expose no names, paths, hashes, peer identities, endpoints, epochs, timestamps, or raw errors and remain below the 64 KiB local-IPC limit.
+- Explicit cancellation discards only the matching transfer and is linearized against finalization. `cancelled` is published only after cleanup succeeds; cleanup failure becomes sticky `failed/cleanup_failed`, poisons later file work, and cannot be retried into a false success. A wrong identifier, parallel manifest, offset gap/overlap, incomplete completion, or staging failure is rejected without advancing receive state.
 - Existing files are never overwritten silently.
 - Received files are not executed or automatically opened.
 - Per-peer quotas, cancellation, backpressure, and rate limits limit denial of service.
@@ -100,7 +101,7 @@ The pre-alpha receiver writes through capability-rooted, no-follow directory and
 
 Outbound selection is anchored by no-follow handles before canonicalization. Enumeration, manifest accounting, hashing, chunks, roots, stable file identities, and cooperative cancellation are bounded. Links, reparse points, sparse/special files, overlapping roots, hard-link aliases, mutations, cycles, and cross-platform path collisions fail closed. Publication never overwrites an existing destination. If a late multi-file publication or cleanup failure makes safe rollback ambiguous, the staging owner is poisoned and already published Nodavo identities are retained for explicit remediation instead of deleting a possibly substituted pathname.
 
-The running agent associates inbound transfer identifiers only after an authenticated, authorized manifest and keeps that association peer-scoped across link loss. Revocation waits for workers and the staging lease, then discards only identifiers known for that peer. A durable peer-ownership journal across agent restart is not implemented yet; unknown persisted identifiers are never deleted merely because a peer presents their UUID. Outbound process-restart persistence and durable poison persistence are also stable-release gates.
+The running agent associates inbound transfer identifiers only after an authenticated, authorized manifest and keeps that association peer-scoped across link loss. Each persistent device identity gets a separate private staging namespace, so another peer presenting the same wire UUID cannot resume, finalize, or discard that state; legacy unscoped staging is not migrated. Revocation waits for workers and the staging lease, then discards only identifiers known for that peer. Process-lifetime completed/cancelled tombstones reject reconnect reannouncement, but public history, selected outbound sources, cancellation tombstones after process restart, and durable poison persistence are still stable-release gates.
 
 ## Local IPC
 

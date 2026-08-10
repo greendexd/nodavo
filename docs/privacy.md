@@ -1,4 +1,4 @@
-<!-- doc-id: privacy; lang: en; revision: 1 -->
+<!-- doc-id: privacy; lang: en; revision: 2 -->
 
 # Privacy
 
@@ -11,6 +11,8 @@ Nodavo is designed to operate directly between paired devices on a local network
 Depending on enabled capabilities, Nodavo may process pointer and keyboard events, clipboard representations, file metadata and contents, device identities, display layouts, connection addresses, performance counters, and local diagnostic logs.
 
 Input, clipboard, and file data is sent only to the actively paired peer and only under the relevant capability. Content is not sent to the Nodavo maintainers.
+
+The local transfer-progress surface is deliberately content-free. It may expose a process-local random identifier, direction, phase, bounded byte counters, cancellability, and a fixed failure category. It does not expose file or directory names, paths, hashes, peer identities, network endpoints, timestamps, protocol identifiers, or raw platform errors. Current/recent rows are bounded and are not durable history across an agent restart.
 
 ## Logs
 
@@ -27,4 +29,3 @@ Update checks may contact a documented release endpoint in future versions. The 
 ## Paired peers
 
 Pairing grants another computer technical access to selected capabilities. Users should pair only devices they control and revoke trust when a device is lost, transferred, reinstalled, or suspected of compromise.
-

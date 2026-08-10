@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 8 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 9 -->
 
 # Архитектура
 
@@ -95,6 +95,10 @@ Private keys хранятся в macOS Keychain и Windows DPAPI/CNG-backed stor
 Clipboard synchronization использует revisions и content addressing для предотвращения loops. Контент передаётся только при включённой capability. Планируемые типы: UTF-8 text, HTML, PNG/BMP и file lists.
 
 Файлы пишутся в private staging directory, ограничиваются quota, проверяются против traversal/unsafe links и хэшируются BLAKE3. Ограниченный durable-журнал хранит только точные contiguous offsets; возобновление после перезапуска требует тот же аутентифицированный manifest и обрезает недолговечный tail. Финальная публикация отказывается перезаписывать существующее назначение. Полученный контент не открывается автоматически.
+
+Transfer execution и public presentation имеют разных owners. Short-held process registry допускает не более 128 nonterminal rows и хранит не более 32 terminal rows; он выдаёт случайный local UUID, который не попадает в peer protocol, и никогда не раскрывает wire transfer UUID. Public snapshot содержит только direction, phase, ограниченные byte counters, возможность cancellation и фиксированную failure category. Outbound bytes продвигаются после принятия reliable frame, inbound bytes — после durable staging write, а completion — только после durable publication и нужного authenticated acknowledgement. Targeted cancellation линеаризуется с finalization и сообщает `cancelled` только после успешного local cleanup.
+
+Каждый authenticated peer открывает private no-follow staging namespace, производную от его persistent device identity. Второй peer не может resume или discard тот же wire UUID, а legacy unscoped pre-alpha staging не мигрируется. Process-lifetime completed/cancelled tombstones не дают reannouncement после reconnect создать новый public transfer. Identity retention также ограничен: registry принимает не более 4 096 lifetime generations, а peer/direction/wire ledger — 8 192 entries. Точный retained replay остаётся idempotent на capacity, а novel identity fail-closed до mutation; identities никогда не выбрасываются молча и не переиспользуются. Выбранные outbound sources и public history по-прежнему являются process-lifetime state; durable восстановление source/history между перезапусками агента остаётся release gate.
 
 Finder ↔ Explorer drag/drop является M0 research gate. Если native drag APIs нельзя сделать надёжными и безопасными, 1.0 предложит явную transfer queue вместо имитации drag/drop.
 

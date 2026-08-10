@@ -111,6 +111,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var transferIsBusy = false
     @Published private(set) var queuedTransferReference: QueuedTransferReference?
     @Published private(set) var transferErrorKey: String?
+    @Published private(set) var transferSession = TransferSessionState()
+    @Published private(set) var transferProgressIsStale = false
+    @Published private(set) var transferCancellationAuthority = TransferCancellationAuthority()
+    @Published private(set) var transferSelectionRequiresFreshPicker = false
     @Published private(set) var agentRegistrationStatus: BundledAgentRegistrationStatus
     @Published private(set) var updateStatus = UpdateStatusSnapshot.idle
     @Published private(set) var updateOperationInProgress = false
@@ -121,13 +125,19 @@ final class AppModel: ObservableObject {
     private let pairingClient = AgentClient()
     private let focusClient = AgentClient()
     private let trustedDevicesClient = AgentClient()
-    private let transferClient = AgentClient()
+    private let transferAdmissionClient = AgentClient()
+    private let transferPollingClient = AgentClient()
+    private let transferMutationClient = AgentClient()
     private let updateClient = AgentClient()
     private let updatePollingClient = AgentClient()
     private var readinessRequestOwner = ReadinessRequestOwner()
     private var updateRequestGeneration: UInt64 = 0
     private var updatePollingOwner = UpdatePollingOwner()
     private var updatePollingTask: Task<Void, Never>?
+    private var transferPollingOwner = TransferPollingOwner()
+    private var transferPollingTask: Task<Void, Never>?
+    private var transferPollingFailureCount = 0
+    private var transferAdmissionOutcomeNeedsPoll = false
     private static let updatePollingInterval = Duration.milliseconds(750)
     private static let maximumUpdatePollAttempts = 14_400
 
@@ -510,21 +520,33 @@ final class AppModel: ObservableObject {
     }
 
     func sendFiles(paths: [String]) {
-        guard !transferIsBusy else { return }
+        guard !transferIsBusy, !transferSelectionRequiresFreshPicker else { return }
         transferIsBusy = true
         transferErrorKey = nil
         queuedTransferReference = nil
         Task {
             defer { transferIsBusy = false }
             do {
-                queuedTransferReference = try await transferClient.sendFiles(paths: paths)
-            } catch AgentClientError.unsafeValue {
-                transferErrorKey = "transfer_selection_invalid"
-            } catch AgentClientError.agentUnavailable {
-                transferErrorKey = "transfer_agent_unavailable"
-                connectionState = .unavailable
+                let reference = try await transferAdmissionClient.sendFiles(paths: paths)
+                queuedTransferReference = reference
+                transferSession.noteAdmittedTransfer(reference.transferID)
+                scheduleTransferPoll(force: true)
             } catch {
-                transferErrorKey = "transfer_queue_failed"
+                switch TransferAdmissionFailureDisposition.classify(error) {
+                case .invalidSelection:
+                    transferErrorKey = "transfer_selection_invalid"
+                case .rejected:
+                    transferErrorKey = "transfer_queue_failed"
+                case .outcomeUnknown:
+                    // The local admission may already have happened before an IPC
+                    // reply was lost or rejected. Keep this exact selection locked
+                    // so it cannot be blindly submitted a second time.
+                    transferSelectionRequiresFreshPicker = true
+                    transferAdmissionOutcomeNeedsPoll = true
+                    transferErrorKey = "transfer_outcome_unknown"
+                    transferProgressIsStale = true
+                    scheduleTransferPoll(force: true)
+                }
             }
         }
     }
@@ -537,6 +559,216 @@ final class AppModel: ObservableObject {
     func clearTransferFeedback() {
         queuedTransferReference = nil
         transferErrorKey = nil
+        transferSelectionRequiresFreshPicker = false
+        transferAdmissionOutcomeNeedsPoll = false
+        if !transferPollingNeeded {
+            transferPollingTask?.cancel()
+            transferPollingTask = nil
+            transferPollingOwner.stop()
+        }
+    }
+
+    var currentTransfers: [TransferSummary] {
+        transferSession.currentTransfers
+    }
+
+    var recentTransfers: [TransferSummary] {
+        transferSession.recentTransfers
+    }
+
+    var transferCancellationInProgress: Set<String> {
+        guard let transferID = transferCancellationAuthority.transferID,
+              transferCancellationAuthority.inFlightGeneration != nil
+        else { return [] }
+        return [transferID]
+    }
+
+    var transferCancellationNeedsRetry: Set<String> {
+        guard let transferID = transferCancellationAuthority.transferID,
+              transferCancellationAuthority.needsRetry
+        else { return [] }
+        return [transferID]
+    }
+
+    func setTransfersVisible(_ visible: Bool) {
+        transferPollingOwner.setVisible(visible)
+        transferPollingTask?.cancel()
+        transferPollingTask = nil
+        transferPollingFailureCount = 0
+        if visible {
+            scheduleTransferPoll(force: true)
+        }
+    }
+
+    func retryTransferProgress() {
+        transferProgressIsStale = false
+        transferPollingFailureCount = 0
+        scheduleTransferPoll(force: true)
+    }
+
+    func cancelTransfer(_ transferID: String) {
+        guard TransferSummary.isCanonicalNonNilUUID(transferID) else { return }
+        let eligible = transferSession.transfers.contains(where: {
+                  $0.transferID == transferID && !$0.phase.isTerminal && $0.cancellable
+              })
+        guard let generation = transferCancellationAuthority.begin(
+            transferID: transferID,
+            eligible: eligible
+        ) else { return }
+
+        Task {
+            do {
+                let snapshot = try await transferMutationClient.cancelTransfer(transferID: transferID)
+                finishTransferCancellation(
+                    transferID: transferID,
+                    generation: generation,
+                    snapshot: snapshot,
+                    error: nil
+                )
+            } catch {
+                finishTransferCancellation(
+                    transferID: transferID,
+                    generation: generation,
+                    snapshot: nil,
+                    error: error
+                )
+            }
+        }
+    }
+
+    private var transferPollingNeeded: Bool {
+        transferSession.transfers.contains { !$0.phase.isTerminal }
+            || transferCancellationAuthority.isActive
+            || transferAdmissionOutcomeNeedsPoll
+            || transferSession.hasPendingAdmissions
+    }
+
+    private func scheduleTransferPoll(force: Bool) {
+        if force, transferPollingOwner.isRequestInProgress {
+            transferPollingTask?.cancel()
+            transferPollingTask = nil
+            transferPollingOwner.stop()
+        }
+        guard let generation = transferPollingOwner.begin(
+            force: force,
+            needsPolling: transferPollingNeeded
+        ) else { return }
+        transferPollingTask?.cancel()
+        transferPollingTask = Task {
+            if !force {
+                do {
+                    try await Task.sleep(
+                        for: .milliseconds(
+                            TransferPollBackoff.delayMilliseconds(
+                                consecutiveFailures: transferPollingFailureCount
+                            )
+                        )
+                    )
+                } catch {
+                    return
+                }
+            }
+            do {
+                let snapshot = try await transferPollingClient.listTransfers()
+                finishTransferPoll(snapshot, generation: generation, error: nil)
+            } catch {
+                finishTransferPoll(nil, generation: generation, error: error)
+            }
+        }
+    }
+
+    private func finishTransferPoll(
+        _ snapshot: TransferSnapshot?,
+        generation: UInt64,
+        error: Error?
+    ) {
+        guard transferPollingOwner.finish(generation) else { return }
+        transferPollingTask = nil
+        if let snapshot {
+            let application = applyTransferSnapshot(snapshot)
+            if application == .stale {
+                recordTransferPollFailure()
+                transferProgressIsStale = true
+            } else {
+                transferPollingFailureCount = 0
+                transferProgressIsStale = false
+                if !snapshot.truncated {
+                    transferAdmissionOutcomeNeedsPoll = false
+                }
+            }
+        } else if error != nil {
+            recordTransferPollFailure()
+            transferProgressIsStale = true
+        }
+        if transferPollingNeeded {
+            scheduleTransferPoll(force: false)
+        }
+    }
+
+    private func finishTransferCancellation(
+        transferID: String,
+        generation: UInt64,
+        snapshot: TransferSnapshot?,
+        error: Error?
+    ) {
+        guard transferCancellationAuthority.owns(
+            transferID: transferID,
+            generation: generation
+        ) else { return }
+        if let snapshot {
+            let application = applyTransferSnapshot(snapshot)
+            if transferCancellationAuthority.owns(
+                transferID: transferID,
+                generation: generation
+            ) {
+                transferCancellationAuthority.markAmbiguous(
+                    transferID: transferID,
+                    generation: generation
+                )
+                transferProgressIsStale = true
+            } else if application != .stale {
+                transferProgressIsStale = false
+            }
+        } else if let clientError = error as? AgentClientError,
+                  case .agent = clientError {
+            transferCancellationAuthority.markRejected(
+                transferID: transferID,
+                generation: generation
+            )
+            transferProgressIsStale = true
+            transferErrorKey = "transfer_cancel_rejected"
+        } else if error != nil {
+            // A timeout or malformed/lost acknowledgement does not prove that
+            // cancellation failed. Poll, and only retry this same transfer ID.
+            transferCancellationAuthority.markAmbiguous(
+                transferID: transferID,
+                generation: generation
+            )
+            transferProgressIsStale = true
+        }
+        scheduleTransferPoll(force: true)
+    }
+
+    @discardableResult
+    private func applyTransferSnapshot(_ snapshot: TransferSnapshot) -> TransferSessionState.Application {
+        var retainingIDs = Set<String>()
+        if let transferID = transferCancellationAuthority.transferID {
+            retainingIDs.insert(transferID)
+        }
+        let result = transferSession.apply(snapshot, retainingIDs: retainingIDs)
+        guard result != .stale, result != .unchanged else { return result }
+        if result == .newInstance {
+            queuedTransferReference = nil
+            transferAdmissionOutcomeNeedsPoll = false
+        }
+        transferCancellationAuthority.reconcile(snapshot: snapshot, application: result)
+        return result
+    }
+
+    private func recordTransferPollFailure() {
+        if transferPollingFailureCount < 4 {
+            transferPollingFailureCount += 1
+        }
     }
 
     func refreshUpdateStatus() {
