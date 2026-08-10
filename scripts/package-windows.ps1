@@ -484,6 +484,7 @@ $releasePersonalStoreSnapshot = @()
 $releasePersonalStoreSnapshotTaken = $false
 $developmentCertificate = $null
 $developmentTrustedPeopleWasImported = $false
+$developmentRootWasImported = $false
 $packagingCompleted = $false
 
 if ($Development) {
@@ -723,6 +724,20 @@ try {
                 -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
             $developmentTrustedPeopleWasImported = $true
         }
+        # SignTool's Authenticode policy still requires a trusted chain anchor
+        # when validating a self-signed development package. Trust the
+        # freshly-created certificate only for this isolated verification and
+        # remove it unconditionally in the finally block below. TrustedPeople
+        # remains necessary for the exported certificate's documented local
+        # installation flow; Root is used only to make the cryptographic CI
+        # verification fail closed instead of ignoring SignTool's exit code.
+        $developmentRootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
+        if (-not (Test-Path -LiteralPath $developmentRootPath)) {
+            Import-Certificate `
+                -FilePath $certificatePath `
+                -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+            $developmentRootWasImported = $true
+        }
         Invoke-Native $signTool @('verify', '/pa', '/all', '/v', $bundlePath)
 
         Copy-Item -LiteralPath $developmentWarningPath -Destination $artifactRoot
@@ -827,6 +842,7 @@ try {
 }
 finally {
     $releaseStoreCleanupError = $null
+    $developmentStoreCleanupError = $null
     if ($releasePersonalStoreSnapshotTaken) {
         try {
             Invoke-PersonalCertificateStoreDeltaCleanup $releasePersonalStoreSnapshot
@@ -836,14 +852,41 @@ finally {
         }
     }
     if ($developmentTrustedPeopleWasImported -and $null -ne $developmentCertificate) {
-        Remove-Item -LiteralPath `
-            "Cert:\CurrentUser\TrustedPeople\$($developmentCertificate.Thumbprint)" `
-            -Force -ErrorAction SilentlyContinue
+        $trustedPeoplePath =
+            "Cert:\CurrentUser\TrustedPeople\$($developmentCertificate.Thumbprint)"
+        try {
+            Remove-Item -LiteralPath $trustedPeoplePath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $trustedPeoplePath) {
+                throw 'certificate remains in CurrentUser/TrustedPeople'
+            }
+        }
+        catch {
+            $developmentStoreCleanupError = $_
+        }
+    }
+    if ($developmentRootWasImported -and $null -ne $developmentCertificate) {
+        $rootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
+        try {
+            Remove-Item -LiteralPath $rootPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $rootPath) {
+                throw 'certificate remains in CurrentUser/Root'
+            }
+        }
+        catch {
+            $developmentStoreCleanupError = $_
+        }
     }
     if ($null -ne $developmentCertificate) {
-        Remove-Item -LiteralPath `
-            "Cert:\CurrentUser\My\$($developmentCertificate.Thumbprint)" `
-            -Force -ErrorAction SilentlyContinue
+        $personalPath = "Cert:\CurrentUser\My\$($developmentCertificate.Thumbprint)"
+        try {
+            Remove-Item -LiteralPath $personalPath -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $personalPath) {
+                throw 'certificate remains in CurrentUser/My'
+            }
+        }
+        catch {
+            $developmentStoreCleanupError = $_
+        }
     }
     if (Test-Path -LiteralPath $workRoot) {
         Remove-Item -LiteralPath $workRoot -Recurse -Force
@@ -861,5 +904,8 @@ finally {
     }
     if ($null -ne $releaseStoreCleanupError) {
         Fail "release certificate-store cleanup failed; signing runner must be discarded"
+    }
+    if ($null -ne $developmentStoreCleanupError) {
+        Fail "development certificate-store cleanup failed; signing runner must be discarded"
     }
 }
