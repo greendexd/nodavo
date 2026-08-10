@@ -3,7 +3,7 @@
 "refresh_status" = "Обновить статус";
 "open_nodavo" = "Открыть Nodavo…";
 "emergency_stop" = "Аварийно отключить";
-"prealpha_notice" = "Сопряжение и защищённое переподключение уже работают в pre-alpha; ввод, буфер и файлы пока недоступны.";
+"prealpha_notice" = "Сопряжение, ввод и буфер уже работают в pre-alpha; передача файлов между устройствами и реальные кросс-платформенные проверки ещё не завершены.";
 "quit" = "Выйти из Nodavo";
 "status_checking" = "Проверка агента…";
 "status_ready" = "Агент готов";
@@ -53,7 +53,7 @@
 "pairing_reset" = "Начать заново";
 "trusted_devices" = "Доверенные устройства";
 "trusted_devices_in_progress" = "Агент уже поддерживает разрешения при сопряжении и отзыв доверия. Список устройств и изменение разрешений после сопряжения — следующий шаг интерфейса.";
-"pairing_prealpha_notice" = "Этот macOS pre-alpha агент пока использует приватные development-файлы. Граница Keychain реализована, но до интеграции требуются production-подпись и provisioning.";
+"pairing_prealpha_notice" = "Этот macOS pre-alpha агент по умолчанию использует Keychain. До релиза всё ещё нужен запуск подписанной и provisioned-сборки.";
 "layout_in_progress" = "Расположение дисплеев и переход через край ещё разрабатываются.";
 "transfers_in_progress" = "Безопасная очередь передачи файлов ещё разрабатывается.";
 "privacy" = "Конфиденциальность";
@@ -61,4 +61,13 @@
 "disabled" = "Выключена";
 "cloud_account" = "Облачная учётная запись";
 "not_required" = "Не требуется";
+"agent_service" = "Фоновый агент";
+"agent_registration" = "Регистрация";
+"agent_registration_development" = "Не используется в этой development-сборке";
+"agent_registration_enabled" = "Включён";
+"agent_registration_registered" = "Зарегистрирован";
+"agent_registration_requires_approval" = "Требуется разрешение";
+"agent_registration_not_found" = "Встроенная служба отсутствует";
+"agent_registration_failed" = "Ошибка регистрации";
+"agent_registration_help" = "Разрешите Nodavo в Системных настройках > Основные > Объекты входа, затем откройте приложение заново. Если встроенная служба отсутствует, переустановите Nodavo.";
 "safety" = "Безопасность";

@@ -3,7 +3,7 @@
 "refresh_status" = "Refresh status";
 "open_nodavo" = "Open Nodavo…";
 "emergency_stop" = "Emergency stop";
-"prealpha_notice" = "Pairing and pinned reconnect are active pre-alpha; input, clipboard, and files remain unavailable.";
+"prealpha_notice" = "Pairing, input, and clipboard are active pre-alpha; peer file transfer and real cross-platform validation are not complete.";
 "quit" = "Quit Nodavo";
 "status_checking" = "Checking agent…";
 "status_ready" = "Agent ready";
@@ -53,7 +53,7 @@
 "pairing_reset" = "Start over";
 "trusted_devices" = "Trusted devices";
 "trusted_devices_in_progress" = "Pairing-time permissions and revocation are implemented in the agent. The trusted-device list and post-pair permission changes are the next UI step.";
-"pairing_prealpha_notice" = "This macOS pre-alpha agent still uses private development files. The Keychain boundary exists but requires production signing and provisioning before integration.";
+"pairing_prealpha_notice" = "This macOS pre-alpha agent defaults to the Keychain. A signed and provisioned distribution run is still required before release.";
 "layout_in_progress" = "Display arrangement and edge switching are under implementation.";
 "transfers_in_progress" = "The safe file-transfer queue is under implementation.";
 "privacy" = "Privacy";
@@ -61,4 +61,13 @@
 "disabled" = "Disabled";
 "cloud_account" = "Cloud account";
 "not_required" = "Not required";
+"agent_service" = "Background agent";
+"agent_registration" = "Registration";
+"agent_registration_development" = "Not used by this development build";
+"agent_registration_enabled" = "Enabled";
+"agent_registration_registered" = "Registered";
+"agent_registration_requires_approval" = "Approval required";
+"agent_registration_not_found" = "Embedded service is missing";
+"agent_registration_failed" = "Registration failed";
+"agent_registration_help" = "Allow Nodavo in System Settings > General > Login Items, then reopen the app. Reinstall Nodavo if the embedded service is missing.";
 "safety" = "Safety";

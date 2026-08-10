@@ -26,11 +26,16 @@ final class AppModel: ObservableObject {
     @Published private(set) var focusState = "local"
     @Published private(set) var pairingState: PairingState = .idle
     @Published private(set) var pairingPrompt: PairingPrompt?
+    @Published private(set) var agentRegistrationStatus: BundledAgentRegistrationStatus
 
     private let statusClient = AgentClient()
     private let safetyClient = AgentClient()
     private let pairingClient = AgentClient()
     private let focusClient = AgentClient()
+
+    init() {
+        agentRegistrationStatus = BundledAgentRegistration.ensureRegistered()
+    }
 
     var menuBarSymbol: String {
         connectionState == .connected ? "cursorarrow.motionlines" : "cursorarrow"
@@ -79,6 +84,24 @@ final class AppModel: ObservableObject {
 
     var pairingIsBusy: Bool {
         pairingState == .waiting || pairingState == .confirming
+    }
+
+    var agentRegistrationStatusText: LocalizedStringKey {
+        switch agentRegistrationStatus {
+        case .notApplicable: "agent_registration_development"
+        case .enabled: "agent_registration_enabled"
+        case .registered: "agent_registration_registered"
+        case .requiresApproval: "agent_registration_requires_approval"
+        case .notFound: "agent_registration_not_found"
+        case .failed: "agent_registration_failed"
+        }
+    }
+
+    var agentRegistrationNeedsAttention: Bool {
+        switch agentRegistrationStatus {
+        case .requiresApproval, .notFound, .failed: true
+        case .notApplicable, .enabled, .registered: false
+        }
     }
 
     var focusStatusText: LocalizedStringKey {

@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 4 -->
+<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 5 -->
 
 # Nodavo для macOS
 
@@ -35,3 +35,5 @@ scripts/package-macos.sh --version 1.0.0 --build-number 1
 ```
 
 Оба provisioning profile должны разрешать точную Keychain access group `${APPLE_TEAM_ID}.dev.nodavo.agent`. Release-путь использует hardened runtime, регистрирует встроенный helper как пользовательский LaunchAgent и требует успешной нотариализации, stapling и проверки Gatekeeper до сообщения об успехе. Без учётных данных Nodavo для подписи и нотариализации эти release-шаги не проверялись.
+
+Интерфейс упакованного приложения показывает, включён ли helper, ожидает ли он разрешения в «Объектах входа», отсутствует или не смог зарегистрироваться. При ошибке регистрации Nodavo не запускает незарегистрированную копию и не создаёт привилегированную службу.

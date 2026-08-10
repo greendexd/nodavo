@@ -232,6 +232,15 @@ private struct SettingsView: View {
                 LabeledContent("telemetry", value: String(localized: "disabled"))
                 LabeledContent("cloud_account", value: String(localized: "not_required"))
             }
+            Section("agent_service") {
+                LabeledContent("agent_registration") {
+                    Text(model.agentRegistrationStatusText)
+                }
+                if model.agentRegistrationNeedsAttention {
+                    Label("agent_registration_help", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+            }
             Section("safety") {
                 Button("emergency_stop", role: .destructive) { model.emergencyStop() }
             }

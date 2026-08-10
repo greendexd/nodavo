@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: en; revision: 4 -->
+<!-- doc-id: macos-app; lang: en; revision: 5 -->
 
 # Nodavo for macOS
 
@@ -35,3 +35,5 @@ scripts/package-macos.sh --version 1.0.0 --build-number 1
 ```
 
 Both provisioning profiles must authorize the exact Keychain access group `${APPLE_TEAM_ID}.dev.nodavo.agent`. The release path uses the hardened runtime, registers the embedded helper as a per-user LaunchAgent, and requires notarization acceptance, stapling, and Gatekeeper assessment before reporting success. Those release steps have not been validated without Nodavo signing and notarization credentials.
+
+The packaged UI reports whether the helper is enabled, awaiting Login Items approval, missing, or failed to register. Registration failure never falls back to starting an unregistered helper or exposing a privileged service.

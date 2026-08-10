@@ -4,10 +4,6 @@ import SwiftUI
 struct NodavoApp: App {
     @StateObject private var model = AppModel()
 
-    init() {
-        BundledAgentRegistration.ensureRegistered()
-    }
-
     var body: some Scene {
         MenuBarExtra("Nodavo", systemImage: model.menuBarSymbol) {
             MenuContent(model: model)
