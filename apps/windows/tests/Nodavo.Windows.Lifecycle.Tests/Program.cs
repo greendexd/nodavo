@@ -500,12 +500,12 @@ internal static class LifecycleTests
         state = TransfersViewModel.BeginAdmissionReconciliation(state);
         Assert(state.AdmissionReconciliationPending &&
             state.AdmissionReconciliationAttemptsRemaining ==
-                TransfersState.MaximumAdmissionReconciliationAttempts &&
+                TransfersViewModel.MaximumAdmissionReconciliationAttempts &&
             state.HasPollingWork,
             "local admission must create bounded authoritative-list polling even with no rows");
 
         for (int attempt = 1;
-             attempt < TransfersState.MaximumAdmissionReconciliationAttempts;
+             attempt < TransfersViewModel.MaximumAdmissionReconciliationAttempts;
              attempt++)
         {
             state = TransfersViewModel.MarkPollFailure(state, generation);
@@ -519,7 +519,7 @@ internal static class LifecycleTests
 
         state = TransfersViewModel.RestartAdmissionReconciliation(state);
         Assert(state.AdmissionReconciliationAttemptsRemaining ==
-                TransfersState.MaximumAdmissionReconciliationAttempts && state.HasPollingWork,
+                TransfersViewModel.MaximumAdmissionReconciliationAttempts && state.HasPollingWork,
             "explicit Refresh transfers must start another bounded reconciliation window");
         TransferListSnapshot authoritative = Snapshot(
             "11111111-1111-1111-1111-111111111111",

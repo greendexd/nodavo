@@ -61,8 +61,6 @@ internal sealed record TransfersState(
     bool AdmissionReconciliationPending,
     int AdmissionReconciliationAttemptsRemaining)
 {
-    internal const int MaximumAdmissionReconciliationAttempts = 5;
-
     internal static TransfersState Empty { get; } = new(
         0,
         false,
@@ -84,6 +82,8 @@ internal sealed record TransfersState(
 
 internal static class TransfersViewModel
 {
+    internal const int MaximumAdmissionReconciliationAttempts = 5;
+
     internal static TransfersState Start(TransfersState state) =>
         state with { Generation = state.Generation + 1, IsLoaded = true };
 
@@ -113,28 +113,28 @@ internal static class TransfersViewModel
         }
         if (!replacedInstance && state.InstanceId is not null && snapshot.Revision == state.Revision)
         {
-            string? cancelOwner = state.CancelOwnerId;
-            bool cancelInFlight = state.CancelInFlight;
-            bool cancelUnknown = state.CancelOutcomeUnknown;
-            if (cancelOwner is not null)
+            string? equalCancelOwner = state.CancelOwnerId;
+            bool equalCancelInFlight = state.CancelInFlight;
+            bool equalCancelUnknown = state.CancelOutcomeUnknown;
+            if (equalCancelOwner is not null)
             {
                 TransferSnapshot? owner = snapshot.Transfers.FirstOrDefault(
-                    transfer => transfer.TransferId == cancelOwner);
+                    transfer => transfer.TransferId == equalCancelOwner);
                 if (owner is null && !snapshot.Truncated ||
                     owner is not null &&
                     (owner.IsTerminal || owner.Phase == TransferPhase.CancelRequested))
                 {
-                    cancelOwner = null;
-                    cancelUnknown = false;
+                    equalCancelOwner = null;
+                    equalCancelUnknown = false;
                 }
             }
             return state with
             {
                 Truncated = snapshot.Truncated,
                 IsStale = false,
-                CancelOwnerId = cancelOwner,
-                CancelInFlight = cancelInFlight,
-                CancelOutcomeUnknown = cancelUnknown,
+                CancelOwnerId = equalCancelOwner,
+                CancelInFlight = equalCancelInFlight,
+                CancelOutcomeUnknown = equalCancelUnknown,
                 AdmissionReconciliationPending = false,
                 AdmissionReconciliationAttemptsRemaining = 0,
             };
@@ -216,14 +216,16 @@ internal static class TransfersViewModel
         state with
         {
             AdmissionReconciliationPending = true,
-            AdmissionReconciliationAttemptsRemaining = MaximumAdmissionReconciliationAttempts,
+            AdmissionReconciliationAttemptsRemaining =
+                MaximumAdmissionReconciliationAttempts,
         };
 
     internal static TransfersState RestartAdmissionReconciliation(TransfersState state) =>
         state.IsLoaded && state.AdmissionReconciliationPending
             ? state with
             {
-                AdmissionReconciliationAttemptsRemaining = MaximumAdmissionReconciliationAttempts,
+                AdmissionReconciliationAttemptsRemaining =
+                    MaximumAdmissionReconciliationAttempts,
             }
             : state;
 

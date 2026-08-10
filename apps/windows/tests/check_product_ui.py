@@ -228,7 +228,17 @@ assert "ObservePollCompletionAsync" in transfers
 assert "BeginAdmissionReconciliation" in transfers
 assert "RestartAdmissionReconciliation" in transfers
 assert "AdmissionReconciliationAttemptsRemaining" in transfer_reducer
-assert "MaximumAdmissionReconciliationAttempts = 5" in transfer_reducer
+assert re.search(
+    r"internal static class TransfersViewModel\s*\{\s*"
+    r"internal const int MaximumAdmissionReconciliationAttempts = 5;",
+    transfer_reducer,
+), "admission attempt bound must be accessible to the reducer"
+assert "string? equalCancelOwner =" in transfer_reducer
+assert "bool equalCancelInFlight =" in transfer_reducer
+assert "bool equalCancelUnknown =" in transfer_reducer
+assert transfer_reducer.count("string? cancelOwner =") == 1, (
+    "equal-revision locals must not shadow the main reducer locals"
+)
 assert transfers.count("_client.SendFilesAsync(") == 1, (
     "admission reconciliation must never create a blind resend path"
 )
