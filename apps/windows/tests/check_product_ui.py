@@ -212,6 +212,12 @@ for failure in (
     assert f'"{failure}"' in transfer_decoder, f"missing bounded failure: {failure}"
 assert 'InvalidResponse = "Invalid transfer snapshot response."' in transfer_decoder
 assert "$\"••••••••-{transferId[^8..]}\"" in transfer_decoder
+managed_tests = (
+    ROOT / "apps/windows/tests/Nodavo.Windows.Lifecycle.Tests/Program.cs"
+).read_text(encoding="utf-8")
+assert 'casedInstanceId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"' in managed_tests
+assert 'casedTransferId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"' in managed_tests
+assert "caseIndex" in managed_tests
 assert "public string TransferId" not in transfer_model + transfer_reducer + transfers
 
 assert 'TimeSpan PollInterval = TimeSpan.FromSeconds(1)' in transfers

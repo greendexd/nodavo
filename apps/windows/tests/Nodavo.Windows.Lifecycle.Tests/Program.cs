@@ -282,6 +282,8 @@ internal static class LifecycleTests
     {
         const string instanceId = "11111111-1111-1111-1111-111111111111";
         const string transferId = "22222222-2222-2222-2222-222222222222";
+        const string casedInstanceId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        const string casedTransferId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
         string validRow = TransferRow(
             transferId,
             "outbound",
@@ -293,10 +295,10 @@ internal static class LifecycleTests
         var rejected = new List<(string Json, string Detail)>
         {
             (TransferEnvelope(instanceId, 0, false, validRow), transferId),
-            (TransferEnvelope(instanceId.ToUpperInvariant(), 1, false, validRow), instanceId),
+            (TransferEnvelope(casedInstanceId.ToUpperInvariant(), 1, false, validRow), casedInstanceId),
             (TransferEnvelope(Guid.Empty.ToString("D"), 1, false, validRow), instanceId),
             (TransferEnvelope(instanceId, 1, false,
-                TransferRow(transferId.ToUpperInvariant(), "outbound", "transferring", "5", "10", true, "null")), transferId),
+                TransferRow(casedTransferId.ToUpperInvariant(), "outbound", "transferring", "5", "10", true, "null")), casedTransferId),
             (TransferEnvelope(instanceId, 1, false,
                 TransferRow(Guid.Empty.ToString("D"), "outbound", "transferring", "5", "10", true, "null")), transferId),
             (TransferEnvelope(instanceId, 1, false, validRow + "," + validRow), transferId),
@@ -343,9 +345,10 @@ internal static class LifecycleTests
                 "null")));
         rejected.Add((TransferEnvelope(instanceId, 1, false, maximumRows), transferId));
 
-        foreach ((string json, string detail) in rejected)
+        for (int caseIndex = 0; caseIndex < rejected.Count; caseIndex++)
         {
-            AssertTransferRejected(json, detail);
+            (string json, string detail) = rejected[caseIndex];
+            AssertTransferRejected(json, detail, caseIndex);
         }
     }
 
@@ -626,7 +629,10 @@ internal static class LifecycleTests
     private static TransferListSnapshot DecodeTransfers(string json) =>
         TransferSnapshotDecoder.DecodeTransfers(Encoding.UTF8.GetBytes(json));
 
-    private static void AssertTransferRejected(string json, string privateDetail)
+    private static void AssertTransferRejected(
+        string json,
+        string privateDetail,
+        int caseIndex)
     {
         try
         {
@@ -639,7 +645,8 @@ internal static class LifecycleTests
                 "transfer decoder errors must be generic and redact private or malformed data");
             return;
         }
-        throw new InvalidOperationException("malformed transfer response must fail closed");
+        throw new InvalidOperationException(
+            $"malformed transfer response case {caseIndex} must fail closed");
     }
 
     private static string TransferEnvelope(
