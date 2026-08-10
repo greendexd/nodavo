@@ -738,7 +738,7 @@ try {
             # confirmation on a headless runner. certutil's forced user-store
             # operation is non-interactive and its exit code remains enforced.
             Invoke-Native $certUtil @(
-                '-user', '-f', '-addstore', 'Root', $certificatePath
+                '-user', '-f', '-silent', '-addstore', 'Root', $certificatePath
             )
             $developmentRootWasImported = $true
         }
@@ -872,7 +872,8 @@ finally {
         $rootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
         try {
             Invoke-Native $certUtil @(
-                '-user', '-f', '-delstore', 'Root', $developmentCertificate.Thumbprint
+                '-user', '-f', '-silent', '-delstore', 'Root',
+                $developmentCertificate.Thumbprint
             )
             if (Test-Path -LiteralPath $rootPath) {
                 throw 'certificate remains in CurrentUser/Root'
