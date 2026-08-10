@@ -1,9 +1,13 @@
-//! Offline verification for signed release metadata.
+//! Signed release verification and effect-isolated update orchestration.
 //!
-//! This crate deliberately has no HTTP client, filesystem writer, process
-//! launcher, installer, or signing-key API. A successful verification returns
-//! authenticated metadata that an independently reviewed host may download and
-//! stage; it never installs or opens an artifact.
+//! The crate deliberately has no concrete HTTP client, filesystem writer,
+//! process launcher, installer, or signing-key API. Network, staging,
+//! persistence, and platform installation remain behind contracts so policy
+//! and crash recovery can be tested without executing downloaded content.
+
+mod runtime;
+
+pub use runtime::*;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -24,6 +28,7 @@ pub const MAX_ARTIFACT_URL_BYTES: usize = 2_048;
 const MAX_PRODUCT_BYTES: usize = 64;
 const MAX_TARGET_COMPONENT_BYTES: usize = 32;
 const MAX_VERSION_BYTES: usize = 128;
+const MAX_INSTALL_IDENTIFIER_BYTES: usize = 255;
 const MAX_SIGNATURE_TEXT_BYTES: usize = 96;
 const SHA256_HEX_BYTES: usize = 64;
 const CANONICAL_DOMAIN: &[u8] = b"NODAVO RELEASE MANIFEST\0";
@@ -176,11 +181,13 @@ pub struct VerificationPolicy {
     channel: String,
     platform: String,
     arch: String,
+    install_identity: String,
     installed_version: Version,
 }
 
 impl VerificationPolicy {
-    /// Creates a strict policy for exactly one product, channel, and target.
+    /// Creates a strict policy for exactly one product, channel, target, and
+    /// platform bundle/package identity.
     ///
     /// # Errors
     ///
@@ -190,6 +197,7 @@ impl VerificationPolicy {
         channel: impl Into<String>,
         platform: impl Into<String>,
         arch: impl Into<String>,
+        install_identity: impl Into<String>,
         installed_version: Version,
     ) -> Result<Self, UpdateError> {
         let policy = Self {
@@ -197,12 +205,14 @@ impl VerificationPolicy {
             channel: channel.into(),
             platform: platform.into(),
             arch: arch.into(),
+            install_identity: install_identity.into(),
             installed_version,
         };
         validate_token(&policy.product, MAX_PRODUCT_BYTES)?;
         validate_token(&policy.channel, MAX_TARGET_COMPONENT_BYTES)?;
         validate_token(&policy.platform, MAX_TARGET_COMPONENT_BYTES)?;
         validate_token(&policy.arch, MAX_TARGET_COMPONENT_BYTES)?;
+        validate_install_identifier(&policy.install_identity)?;
         if policy.installed_version.to_string().len() > MAX_VERSION_BYTES {
             return Err(UpdateError::InvalidVersionBounds);
         }
@@ -212,6 +222,12 @@ impl VerificationPolicy {
     #[must_use]
     pub const fn installed_version(&self) -> &Version {
         &self.installed_version
+    }
+
+    /// Locally pinned bundle or package identity allowed for this target.
+    #[must_use]
+    pub fn install_identity(&self) -> &str {
+        &self.install_identity
     }
 }
 
@@ -288,6 +304,7 @@ impl ReleaseVerifier {
         Ok(VerifiedRelease {
             manifest: signed.manifest,
             artifact_sha256: digest,
+            install_identity: self.policy.install_identity.clone(),
         })
     }
 
@@ -323,6 +340,7 @@ impl ReleaseVerifier {
 pub struct VerifiedRelease {
     manifest: ReleaseManifest,
     artifact_sha256: [u8; 32],
+    install_identity: String,
 }
 
 impl VerifiedRelease {
@@ -334,6 +352,12 @@ impl VerifiedRelease {
     #[must_use]
     pub const fn artifact_sha256(&self) -> &[u8; 32] {
         &self.artifact_sha256
+    }
+
+    /// Locally pinned install identity carried from the verification policy.
+    #[must_use]
+    pub fn install_identity(&self) -> &str {
+        &self.install_identity
     }
 
     /// Creates a bounded streaming verifier for bytes downloaded by the host.
@@ -374,6 +398,12 @@ pub struct ArtifactVerifier {
 }
 
 impl ArtifactVerifier {
+    /// Number of bytes incorporated so far.
+    #[must_use]
+    pub const fn observed_size(&self) -> u64 {
+        self.observed_size
+    }
+
     /// Adds one downloaded chunk without retaining artifact contents.
     ///
     /// # Errors
@@ -458,6 +488,18 @@ fn validate_token(value: &str, max_bytes: usize) -> Result<(), UpdateError> {
         || !value.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-._".contains(&byte)
         })
+    {
+        return Err(UpdateError::InvalidMetadata);
+    }
+    Ok(())
+}
+
+fn validate_install_identifier(value: &str) -> Result<(), UpdateError> {
+    if value.is_empty()
+        || value.len() > MAX_INSTALL_IDENTIFIER_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
     {
         return Err(UpdateError::InvalidMetadata);
     }
@@ -602,6 +644,7 @@ mod tests {
             "stable",
             "macos",
             "aarch64",
+            "dev.nodavo.macos",
             Version::parse("1.5.0").unwrap(),
         )
         .unwrap();
@@ -619,6 +662,14 @@ mod tests {
         assert_eq!(
             verifier.verify_json(manifest_json(SIGNATURE, 1_024).as_bytes(), &future_floor),
             Err(UpdateError::RollbackRejected)
+        );
+
+        let mut wrong_target: SignedManifest =
+            serde_json::from_str(&manifest_json(SIGNATURE, 1_024)).unwrap();
+        wrong_target.manifest.channel = "beta".to_owned();
+        assert_eq!(
+            verifier.verify_policy(&wrong_target.manifest, &state),
+            Err(UpdateError::TargetMismatch)
         );
     }
 }

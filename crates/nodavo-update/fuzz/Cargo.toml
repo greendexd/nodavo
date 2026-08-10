@@ -1,0 +1,31 @@
+[package]
+name = "nodavo-update-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ed25519-dalek = "2"
+libfuzzer-sys = "0.4"
+nodavo-update = { path = ".." }
+semver = "1"
+
+[[bin]]
+name = "manifest_envelope"
+path = "fuzz_targets/manifest_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persistent_state"
+path = "fuzz_targets/persistent_state.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
