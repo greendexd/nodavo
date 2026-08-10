@@ -273,6 +273,52 @@ function Invoke-PersonalCertificateStoreDeltaCleanup([string[]] $BeforeThumbprin
     }
 }
 
+function Add-PublicCertificateToCurrentUserStore(
+    [string] $StoreName,
+    [string] $CertificatePath
+) {
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $CertificatePath
+    )
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        if ($certificate.HasPrivateKey) {
+            Fail "development trust store input unexpectedly contains a private key"
+        }
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $store.Add($certificate)
+    }
+    finally {
+        $store.Dispose()
+        $certificate.Dispose()
+    }
+}
+
+function Remove-CertificateFromCurrentUserStore(
+    [string] $StoreName,
+    [string] $Thumbprint
+) {
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $StoreName,
+        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+    )
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+        $matches = @($store.Certificates | Where-Object {
+            $_.Thumbprint -ceq $Thumbprint
+        })
+        foreach ($certificate in $matches) {
+            $store.Remove($certificate)
+        }
+    }
+    finally {
+        $store.Dispose()
+    }
+}
+
 function Assert-PackageContent(
     [string] $BundlePath,
     [string] $MakeAppxPath,
@@ -566,7 +612,6 @@ foreach ($value in @($publisher, $publisherDisplayName, $displayName, $descripti
 $cargo = Get-RequiredCommand 'cargo.exe'
 $rustup = Get-RequiredCommand 'rustup.exe'
 $dotnet = Get-RequiredCommand 'dotnet.exe'
-$certUtil = Get-RequiredCommand 'certutil.exe'
 $makeAppx = Find-WindowsSdkTool 'makeappx.exe'
 $signTool = Find-WindowsSdkTool 'signtool.exe'
 
@@ -734,12 +779,10 @@ try {
         # verification fail closed instead of ignoring SignTool's exit code.
         $developmentRootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
         if (-not (Test-Path -LiteralPath $developmentRootPath)) {
-            # Import-Certificate can invoke Windows' interactive root-trust
-            # confirmation on a headless runner. certutil's forced user-store
-            # operation is non-interactive and its exit code remains enforced.
-            Invoke-Native $certUtil @(
-                '-user', '-f', '-silent', '-addstore', 'Root', $certificatePath
-            )
+            # Add only the exported public certificate through the direct .NET
+            # store API. Import-Certificate/certutil can enter interactive or
+            # online root-store flows on a headless runner.
+            Add-PublicCertificateToCurrentUserStore 'Root' $certificatePath
             $developmentRootWasImported = $true
         }
         Invoke-Native $signTool @('verify', '/pa', '/all', '/v', $bundlePath)
@@ -871,10 +914,9 @@ finally {
     if ($developmentRootWasImported -and $null -ne $developmentCertificate) {
         $rootPath = "Cert:\CurrentUser\Root\$($developmentCertificate.Thumbprint)"
         try {
-            Invoke-Native $certUtil @(
-                '-user', '-f', '-silent', '-delstore', 'Root',
+            Remove-CertificateFromCurrentUserStore `
+                'Root' `
                 $developmentCertificate.Thumbprint
-            )
             if (Test-Path -LiteralPath $rootPath) {
                 throw 'certificate remains in CurrentUser/Root'
             }
