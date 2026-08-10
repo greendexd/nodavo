@@ -1578,9 +1578,9 @@ fn map_session_error(error: SessionRuntimeError) -> AgentError {
         SessionRuntimeError::Transport => AgentError::NotConnected,
         SessionRuntimeError::FocusRejected => AgentError::FocusRejected,
         SessionRuntimeError::SafetyRecoveryFailed => AgentError::SafetyRecoveryFailed,
-        SessionRuntimeError::ProtocolViolation | SessionRuntimeError::Platform => {
-            AgentError::PairingFailed
-        }
+        SessionRuntimeError::ProtocolViolation
+        | SessionRuntimeError::Platform
+        | SessionRuntimeError::TopologyRefreshRequired => AgentError::PairingFailed,
     }
 }
 

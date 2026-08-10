@@ -31,7 +31,7 @@ use nodavo_transport::{
 };
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, sleep};
 
 use crate::clipboard_port::ClipboardPort;
 use crate::clipboard_runtime::{ClipboardRuntimeError, PeerClipboardRuntime};
@@ -40,7 +40,7 @@ use crate::input_wire::{
 };
 use crate::native_bridge::{NativeInputReceiver, PlatformSafetyEvent, PlatformSafetyReceiver};
 use crate::platform_port::{PlatformPort, PlatformPortError};
-use crate::topology_runtime::{LocalPointerAction, PeerTopologyState};
+use crate::topology_runtime::{LocalPointerAction, LocalTopologyCandidate, PeerTopologyState};
 use crate::transfer_runtime::{PeerTransferConfig, PeerTransferRuntime, TransferRuntimeError};
 use crate::transfer_worker::{
     TransferStopMode, TransferStore, TransferWorker, TransferWorkerEvent,
@@ -52,6 +52,7 @@ const MAX_LEASE_TTL_MS: u32 = 30_000;
 const DEFAULT_LEASE_TTL_MS: u32 = 5_000;
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
 const INITIAL_TOPOLOGY_TIMEOUT: Duration = Duration::from_secs(5);
+const TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionRole {
@@ -89,6 +90,8 @@ pub(crate) enum SessionRuntimeError {
     Platform,
     #[error("local input release or ownership restore failed")]
     SafetyRecoveryFailed,
+    #[error("native display geometry changed before input injection")]
+    TopologyRefreshRequired,
 }
 
 impl From<TransportError> for SessionRuntimeError {
@@ -163,7 +166,6 @@ pub(crate) enum LocalSessionCommand {
         acknowledgement: oneshot::Sender<Result<TransferId, TransferError>>,
     },
     WakeTransferCancellation,
-    LocalInput(InputEvent),
 }
 
 pub(crate) fn command_channel() -> (
@@ -221,6 +223,83 @@ struct Channels {
     datagrams: DatagramAvailability,
 }
 
+#[derive(Debug, Default)]
+struct LocalTopologyRefresh {
+    pending: Option<LocalTopologyCandidate>,
+    injection_retry: Option<PendingInjectionRetry>,
+    snapshot_deadline: Option<MonotonicMillis>,
+    ack_deadline: Option<MonotonicMillis>,
+}
+
+#[derive(Debug)]
+struct PendingInjectionRetry {
+    input: InputEvent,
+    remaining_effects: Vec<Effect>,
+}
+
+enum RefreshOutcome {
+    Completed(Result<Result<(), SessionRuntimeError>, tokio::time::error::Elapsed>),
+    PlatformSafety(Option<PlatformSafetyEvent>),
+    Disconnect,
+}
+
+impl LocalTopologyRefresh {
+    fn coalesce(&mut self, candidate: Option<LocalTopologyCandidate>) {
+        self.pending = candidate;
+    }
+
+    fn take_pending(&mut self) -> Option<LocalTopologyCandidate> {
+        self.pending.take()
+    }
+
+    fn queue_injection_retry(
+        &mut self,
+        input: InputEvent,
+        remaining_effects: Vec<Effect>,
+    ) -> Result<(), SessionRuntimeError> {
+        if !matches!(input, InputEvent::PointerMotion { .. }) || self.injection_retry.is_some() {
+            return Err(SessionRuntimeError::Platform);
+        }
+        self.injection_retry = Some(PendingInjectionRetry {
+            input,
+            remaining_effects,
+        });
+        Ok(())
+    }
+
+    fn take_injection_retry(&mut self) -> Option<PendingInjectionRetry> {
+        self.injection_retry.take()
+    }
+
+    fn begin_snapshot(&mut self, now: MonotonicMillis) {
+        if self.snapshot_deadline.is_none() {
+            self.snapshot_deadline = Some(now.saturating_add(TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS));
+        }
+    }
+
+    fn finish_snapshot(&mut self) {
+        self.snapshot_deadline = None;
+    }
+
+    fn snapshot_pending(&self) -> bool {
+        self.snapshot_deadline.is_some()
+    }
+
+    fn arm_ack_deadline(&mut self, now: MonotonicMillis) {
+        self.ack_deadline = Some(now.saturating_add(TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS));
+    }
+
+    fn acknowledge(&mut self) {
+        self.ack_deadline = None;
+    }
+
+    fn timed_out(&self, now: MonotonicMillis) -> bool {
+        self.snapshot_deadline
+            .is_some_and(|deadline| now >= deadline)
+            || self.ack_deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
 struct PeerSession<'a> {
     connection: Box<dyn PeerConnection>,
     config: SessionConfig,
@@ -237,6 +316,8 @@ struct PeerSession<'a> {
     renewal_pending: bool,
     routing_to_peer: bool,
     topology: PeerTopologyState,
+    topology_refresh: LocalTopologyRefresh,
+    topology_initialized: bool,
     clipboard: PeerClipboardRuntime,
     transfer: TransferWorker,
     local_grant_epoch: GrantEpoch,
@@ -244,6 +325,10 @@ struct PeerSession<'a> {
     peer_capabilities: Capability,
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear setup/teardown path keeps session safety ordering auditable"
+)]
 pub(crate) async fn run_peer_session(
     mut connection: Box<dyn PeerConnection>,
     config: SessionConfig,
@@ -308,6 +393,8 @@ pub(crate) async fn run_peer_session(
         routing_to_peer: false,
         topology: PeerTopologyState::from_environment()
             .map_err(|_| SessionRuntimeError::Platform)?,
+        topology_refresh: LocalTopologyRefresh::default(),
+        topology_initialized: false,
         clipboard,
         transfer,
         local_grant_epoch: config.local_grant_epoch,
@@ -324,19 +411,30 @@ pub(crate) async fn run_peer_session(
         }
         return Err(SessionRuntimeError::Platform);
     }
-    if session.initialize_topology().await.is_err() {
-        if session
-            .force_recovery(Event::LocalEmergencyStop)
-            .await
-            .is_err()
+    if session
+        .initialize_topology(&mut safety, &mut disconnect)
+        .await
+        .is_err()
+    {
+        if session.core.link_state() != LinkState::Down
+            && session
+                .force_recovery(Event::LocalEmergencyStop)
+                .await
+                .is_err()
         {
             return Err(SessionRuntimeError::SafetyRecoveryFailed);
         }
         return Err(SessionRuntimeError::Platform);
     }
+    session.topology_initialized = true;
     session
-        .set_session_topology_readiness(SessionTopologyReadiness::Ready)
+        .preflight_local_topology_refresh(Some(&mut input), None, &mut safety, &mut disconnect)
         .await?;
+    if !session.core.local_topology_refresh_pending() {
+        session
+            .set_session_topology_readiness(SessionTopologyReadiness::Ready)
+            .await?;
+    }
     session.update_status().await;
     let result = session
         .event_loop(&mut commands, &mut input, &mut safety, &mut disconnect)
@@ -391,6 +489,10 @@ fn new_transfer_runtime(
 }
 
 impl PeerSession<'_> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one biased select keeps safety, refresh, and dispatch priority auditable"
+    )]
     async fn event_loop(
         &mut self,
         commands: &mut mpsc::Receiver<LocalSessionCommand>,
@@ -402,8 +504,17 @@ impl PeerSession<'_> {
         timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             if let Some(event) = platform_safety.pending() {
-                self.handle_local_command(platform_safety_command(event))
-                    .await?;
+                self.handle_local_command(
+                    platform_safety_command(event),
+                    native_input,
+                    platform_safety,
+                    disconnect,
+                )
+                .await?;
+                return Ok(());
+            }
+            if self.topology_refresh.timed_out(self.now()) {
+                self.force_recovery(Event::LocalEmergencyStop).await?;
                 return Ok(());
             }
             tokio::select! {
@@ -418,12 +529,37 @@ impl PeerSession<'_> {
                     let Some(event) = event else {
                         continue;
                     };
-                    if self.handle_local_command(platform_safety_command(event)).await? {
+                    if self.handle_local_command(
+                        platform_safety_command(event),
+                        native_input,
+                        platform_safety,
+                        disconnect,
+                    ).await? {
                         return Ok(());
                     }
                 }
                 Some(command) = commands.recv() => {
-                    if self.handle_local_command(command).await? {
+                    let priority = matches!(
+                        &command,
+                        LocalSessionCommand::EmergencyStop { .. }
+                            | LocalSessionCommand::LocalLocked { .. }
+                            | LocalSessionCommand::LocalSleeping { .. }
+                            | LocalSessionCommand::UpdateLocalGrant { .. }
+                    );
+                    if !priority {
+                        self.preflight_local_topology_refresh(
+                            Some(native_input),
+                            None,
+                            platform_safety,
+                            disconnect,
+                        ).await?;
+                    }
+                    if self.handle_local_command(
+                        command,
+                        native_input,
+                        platform_safety,
+                        disconnect,
+                    ).await? {
                         return Ok(());
                     }
                 }
@@ -432,6 +568,12 @@ impl PeerSession<'_> {
                         self.force_recovery(Event::LocalEmergencyStop).await?;
                         return Err(SessionRuntimeError::Platform);
                     };
+                    self.preflight_local_topology_refresh(
+                        Some(native_input),
+                        None,
+                        platform_safety,
+                        disconnect,
+                    ).await?;
                     if let Err(error) = self.handle_transfer_worker_event(event).await {
                         if transfer_send_failure_is_link_loss(error) {
                             self.force_recovery(Event::LinkDisconnected).await?;
@@ -448,7 +590,12 @@ impl PeerSession<'_> {
                             return Err(SessionRuntimeError::Transport);
                         }
                     };
-                    if self.handle_transport_event(event).await? {
+                    if self.handle_transport_event(
+                        event,
+                        Some(native_input),
+                        platform_safety,
+                        disconnect,
+                    ).await? {
                         return Ok(());
                     }
                 }
@@ -457,12 +604,15 @@ impl PeerSession<'_> {
                         self.force_recovery(Event::LocalEmergencyStop).await?;
                         return Err(SessionRuntimeError::Platform);
                     };
-                    if self.handle_local_command(LocalSessionCommand::LocalInput(input)).await? {
-                        return Ok(());
-                    }
+                    self.handle_native_input(
+                        input,
+                        native_input,
+                        platform_safety,
+                        disconnect,
+                    ).await?;
                 }
                 _ = timer.tick() => {
-                    if self.handle_timer().await? {
+                    if self.handle_timer(native_input, platform_safety, disconnect).await? {
                         return Ok(());
                     }
                 }
@@ -473,17 +623,32 @@ impl PeerSession<'_> {
     async fn handle_local_command(
         &mut self,
         command: LocalSessionCommand,
+        native_input: &mut NativeInputReceiver,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
     ) -> Result<bool, SessionRuntimeError> {
         match command {
             LocalSessionCommand::RequestFocus {
                 ttl_ms,
                 acknowledgement,
             } => {
-                let result = if self.topology.prepare_manual_focus().is_err() {
-                    Err(SessionRuntimeError::FocusRejected)
-                } else {
-                    let pointer_enter_required = self.topology.pointer_enter_required();
-                    self.request_focus(ttl_ms, pointer_enter_required).await
+                let result = match self
+                    .preflight_local_topology_refresh(
+                        Some(native_input),
+                        None,
+                        platform_safety,
+                        disconnect,
+                    )
+                    .await
+                {
+                    Err(error) => Err(error),
+                    Ok(_) if self.topology.prepare_manual_focus().is_err() => {
+                        Err(SessionRuntimeError::FocusRejected)
+                    }
+                    Ok(_) => {
+                        let pointer_enter_required = self.topology.pointer_enter_required();
+                        self.request_focus(ttl_ms, pointer_enter_required).await
+                    }
                 };
                 let failed = result.is_err();
                 let _ = acknowledgement.send(result);
@@ -557,18 +722,57 @@ impl PeerSession<'_> {
             LocalSessionCommand::WakeTransferCancellation => {
                 self.transfer.try_wake_cancellation()?;
             }
-            LocalSessionCommand::LocalInput(event) => {
-                self.handle_local_input(event).await?;
-            }
         }
         self.update_status().await;
         Ok(false)
     }
 
-    async fn handle_timer(&mut self) -> Result<bool, SessionRuntimeError> {
+    async fn handle_native_input(
+        &mut self,
+        input: InputEvent,
+        native_input: &mut NativeInputReceiver,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<(), SessionRuntimeError> {
+        if !self
+            .preflight_local_topology_refresh(
+                Some(native_input),
+                Some(input),
+                platform_safety,
+                disconnect,
+            )
+            .await?
+        {
+            self.handle_local_input(input).await?;
+        }
+        self.update_status().await;
+        Ok(())
+    }
+
+    async fn handle_timer(
+        &mut self,
+        native_input: &mut NativeInputReceiver,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<bool, SessionRuntimeError> {
+        if self.topology_refresh.timed_out(self.now()) {
+            self.force_recovery(Event::LocalEmergencyStop).await?;
+            return Ok(true);
+        }
+        self.preflight_local_topology_refresh(
+            Some(native_input),
+            None,
+            platform_safety,
+            disconnect,
+        )
+        .await?;
         if self.platform.ensure_healthy().is_err() {
             self.force_recovery(Event::LocalEmergencyStop).await?;
             return Err(SessionRuntimeError::Platform);
+        }
+        if self.topology_refresh.timed_out(self.now()) {
+            self.force_recovery(Event::LocalEmergencyStop).await?;
+            return Ok(true);
         }
         let clipboard_messages = self.clipboard.poll()?;
         self.send_clipboard_messages(clipboard_messages).await?;
@@ -596,23 +800,57 @@ impl PeerSession<'_> {
         Ok(disconnect)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive channel dispatch keeps preflight and close ordering explicit"
+    )]
     async fn handle_transport_event(
         &mut self,
         event: TransportEvent,
+        mut native_input: Option<&mut NativeInputReceiver>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
     ) -> Result<bool, SessionRuntimeError> {
         event
             .validate(self.channels.datagrams)
             .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+        let control_dispatch = matches!(
+            &event,
+            TransportEvent::ReliableData { channel, .. } if *channel == self.channels.control
+        );
+        let terminal_dispatch = matches!(&event, TransportEvent::Closed(_))
+            || matches!(
+                &event,
+                TransportEvent::ChannelClosed { channel }
+                    if *channel == self.channels.control
+                        || *channel == self.channels.reliable_input
+                        || *channel == self.channels.clipboard
+                        || *channel == self.channels.file_manifest
+                        || *channel == self.channels.file_data
+            );
+        if !control_dispatch && !terminal_dispatch {
+            self.preflight_local_topology_refresh(
+                native_input.as_deref_mut(),
+                None,
+                platform_safety,
+                disconnect,
+            )
+            .await?;
+        }
         let outcome = match event {
             TransportEvent::ReliableData {
                 channel, payload, ..
-            } if channel == self.channels.control => self.handle_control(&payload).await?,
+            } if channel == self.channels.control => {
+                self.handle_control(&payload, native_input, platform_safety, disconnect)
+                    .await?
+            }
             TransportEvent::ReliableData {
                 channel, payload, ..
             } if channel == self.channels.reliable_input => {
                 let message = decode_reliable_input(&payload)
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                self.handle_input(message).await?;
+                self.handle_input(message, native_input, platform_safety, disconnect)
+                    .await?;
                 false
             }
             TransportEvent::ReliableData {
@@ -620,7 +858,8 @@ impl PeerSession<'_> {
             } if Some(channel) == self.channels.pointer_fallback => {
                 let message = decode_pointer_fallback(&payload)
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                self.handle_input(message).await?;
+                self.handle_input(message, native_input, platform_safety, disconnect)
+                    .await?;
                 false
             }
             TransportEvent::ReliableData {
@@ -647,7 +886,8 @@ impl PeerSession<'_> {
             TransportEvent::Datagram { payload } => {
                 let message = decode_datagram(&payload)
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                self.handle_input(message).await?;
+                self.handle_input(message, native_input, platform_safety, disconnect)
+                    .await?;
                 false
             }
             TransportEvent::Closed(reason) => {
@@ -676,12 +916,30 @@ impl PeerSession<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn handle_control(&mut self, payload: &[u8]) -> Result<bool, SessionRuntimeError> {
+    async fn handle_control(
+        &mut self,
+        payload: &[u8],
+        native_input: Option<&mut NativeInputReceiver>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<bool, SessionRuntimeError> {
         let message =
             decode_control(payload).map_err(|_| SessionRuntimeError::ProtocolViolation)?;
         let WireMessage::Control(control) = message else {
             return Err(SessionRuntimeError::ProtocolViolation);
         };
+        let priority = matches!(
+            &control,
+            ControlMessage::CapabilityGrant { .. }
+                | ControlMessage::CapabilityRevoke { .. }
+                | ControlMessage::SessionClose { .. }
+                | ControlMessage::EmergencyDisconnect { .. }
+        );
+        if !priority {
+            self.preflight_local_topology_refresh(native_input, None, platform_safety, disconnect)
+                .await?;
+        }
+        let local_topology_ack = matches!(&control, ControlMessage::DisplayTopologyAck { .. });
         let (effects, disconnect) = match control {
             ControlMessage::CapabilityGrant {
                 peer,
@@ -813,47 +1071,54 @@ impl PeerSession<'_> {
             _ => return Err(SessionRuntimeError::ProtocolViolation),
         };
         self.apply_remote_effects(effects).await?;
+        if local_topology_ack && self.topology_initialized {
+            self.drive_local_topology_refresh().await?;
+        }
         Ok(disconnect)
     }
 
-    async fn handle_input(&mut self, message: WireMessage) -> Result<(), SessionRuntimeError> {
+    async fn handle_input(
+        &mut self,
+        message: WireMessage,
+        native_input: Option<&mut NativeInputReceiver>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<(), SessionRuntimeError> {
         let WireMessage::Input(input) = message else {
             return Err(SessionRuntimeError::ProtocolViolation);
         };
         let received_at = self.now();
-        let effects =
-            match decode_event(&input).map_err(|_| SessionRuntimeError::ProtocolViolation)? {
-                DecodedInput::Event(event) => {
-                    let event = self
-                        .topology
-                        .resolve_incoming(event)
-                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                    self.core.handle(Event::RemoteInput {
-                        meta: *input.meta(),
-                        lease_id: LeaseId::new(input.lease_id()),
-                        received_at,
-                        input: event,
-                    })
-                }
-                DecodedInput::PointerEnter(position) => {
-                    let position = self
-                        .topology
-                        .resolve_incoming_position(position)
-                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                    self.core.handle(Event::RemotePointerEnter {
-                        meta: *input.meta(),
-                        lease_id: LeaseId::new(input.lease_id()),
-                        received_at,
-                        position,
-                    })
-                }
-                DecodedInput::ReleaseAll => self.core.handle(Event::RemoteReleaseAll {
-                    meta: *input.meta(),
-                    lease_id: LeaseId::new(input.lease_id()),
-                    received_at,
-                }),
-            };
+        let effects = match decode_event(&input)
+            .map_err(|_| SessionRuntimeError::ProtocolViolation)?
+        {
+            DecodedInput::Event(event) => self.core.handle(Event::RemoteInput {
+                meta: *input.meta(),
+                lease_id: LeaseId::new(input.lease_id()),
+                received_at,
+                input: event,
+            }),
+            DecodedInput::PointerEnter(position) => self.core.handle(Event::RemotePointerEnter {
+                meta: *input.meta(),
+                lease_id: LeaseId::new(input.lease_id()),
+                received_at,
+                position,
+            }),
+            DecodedInput::ReleaseAll => self.core.handle(Event::RemoteReleaseAll {
+                meta: *input.meta(),
+                lease_id: LeaseId::new(input.lease_id()),
+                received_at,
+            }),
+        };
         if let Err(error) = self.apply_remote_effects(effects).await {
+            if matches!(error, SessionRuntimeError::TopologyRefreshRequired) {
+                self.preflight_required_local_topology_refresh(
+                    native_input,
+                    platform_safety,
+                    disconnect,
+                )
+                .await?;
+                return Ok(());
+            }
             if self
                 .force_recovery(Event::LocalEmergencyStop)
                 .await
@@ -891,13 +1156,15 @@ impl PeerSession<'_> {
         if route_to_peer != self.routing_to_peer {
             if self.platform.set_routing_to_peer(route_to_peer).is_err() {
                 let _ = self.platform.restore_local_ownership();
+                self.session_safety.latch_failure();
                 self.routing_to_peer = false;
                 return Err(SessionRuntimeError::Platform);
             }
             self.routing_to_peer = route_to_peer;
         }
         let mut deferred_platform_error = None;
-        for effect in effects {
+        let mut effects = effects.into_iter();
+        while let Some(effect) = effects.next() {
             match effect {
                 Effect::RequestRemoteFocus {
                     lease_id,
@@ -962,9 +1229,27 @@ impl PeerSession<'_> {
                 Effect::SendReleaseAll { lease_id } => {
                     self.send_release_all(lease_id).await?;
                 }
-                Effect::InjectInput(input) => self.platform.inject(input)?,
+                Effect::InjectInput(input) => {
+                    let native_input = self
+                        .topology
+                        .resolve_incoming(input)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                    match self.platform.inject(native_input) {
+                        Ok(()) => {}
+                        Err(PlatformPortError::DisplaySnapshotPending) => {
+                            self.topology_refresh
+                                .queue_injection_retry(input, effects.collect())?;
+                            return Err(SessionRuntimeError::TopologyRefreshRequired);
+                        }
+                        Err(_) => {
+                            self.session_safety.latch_failure();
+                            return Err(SessionRuntimeError::Platform);
+                        }
+                    }
+                }
                 Effect::ReleaseInjectedInput { releases } => {
                     if self.platform.release_injected(&releases).is_err() {
+                        self.session_safety.latch_failure();
                         deferred_platform_error = Some(SessionRuntimeError::Platform);
                     }
                 }
@@ -977,6 +1262,7 @@ impl PeerSession<'_> {
                 }
                 Effect::RestoreLocalOwnership => {
                     if self.platform.restore_local_ownership().is_err() {
+                        self.session_safety.latch_failure();
                         deferred_platform_error = Some(SessionRuntimeError::Platform);
                     }
                     self.routing_to_peer = false;
@@ -1044,22 +1330,55 @@ impl PeerSession<'_> {
         self.send_control(message).await
     }
 
-    async fn initialize_topology(&mut self) -> Result<(), SessionRuntimeError> {
-        let snapshots = self.platform.display_snapshot()?;
-        let topology = self
-            .topology
-            .reconcile_local(&snapshots)
-            .map_err(|_| SessionRuntimeError::Platform)?
-            .ok_or(SessionRuntimeError::Platform)?;
+    async fn initialize_topology(
+        &mut self,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<(), SessionRuntimeError> {
+        let acquisition = async {
+            loop {
+                match self.platform.display_snapshot() {
+                    Ok(snapshots) => {
+                        return self
+                            .topology
+                            .prepare_local_candidate(&snapshots)
+                            .map_err(|_| SessionRuntimeError::Platform)?
+                            .ok_or(SessionRuntimeError::Platform);
+                    }
+                    Err(PlatformPortError::DisplaySnapshotPending) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                tokio::select! {
+                    biased;
+                    changed = disconnect.changed() => {
+                        if changed.is_ok() {
+                            self.force_recovery(Event::LocalEmergencyStop).await?;
+                        }
+                        return Err(SessionRuntimeError::Platform);
+                    }
+                    event = platform_safety.changed() => {
+                        let Some(event) = event else {
+                            continue;
+                        };
+                        self.force_recovery(core_event_for_platform_safety(event)).await?;
+                        return Err(SessionRuntimeError::Platform);
+                    }
+                    () = sleep(TIMER_INTERVAL) => {}
+                }
+            }
+        };
+        let candidate = tokio::time::timeout(INITIAL_TOPOLOGY_TIMEOUT, acquisition)
+            .await
+            .map_err(|_| SessionRuntimeError::Platform)??;
         if self.core.local_grant_allows_peer_input() {
-            let revision = topology.revision();
-            let effects = self.core.handle(Event::LocalTopologyPublished { revision });
-            self.apply_local_effects(effects).await?;
-            self.topology.record_local_publish(revision);
-            let meta = self.next_meta(SequenceKind::Control);
-            self.send_control(ControlMessage::DisplayTopology { meta, topology })
-                .await?;
+            self.publish_local_candidate(candidate).await?;
+        } else {
+            self.topology
+                .commit_local_candidate(candidate)
+                .map_err(|_| SessionRuntimeError::Platform)?;
         }
+        let effects = self.core.handle(Event::LocalTopologyRefreshStarted);
+        self.apply_local_effects(effects).await?;
 
         let needs_remote = self.core.peer_grant_allows_local_input();
         let needs_ack = self.core.local_grant_allows_peer_input();
@@ -1071,15 +1390,256 @@ impl PeerSession<'_> {
                 if remote_ready && local_ready {
                     return Ok(());
                 }
-                let event = self.connection.next_event().await?;
-                if self.handle_transport_event(event).await? {
-                    return Err(SessionRuntimeError::Transport);
+                tokio::select! {
+                    biased;
+                    changed = disconnect.changed() => {
+                        if changed.is_ok() {
+                            self.force_recovery(Event::LocalEmergencyStop).await?;
+                        }
+                        return Err(SessionRuntimeError::Platform);
+                    }
+                    event = platform_safety.changed() => {
+                        let Some(event) = event else {
+                            continue;
+                        };
+                        self.force_recovery(core_event_for_platform_safety(event)).await?;
+                        return Err(SessionRuntimeError::Platform);
+                    }
+                    event = self.connection.next_event() => {
+                        if self
+                            .handle_transport_event(
+                                event?,
+                                None,
+                                platform_safety,
+                                disconnect,
+                            )
+                            .await?
+                        {
+                            return Err(SessionRuntimeError::Transport);
+                        }
+                    }
                 }
             }
         };
         tokio::time::timeout(INITIAL_TOPOLOGY_TIMEOUT, exchange)
             .await
-            .map_err(|_| SessionRuntimeError::Transport)?
+            .map_err(|_| SessionRuntimeError::Transport)??;
+        let effects = self.core.handle(Event::LocalTopologyRefreshUnchanged);
+        self.apply_local_effects(effects).await
+    }
+
+    async fn preflight_local_topology_refresh(
+        &mut self,
+        native_input: Option<&mut NativeInputReceiver>,
+        admitted_input: Option<InputEvent>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<bool, SessionRuntimeError> {
+        if !self.topology_initialized {
+            return Ok(false);
+        }
+        if !self.platform.display_change_pending()? && !self.topology_refresh.snapshot_pending() {
+            return Ok(false);
+        }
+        self.run_local_topology_refresh_with_priority(
+            native_input,
+            admitted_input,
+            platform_safety,
+            disconnect,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn preflight_required_local_topology_refresh(
+        &mut self,
+        native_input: Option<&mut NativeInputReceiver>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<(), SessionRuntimeError> {
+        self.run_local_topology_refresh_with_priority(
+            native_input,
+            None,
+            platform_safety,
+            disconnect,
+        )
+        .await
+    }
+
+    async fn run_local_topology_refresh_with_priority(
+        &mut self,
+        native_input: Option<&mut NativeInputReceiver>,
+        admitted_input: Option<InputEvent>,
+        platform_safety: &mut PlatformSafetyReceiver,
+        disconnect: &mut watch::Receiver<u64>,
+    ) -> Result<(), SessionRuntimeError> {
+        if let Some(event) = platform_safety.pending() {
+            self.force_recovery(core_event_for_platform_safety(event))
+                .await?;
+            return Err(SessionRuntimeError::Platform);
+        }
+
+        let outcome = {
+            let refresh = tokio::time::timeout(
+                Duration::from_millis(TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS),
+                self.observe_local_topology_change(native_input, admitted_input),
+            );
+            tokio::select! {
+                biased;
+                changed = disconnect.changed() => {
+                    let _ = changed;
+                    RefreshOutcome::Disconnect
+                }
+                event = platform_safety.changed() => RefreshOutcome::PlatformSafety(event),
+                result = refresh => RefreshOutcome::Completed(result),
+            }
+        };
+
+        match outcome {
+            RefreshOutcome::Completed(Ok(result)) => result,
+            RefreshOutcome::Completed(Err(_))
+            | RefreshOutcome::Disconnect
+            | RefreshOutcome::PlatformSafety(None) => {
+                self.force_recovery(Event::LocalEmergencyStop).await?;
+                Err(SessionRuntimeError::Platform)
+            }
+            RefreshOutcome::PlatformSafety(Some(event)) => {
+                self.force_recovery(core_event_for_platform_safety(event))
+                    .await?;
+                Err(SessionRuntimeError::Platform)
+            }
+        }
+    }
+
+    async fn observe_local_topology_change(
+        &mut self,
+        native_input: Option<&mut NativeInputReceiver>,
+        admitted_input: Option<InputEvent>,
+    ) -> Result<(), SessionRuntimeError> {
+        if !self.topology_refresh.snapshot_pending() {
+            self.set_session_topology_readiness(SessionTopologyReadiness::Synchronizing)
+                .await?;
+            self.topology_refresh.begin_snapshot(self.now());
+            self.platform.set_routing_to_peer(false)?;
+            self.routing_to_peer = false;
+            self.platform.pause_input_admission()?;
+            if let Some(native_input) = native_input {
+                let mut admitted = admitted_input.into_iter().collect::<Vec<_>>();
+                admitted.extend(
+                    native_input
+                        .drain_pending()
+                        .map_err(|_| SessionRuntimeError::Platform)?,
+                );
+                if matches!(
+                    self.core.focus_state(),
+                    CoreFocusState::ControllingRemote { .. }
+                ) {
+                    for input in admitted {
+                        self.handle_local_input(input).await?;
+                    }
+                }
+            }
+            let effects = self.core.handle(Event::LocalTopologyRefreshStarted);
+            self.apply_local_effects(effects).await?;
+        }
+        let snapshots = match self.platform.display_snapshot() {
+            Ok(snapshots) => snapshots,
+            Err(PlatformPortError::DisplaySnapshotPending) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if self.topology_refresh.timed_out(self.now()) {
+            return Err(SessionRuntimeError::Platform);
+        }
+        let candidate = self
+            .topology
+            .prepare_local_candidate(&snapshots)
+            .map_err(|_| SessionRuntimeError::Platform)?;
+        let changed = candidate.is_some();
+        self.topology_refresh.coalesce(candidate);
+        self.topology_refresh.finish_snapshot();
+        if !changed {
+            let effects = self.core.handle(Event::LocalTopologyRefreshUnchanged);
+            self.apply_local_effects(effects).await?;
+            self.platform.resume_input_admission();
+        } else if !self.core.local_grant_allows_peer_input() {
+            let candidate = self
+                .topology_refresh
+                .take_pending()
+                .ok_or(SessionRuntimeError::Platform)?;
+            self.topology
+                .commit_local_candidate(candidate)
+                .map_err(|_| SessionRuntimeError::Platform)?;
+            let effects = self.core.handle(Event::LocalTopologyRefreshUnchanged);
+            self.apply_local_effects(effects).await?;
+            self.platform.resume_input_admission();
+            self.set_session_topology_readiness(SessionTopologyReadiness::Ready)
+                .await?;
+            self.retry_pending_injection().await?;
+            return Ok(());
+        }
+        self.drive_local_topology_refresh().await?;
+        self.retry_pending_injection().await
+    }
+
+    async fn retry_pending_injection(&mut self) -> Result<(), SessionRuntimeError> {
+        let Some(retry) = self.topology_refresh.take_injection_retry() else {
+            return Ok(());
+        };
+        let Ok(input) = self.topology.resolve_incoming(retry.input) else {
+            // The admitted pointer targeted a display removed by the stable
+            // replacement graph. It must never resolve to a retired native ID.
+            return Ok(());
+        };
+        if self.platform.inject(input).is_ok() {
+            self.apply_remote_effects(retry.remaining_effects).await
+        } else {
+            // One stable-snapshot retry is the hard bound. A second transition
+            // or any native failure is recovered fail-closed by the caller.
+            self.session_safety.latch_failure();
+            Err(SessionRuntimeError::Platform)
+        }
+    }
+
+    async fn drive_local_topology_refresh(&mut self) -> Result<(), SessionRuntimeError> {
+        if !self.topology.local_ack_pending() {
+            self.topology_refresh.acknowledge();
+        }
+        if self.topology.local_ack_pending() || self.topology_refresh.snapshot_pending() {
+            return Ok(());
+        }
+        if let Some(candidate) = self.topology_refresh.take_pending() {
+            return self.publish_local_candidate(candidate).await;
+        }
+        if !self.core.local_grant_allows_peer_input() || self.topology.local_is_ready() {
+            self.set_session_topology_readiness(SessionTopologyReadiness::Ready)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_local_candidate(
+        &mut self,
+        candidate: LocalTopologyCandidate,
+    ) -> Result<(), SessionRuntimeError> {
+        let revision = candidate.revision();
+        let effects = self.core.handle(Event::LocalTopologyPublished { revision });
+        self.apply_local_effects(effects).await?;
+        let topology = self
+            .topology
+            .commit_local_candidate(candidate)
+            .map_err(|_| SessionRuntimeError::Platform)?;
+        if topology.revision() != revision {
+            return Err(SessionRuntimeError::ProtocolViolation);
+        }
+        self.topology.record_local_publish(revision);
+        let meta = self.next_meta(SequenceKind::Control);
+        self.send_control(ControlMessage::DisplayTopology { meta, topology })
+            .await?;
+        self.platform.resume_input_admission();
+        if self.topology_initialized {
+            self.topology_refresh.arm_ack_deadline(self.now());
+        }
+        Ok(())
     }
 
     async fn request_focus(
@@ -1099,6 +1659,9 @@ impl PeerSession<'_> {
     }
 
     async fn handle_local_input(&mut self, event: InputEvent) -> Result<(), SessionRuntimeError> {
+        if self.core.local_topology_refresh_pending() {
+            return Ok(());
+        }
         if let InputEvent::PointerMotion { position } = event {
             let action = self
                 .topology
@@ -1252,11 +1815,14 @@ impl PeerSession<'_> {
             if matches!(self.channels.datagrams, DatagramAvailability::Available(_)) {
                 let payload = encode_datagram(&WireMessage::Input(input))
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
-                self.connection
-                    .execute(TransportCommand::SendDatagram {
+                tokio::time::timeout(
+                    Duration::from_millis(TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS),
+                    self.connection.execute(TransportCommand::SendDatagram {
                         payload: Bytes::from(payload),
-                    })
-                    .await?;
+                    }),
+                )
+                .await
+                .map_err(|_| SessionRuntimeError::Transport)??;
             } else {
                 let channel = self
                     .channels
@@ -1280,13 +1846,16 @@ impl PeerSession<'_> {
         channel: ChannelId,
         payload: Vec<u8>,
     ) -> Result<(), SessionRuntimeError> {
-        self.connection
-            .execute(TransportCommand::SendReliable {
+        tokio::time::timeout(
+            Duration::from_millis(TOPOLOGY_REFRESH_PHASE_TIMEOUT_MS),
+            self.connection.execute(TransportCommand::SendReliable {
                 channel,
                 payload: Bytes::from(payload),
                 end_of_stream: false,
-            })
-            .await?;
+            }),
+        )
+        .await
+        .map_err(|_| SessionRuntimeError::Transport)??;
         Ok(())
     }
 
@@ -1363,6 +1932,14 @@ impl PeerSession<'_> {
                 .await?;
             Ok(())
         } else {
+            if matches!(
+                result,
+                Err(SessionRuntimeError::Platform | SessionRuntimeError::SafetyRecoveryFailed)
+            ) {
+                // Publish the irreversible admission fence before any awaited
+                // status work or error return can race a replacement session.
+                self.session_safety.latch_failure();
+            }
             let mut status = self.status.write().await;
             status.input_owner = InputOwner::Local;
             status.focus_state = AgentFocusState::Local;
@@ -1428,7 +2005,7 @@ async fn publish_session_topology_readiness(
     readiness: SessionTopologyReadiness,
 ) -> Result<(), SessionRuntimeError> {
     let mut status = status.write().await;
-    if readiness == SessionTopologyReadiness::Ready && session_safety.blocks_ready() {
+    if readiness != SessionTopologyReadiness::NotConnected && session_safety.blocks_ready() {
         status.phase = nodavo_local_ipc::AgentPhase::Stopping;
         status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
         return Err(SessionRuntimeError::SafetyRecoveryFailed);
@@ -1447,6 +2024,14 @@ fn platform_safety_command(event: PlatformSafetyEvent) -> LocalSessionCommand {
         PlatformSafetyEvent::CaptureFailed => {
             LocalSessionCommand::EmergencyStop { acknowledgement }
         }
+    }
+}
+
+const fn core_event_for_platform_safety(event: PlatformSafetyEvent) -> Event {
+    match event {
+        PlatformSafetyEvent::LocalLocked => Event::LocalLocked,
+        PlatformSafetyEvent::LocalSleeping => Event::LocalSleeping,
+        PlatformSafetyEvent::CaptureFailed => Event::LocalEmergencyStop,
     }
 }
 
@@ -1850,6 +2435,7 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::platform_port::VirtualPlatformPort;
+    use crate::topology_runtime::NativeDisplaySnapshot;
 
     use super::*;
 
@@ -1869,6 +2455,49 @@ mod tests {
         ));
     }
 
+    fn display_snapshot(native_id: u64, pixel_width: u32) -> NativeDisplaySnapshot {
+        NativeDisplaySnapshot {
+            native_id: nodavo_input::DisplayId::new(native_id),
+            origin_x_milli: 0,
+            origin_y_milli: 0,
+            pixel_width,
+            pixel_height: 1_080,
+            scale_x_milli: 1_000,
+            scale_y_milli: 1_000,
+            rotation: nodavo_protocol::DisplayRotation::Degrees0,
+        }
+    }
+
+    #[test]
+    fn missing_refresh_ack_deadline_survives_a_dirty_storm_and_latest_wins() {
+        let mut topology = PeerTopologyState::from_environment().unwrap();
+        let mut refresh = LocalTopologyRefresh::default();
+        refresh.arm_ack_deadline(MonotonicMillis::new(10));
+
+        for width in [1_280, 1_440, 1_920] {
+            let candidate = topology
+                .prepare_local_candidate(&[display_snapshot(101, width)])
+                .unwrap();
+            refresh.coalesce(candidate);
+        }
+
+        assert!(!refresh.timed_out(MonotonicMillis::new(5_009)));
+        assert!(refresh.timed_out(MonotonicMillis::new(5_010)));
+        let committed = topology
+            .commit_local_candidate(refresh.take_pending().unwrap())
+            .unwrap();
+        assert_eq!(committed.displays()[0].pixel_width(), 1_920);
+        assert!(refresh.take_pending().is_none());
+
+        let mut snapshot_refresh = LocalTopologyRefresh::default();
+        snapshot_refresh.begin_snapshot(MonotonicMillis::new(10));
+        for ready_event_at in [11, 100, 1_000, 5_009] {
+            snapshot_refresh.begin_snapshot(MonotonicMillis::new(ready_event_at));
+            assert!(!snapshot_refresh.timed_out(MonotonicMillis::new(5_009)));
+        }
+        assert!(snapshot_refresh.timed_out(MonotonicMillis::new(5_010)));
+    }
+
     struct MemoryConnection {
         remote: Endpoint,
         inbound: mpsc::UnboundedReceiver<TransportEvent>,
@@ -1876,6 +2505,7 @@ mod tests {
         peer_events: mpsc::UnboundedSender<TransportEvent>,
         next_channel: Arc<AtomicU64>,
         closed: bool,
+        required_safety_fence_on_close: Option<Arc<SessionSafetyState>>,
     }
 
     impl PeerConnection for MemoryConnection {
@@ -1937,6 +2567,12 @@ mod tests {
                         .send(TransportEvent::Datagram { payload })
                         .map_err(|_| TransportError::Closed)?,
                     TransportCommand::Close(reason) => {
+                        if let Some(safety) = &self.required_safety_fence_on_close {
+                            assert!(
+                                safety.failure_latched(),
+                                "native recovery failure was not fenced before transport close"
+                            );
+                        }
                         self.closed = true;
                         let _ = self.peer_events.send(TransportEvent::Closed(reason));
                     }
@@ -1950,7 +2586,9 @@ mod tests {
         }
     }
 
-    fn memory_pair() -> (Box<dyn PeerConnection>, Box<dyn PeerConnection>) {
+    fn memory_pair(
+        b_close_safety: Option<Arc<SessionSafetyState>>,
+    ) -> (Box<dyn PeerConnection>, Box<dyn PeerConnection>) {
         let (a_tx, a_rx) = mpsc::unbounded_channel();
         let (b_tx, b_rx) = mpsc::unbounded_channel();
         let next_channel = Arc::new(AtomicU64::new(1));
@@ -1966,6 +2604,7 @@ mod tests {
                 peer_events: b_tx.clone(),
                 next_channel: Arc::clone(&next_channel),
                 closed: false,
+                required_safety_fence_on_close: None,
             }),
             Box::new(MemoryConnection {
                 remote: a_endpoint,
@@ -1974,6 +2613,7 @@ mod tests {
                 peer_events: a_tx,
                 next_channel,
                 closed: false,
+                required_safety_fence_on_close: b_close_safety,
             }),
         )
     }
@@ -2071,7 +2711,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn two_peers_return_focus_on_same_link_and_recover_before_acknowledgement() {
-        let (a_connection, b_connection) = memory_pair();
+        let a_session_safety = Arc::new(SessionSafetyState::default());
+        let b_session_safety = Arc::new(SessionSafetyState::default());
+        let (a_connection, b_connection) = memory_pair(Some(Arc::clone(&b_session_safety)));
         let grants = CapabilityGrants::NONE
             .with(TrustedCapability::RemoteInput)
             .with(TrustedCapability::ClipboardRead)
@@ -2083,6 +2725,7 @@ mod tests {
         let b_platform = VirtualPlatformPort::default();
         let a_observer = a_platform.clone();
         let b_observer = b_platform.clone();
+        b_observer.signal_unstable_display_change();
         let (a_commands, a_receiver) = command_channel();
         let (b_commands, b_receiver) = command_channel();
         let (a_native_sender, a_native_receiver) = crate::native_bridge::native_input_channel();
@@ -2111,8 +2754,8 @@ mod tests {
         fs::write(&outbound_path, outbound_content).unwrap();
         let (_a_disconnect, a_disconnect) = watch::channel(0_u64);
         let (_b_disconnect, b_disconnect) = watch::channel(0_u64);
-
         let a_status_task = Arc::clone(&a_status);
+        let a_session_safety_task = Arc::clone(&a_session_safety);
         let a_task = tokio::spawn(async move {
             let mut platform = a_platform;
             run_peer_session(
@@ -2134,7 +2777,7 @@ mod tests {
                     clipboard: Box::new(a_clipboard),
                     transfer: a_transfer,
                     transfer_store: a_transfer_store,
-                    session_safety: Arc::new(SessionSafetyState::default()),
+                    session_safety: a_session_safety_task,
                 },
                 a_disconnect,
                 &a_status_task,
@@ -2143,6 +2786,7 @@ mod tests {
             .await
         });
         let b_status_task = Arc::clone(&b_status);
+        let b_session_safety_task = Arc::clone(&b_session_safety);
         let b_task = tokio::spawn(async move {
             let mut platform = b_platform;
             run_peer_session(
@@ -2164,7 +2808,7 @@ mod tests {
                     clipboard: Box::new(b_clipboard),
                     transfer: b_transfer,
                     transfer_store: b_transfer_store,
-                    session_safety: Arc::new(SessionSafetyState::default()),
+                    session_safety: b_session_safety_task,
                 },
                 b_disconnect,
                 &b_status_task,
@@ -2172,6 +2816,20 @@ mod tests {
             )
             .await
         });
+
+        timeout(Duration::from_secs(2), async {
+            while b_observer.snapshot().display_snapshot_attempts == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial topology acquisition did not retry a pending snapshot");
+        assert_eq!(
+            b_status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::Synchronizing
+        );
+        assert!(!b_task.is_finished());
+        b_observer.stabilize_display_change(vec![display_snapshot(101, 1_920)]);
 
         timeout(Duration::from_secs(2), async {
             while b_clipboard_observer.applied_bytes() != clipboard_content {
@@ -2209,6 +2867,43 @@ mod tests {
         })
         .await
         .expect("file did not cross the dedicated manifest/data channels");
+
+        // A platform transition discovered by absolute placement is retried
+        // exactly once after a stable snapshot. Refresh quiescence retires the
+        // interrupted lease, so the next focus request starts from Local.
+        b_observer.fail_next_pointer_injection_for_topology();
+        let (ack, received) = oneshot::channel();
+        a_commands
+            .send(LocalSessionCommand::RequestFocus {
+                ttl_ms: 5_000,
+                acknowledgement: ack,
+            })
+            .await
+            .unwrap();
+        received.await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let state = b_observer.snapshot();
+                if state.injection_attempts >= 2
+                    && a_status.read().await.focus_state == AgentFocusState::Local
+                    && b_status.read().await.focus_state == AgentFocusState::Local
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("absolute injection was not retried after topology stabilization");
+        assert_eq!(
+            b_observer
+                .snapshot()
+                .injected
+                .iter()
+                .filter(|event| matches!(event, InputEvent::PointerMotion { .. }))
+                .count(),
+            1
+        );
 
         let (ack, received) = oneshot::channel();
         a_commands
@@ -2249,17 +2944,121 @@ mod tests {
         .await
         .expect("relative pointer delta did not follow reliable entry placement");
 
+        // The stable revision becomes available entirely between timer ticks;
+        // the per-monitor revision cursor must still retain that edge.
+        a_observer.stabilize_display_change(vec![display_snapshot(101, 1_440)]);
+        wait_for_owner(&b_status, InputOwner::Local).await;
+        wait_for_focus(&a_status, AgentFocusState::Local).await;
+        assert!(!a_observer.snapshot().routing_to_peer);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if a_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Ready
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hot-plug topology acknowledgement timed out");
+        assert!(!a_observer.snapshot().routing_to_peer);
+
+        a_observer.signal_unstable_display_change();
         let (ack, received) = oneshot::channel();
-        a_commands
-            .send(LocalSessionCommand::ReleaseFocus {
+        b_commands
+            .send(LocalSessionCommand::RequestFocus {
+                ttl_ms: 5_000,
                 acknowledgement: ack,
             })
             .await
             .unwrap();
         received.await.unwrap().unwrap();
-        wait_for_owner(&b_status, InputOwner::Local).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if a_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Synchronizing
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("focus request did not yield to pre-dispatch topology refresh");
+        wait_for_owner(&a_status, InputOwner::Local).await;
+        wait_for_focus(&b_status, AgentFocusState::Local).await;
+        assert!(!b_observer.snapshot().routing_to_peer);
+        a_observer.stabilize_display_change(vec![display_snapshot(101, 1_500)]);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if a_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Ready
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("focus-gated topology refresh did not complete");
+
+        let (ack, received) = oneshot::channel();
+        a_commands
+            .send(LocalSessionCommand::RequestFocus {
+                ttl_ms: 5_000,
+                acknowledgement: ack,
+            })
+            .await
+            .unwrap();
+        received.await.unwrap().unwrap();
+        wait_for_focus(&a_status, AgentFocusState::ControllingPeer).await;
+        wait_for_focus(&b_status, AgentFocusState::ControlledByPeer).await;
+        b_observer.signal_unstable_display_change();
+        a_native_sender
+            .send(InputEvent::Key {
+                usage: HidUsage::new(KEYBOARD_PAGE, 5),
+                state: KeyState::Pressed,
+                modifiers: Modifiers::empty(),
+            })
+            .unwrap();
         wait_for_focus(&a_status, AgentFocusState::Local).await;
-        assert!(!a_observer.snapshot().routing_to_peer);
+        wait_for_focus(&b_status, AgentFocusState::Local).await;
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if b_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Synchronizing
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remote input did not yield to pre-dispatch topology refresh");
+        assert!(!b_observer.snapshot().injected.iter().any(|event| {
+            matches!(
+                event,
+                InputEvent::Key {
+                    usage,
+                    state: KeyState::Pressed,
+                    ..
+                } if *usage == HidUsage::new(KEYBOARD_PAGE, 5)
+            )
+        }));
+        b_observer.stabilize_display_change(vec![display_snapshot(101, 1_440)]);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if b_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Ready
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("peer topology did not recover after pre-dispatch refresh");
 
         let (ack, received) = oneshot::channel();
         b_commands
@@ -2273,33 +3072,57 @@ mod tests {
         wait_for_owner(&a_status, InputOwner::Remote).await;
         wait_for_focus(&b_status, AgentFocusState::ControllingPeer).await;
         assert!(b_observer.snapshot().routing_to_peer);
-        b_native_sender
-            .send(InputEvent::Key {
-                usage: HidUsage::new(KEYBOARD_PAGE, 4),
-                state: KeyState::Pressed,
-                modifiers: Modifiers::empty(),
-            })
-            .unwrap();
+        let queued_press = InputEvent::Key {
+            usage: HidUsage::new(KEYBOARD_PAGE, 4),
+            state: KeyState::Pressed,
+            modifiers: Modifiers::empty(),
+        };
+        let queued_release = InputEvent::Key {
+            usage: HidUsage::new(KEYBOARD_PAGE, 4),
+            state: KeyState::Released,
+            modifiers: Modifiers::empty(),
+        };
+        b_native_sender.send(queued_press).unwrap();
+        b_native_sender.send(queued_release).unwrap();
+        b_observer.signal_unstable_display_change();
+        wait_for_owner(&a_status, InputOwner::Local).await;
+        wait_for_focus(&a_status, AgentFocusState::Local).await;
+        wait_for_focus(&b_status, AgentFocusState::Local).await;
         timeout(Duration::from_secs(2), async {
-            while !a_observer.snapshot().injected.iter().any(|event| {
-                matches!(
-                    event,
-                    InputEvent::Key {
-                        usage,
-                        state: KeyState::Pressed,
-                        ..
-                    } if *usage == HidUsage::new(KEYBOARD_PAGE, 4)
-                )
-            }) {
+            loop {
+                if b_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Synchronizing
+                {
+                    return;
+                }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .unwrap();
+        .expect("unstable hot-plug did not enter synchronizing state");
+        assert!(!b_observer.snapshot().routing_to_peer);
+
+        b_observer.stabilize_display_change(vec![display_snapshot(101, 1_600)]);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if b_status.read().await.readiness.session_topology
+                    == SessionTopologyReadiness::Ready
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("in-progress hot-plug did not publish after stabilization");
 
         let grants_without_input =
             CapabilityGrants::from_bits(grants.bits() & !(TrustedCapability::RemoteInput as u8))
                 .unwrap();
+        // Peer B faults while restoring native ownership during the revoke's
+        // directional shutdown. The process-wide safety fence must be latched
+        // before its session future can return.
+        b_observer.fail_restore_local_ownership();
         let (ack, received) = oneshot::channel();
         a_commands
             .send(LocalSessionCommand::UpdateLocalGrant {
@@ -2316,10 +3139,10 @@ mod tests {
         wait_for_focus(&a_status, AgentFocusState::Local).await;
         wait_for_focus(&b_status, AgentFocusState::Local).await;
         assert!(!b_observer.snapshot().routing_to_peer);
-        assert_eq!(a_observer.snapshot().forced_releases.len(), 1);
+        assert!(a_observer.snapshot().forced_releases.is_empty());
 
         let recovered = a_observer.snapshot();
-        assert_eq!(recovered.forced_releases.len(), 1);
+        assert!(recovered.forced_releases.is_empty());
         assert!(!recovered.routing_to_peer);
         assert_eq!(a_status.read().await.input_owner, InputOwner::Local);
         assert_eq!(a_status.read().await.focus_state, AgentFocusState::Local);
@@ -2335,7 +3158,25 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(b_result.is_ok(), "peer B failed: {b_result:?}");
+        assert!(matches!(
+            b_result,
+            Err(SessionRuntimeError::SafetyRecoveryFailed)
+        ));
+        assert!(b_session_safety.failure_latched());
+        assert!(b_session_safety.blocks_ready());
+        assert_eq!(
+            b_status.read().await.phase,
+            nodavo_local_ipc::AgentPhase::Stopping
+        );
+        assert!(matches!(
+            publish_session_topology_readiness(
+                &b_status,
+                b_session_safety.as_ref(),
+                SessionTopologyReadiness::Ready,
+            )
+            .await,
+            Err(SessionRuntimeError::SafetyRecoveryFailed)
+        ));
         assert_eq!(
             a_status.read().await.readiness.session_topology,
             SessionTopologyReadiness::NotConnected

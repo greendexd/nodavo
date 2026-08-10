@@ -7,11 +7,14 @@
 //! desktop control.
 
 use nodavo_input::{DisplayId, NormalizedPosition};
+use nodavo_protocol::DisplayRotation;
 use thiserror::Error;
 
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 mod clipboard;
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+mod display_runtime;
 mod input_runtime;
 
 #[cfg(any(target_os = "windows", test))]
@@ -20,6 +23,7 @@ mod windows_ipc_policy;
 #[cfg(any(target_os = "windows", test))]
 pub use windows_ipc_policy::WindowsUiAuthMode;
 
+pub use display_runtime::{DisplaySnapshot, DisplaySnapshotState};
 pub use input_runtime::{
     ForceReleaseAcknowledgement, WindowsInputCaptureEvent, WindowsInputLifecycleEvent,
 };
@@ -31,7 +35,7 @@ pub use input_runtime::{
 pub const NODAVO_INPUT_TAG: usize = 0x4E4F_4441_564F_5749;
 
 /// Hard ceiling for display records returned by native enumeration.
-pub const MAX_DISPLAYS: usize = 64;
+pub const MAX_DISPLAYS: usize = nodavo_protocol::MAX_TOPOLOGY_DISPLAYS;
 /// Largest plaintext accepted by the current-user DPAPI boundary.
 pub const MAX_PROTECTED_SECRET_BYTES: usize = 1024 * 1024;
 /// Largest serialized DPAPI blob accepted from local persistent storage.
@@ -170,6 +174,7 @@ pub struct DisplayGeometry {
     pub height_pixels: u32,
     pub dpi_x: u32,
     pub dpi_y: u32,
+    pub rotation: DisplayRotation,
     pub primary: bool,
 }
 
@@ -262,6 +267,8 @@ pub enum WindowsPlatformError {
     UnknownDisplay,
     #[error("Windows returned invalid or overflowing display geometry")]
     InvalidDisplay,
+    #[error("the authoritative Windows display snapshot is not available")]
+    DisplayUnavailable,
     #[error("Windows rejected or partially completed input injection")]
     InputBlocked,
     #[error("the Windows Raw Input capture boundary could not be created")]
@@ -274,6 +281,8 @@ pub enum WindowsPlatformError {
     CaptureNotRunning,
     #[error("the input capture callback failed")]
     CaptureCallbackFailed,
+    #[error("the input capture routing barrier did not drain in time")]
+    CaptureBarrierTimeout,
     #[error("the input capture worker could not start or terminated unexpectedly")]
     CaptureThread,
     #[error("one or more tracked keys or buttons could not be released")]
@@ -309,11 +318,11 @@ mod windows;
 
 #[cfg(target_os = "windows")]
 pub use self::windows::{
-    AuthorizedWindowsUi, WindowsClipboard, WindowsInputCapture, WindowsInputInjector,
-    active_displays, authorize_named_pipe_client, compiled_windows_ui_auth_mode,
-    create_private_named_pipe, current_user_agent_pipe_name, probe_environment, probe_readiness,
-    protect_current_user_secret, replace_file_atomic, run_input_capture,
-    unprotect_current_user_secret, validate_compiled_windows_ui_auth_policy,
+    AuthorizedWindowsUi, WindowsClipboard, WindowsDisplayMonitor, WindowsInputCapture,
+    WindowsInputInjector, active_displays, authorize_named_pipe_client,
+    compiled_windows_ui_auth_mode, create_private_named_pipe, current_user_agent_pipe_name,
+    probe_environment, probe_readiness, protect_current_user_secret, replace_file_atomic,
+    run_input_capture, unprotect_current_user_secret, validate_compiled_windows_ui_auth_policy,
 };
 
 /// Non-Windows probe stub used by workspace tooling and portable callers.
@@ -381,6 +390,7 @@ mod tests {
             height_pixels: 1_080,
             dpi_x: 144,
             dpi_y: 144,
+            rotation: DisplayRotation::Degrees0,
             primary: false,
         };
         assert_eq!(

@@ -1,10 +1,12 @@
-<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 14 -->
+<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 15 -->
 
 # Nodavo для Windows
 
 [English](README.md) · [Русский](README.ru.md)
 
 В этом каталоге находится первая нативная оболочка Nodavo на WinUI 3. В ней есть двуязычные разделы обзора, устройств, расположения, передач и настроек. Обзор сохраняет phase соединения, peer и input owner, отдельно показывая доступность взаимно аутентифицированного агента, готовность локального ввода, локальные дисплеи и синхронизацию peer-топологии. Экран устройств реализует ожидающее/ручное сопряжение, сравнение и подтверждение кода, ограниченный список доверенных устройств, транзакционные изменения всех четырёх локальных разрешений и подтверждаемый разрушительный отзыв. Передачи принимают только результаты явного выбора файлов/папок системными Windows picker, до IPC применяют локальные пределы 32 путей и 4 КиБ на путь, а в ленте текущих/недавних передач показывают только скрытые идентификаторы, прогресс в байтах и разрешённую агентом отмену. Это заявления об исходниках и CI, а не о квалифицированном Windows runtime.
+
+Platform source Windows теперь владеет одним process-wide per-monitor-v2 display service. Скрытое broadcast-capable window сокращает задержку обнаружения, а authoritative источником остаются ограниченный full polling и два одинаковых DisplayConfig-backed samples. Capture и injection используют один snapshot и непереиспользуемые opaque identities; routing enable, доставка suppressed reliable Raw Input, absolute injection, stop/restart и timed-detach poison сериализованы с invalidation. Агент quiesce’ит старую lease и требует acknowledgement точной replacement topology до возобновления focus. Portable и Windows cross-target checks покрывают эти contracts, но физические x64/ARM64 hot-plug, RDP, mixed-DPI, lock/UAC и suspend/resume остаются Windows runtime gates.
 
 ## Поддерживаемые цели исходного проекта
 

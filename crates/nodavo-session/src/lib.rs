@@ -163,8 +163,16 @@ pub enum Event {
         peer_grant_epoch: GrantEpoch,
         peer_grant_allows_local_input: bool,
     },
-    /// Records the revision most recently sent by this endpoint. The runtime
-    /// sends the already-validated snapshot after this transition succeeds.
+    /// Begins a local display refresh before any potentially blocking native
+    /// snapshot acquisition. Focus stays gated until a candidate is published
+    /// and acknowledged, or the refresh is confirmed unchanged.
+    LocalTopologyRefreshStarted,
+    /// Completes a refresh whose fully validated snapshot matches the active
+    /// local topology.
+    LocalTopologyRefreshUnchanged,
+    /// Begins publication of an already-validated local revision. This
+    /// transition invalidates the prior acknowledgement and quiesces any focus
+    /// lease before the runtime commits and sends the candidate snapshot.
     LocalTopologyPublished {
         revision: u64,
     },
@@ -403,6 +411,7 @@ pub struct SessionCore {
     peer_grant_allows_local_input: bool,
     published_topology_revision: Option<u64>,
     acknowledged_topology_revision: Option<u64>,
+    local_topology_snapshot_pending: bool,
     remote_topology_revision: Option<u64>,
     injected_pressed: PressedState,
     routed_pressed: PressedState,
@@ -464,6 +473,12 @@ impl SessionCore {
     #[must_use]
     pub const fn acknowledged_topology_revision(&self) -> Option<u64> {
         self.acknowledged_topology_revision
+    }
+
+    #[must_use]
+    pub fn local_topology_refresh_pending(&self) -> bool {
+        self.local_topology_snapshot_pending
+            || self.published_topology_revision != self.acknowledged_topology_revision
     }
 
     #[must_use]
@@ -537,6 +552,7 @@ impl SessionCore {
                 self.peer_grant_allows_local_input = peer_grant_allows_local_input;
                 self.published_topology_revision = None;
                 self.acknowledged_topology_revision = None;
+                self.local_topology_snapshot_pending = false;
                 self.remote_topology_revision = None;
                 self.clear_pointer_enter_state();
                 Vec::new()
@@ -549,6 +565,8 @@ impl SessionCore {
                 peer_grant_epoch,
                 peer_grant_allows_local_input,
             } => self.update_peer_grant(peer_grant_epoch, peer_grant_allows_local_input),
+            Event::LocalTopologyRefreshStarted => self.begin_local_topology_refresh(),
+            Event::LocalTopologyRefreshUnchanged => self.finish_unchanged_local_topology_refresh(),
             Event::LocalTopologyPublished { revision } => self.publish_local_topology(revision),
             Event::RemoteTopologyReceived { meta, revision } => {
                 self.accept_remote_topology(meta, revision)
@@ -565,6 +583,9 @@ impl SessionCore {
                 rejected(RejectReason::LocalInputNotAuthorized)
             }
             Event::LocalFocusRequested { .. } if self.remote_topology_revision.is_none() => {
+                rejected(RejectReason::TopologyUnavailable)
+            }
+            Event::LocalFocusRequested { .. } if self.local_topology_refresh_pending() => {
                 rejected(RejectReason::TopologyUnavailable)
             }
             Event::LocalFocusRequested {
@@ -611,6 +632,10 @@ impl SessionCore {
                 }
                 if !self.peer_grant_allows_local_input {
                     return rejected(RejectReason::LocalInputNotAuthorized);
+                }
+                if self.focus == FocusState::Local {
+                    self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+                    return Vec::new();
                 }
                 let accepted = matches!(
                     self.focus,
@@ -700,6 +725,10 @@ impl SessionCore {
                 if lease_id.is_zero() {
                     return rejected(RejectReason::InvalidLease);
                 }
+                if self.focus == FocusState::Local {
+                    self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+                    return Vec::new();
+                }
                 if self
                     .focus
                     .lease()
@@ -752,6 +781,7 @@ impl SessionCore {
         self.local_grant_allows_peer_input = local_grant_allows_peer_input;
         self.published_topology_revision = None;
         self.acknowledged_topology_revision = None;
+        self.local_topology_snapshot_pending = false;
 
         if self.focus != FocusState::Local
             || !self.injected_pressed.is_empty()
@@ -803,8 +833,31 @@ impl SessionCore {
         ]
     }
 
+    fn begin_local_topology_refresh(&mut self) -> Vec<Effect> {
+        if self.link != LinkState::Ready {
+            return rejected(RejectReason::InvalidTransition);
+        }
+        if self.local_topology_snapshot_pending {
+            return Vec::new();
+        }
+        self.local_topology_snapshot_pending = true;
+        if self.focus == FocusState::Local {
+            Vec::new()
+        } else {
+            self.release_focus(true)
+        }
+    }
+
+    fn finish_unchanged_local_topology_refresh(&mut self) -> Vec<Effect> {
+        if self.link != LinkState::Ready || !self.local_topology_snapshot_pending {
+            return rejected(RejectReason::InvalidTransition);
+        }
+        self.local_topology_snapshot_pending = false;
+        Vec::new()
+    }
+
     fn publish_local_topology(&mut self, revision: u64) -> Vec<Effect> {
-        if self.link != LinkState::Ready || self.focus != FocusState::Local {
+        if self.link != LinkState::Ready {
             return rejected(RejectReason::InvalidTransition);
         }
         if !self.local_grant_allows_peer_input {
@@ -821,7 +874,12 @@ impl SessionCore {
         }
         self.published_topology_revision = Some(revision);
         self.acknowledged_topology_revision = None;
-        Vec::new()
+        self.local_topology_snapshot_pending = false;
+        if self.focus == FocusState::Local {
+            Vec::new()
+        } else {
+            self.release_focus(true)
+        }
     }
 
     fn accept_remote_topology(&mut self, meta: EventMeta, revision: u64) -> Vec<Effect> {
@@ -830,9 +888,6 @@ impl SessionCore {
         }
         if !self.peer_grant_allows_local_input {
             return rejected(RejectReason::TopologyNotAuthorized);
-        }
-        if self.focus != FocusState::Local {
-            return rejected(RejectReason::InvalidTransition);
         }
         if revision == 0 {
             return rejected(RejectReason::InvalidTopologyRevision);
@@ -843,12 +898,18 @@ impl SessionCore {
         {
             return rejected(RejectReason::StaleTopologyRevision);
         }
+        let mut effects = if self.focus == FocusState::Local {
+            Vec::new()
+        } else {
+            self.release_focus(true)
+        };
         self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
         self.remote_topology_revision = Some(revision);
-        vec![
+        effects.extend([
             Effect::AcceptRemoteTopology { revision },
             Effect::AcknowledgeRemoteTopology { revision },
-        ]
+        ]);
+        effects
     }
 
     fn acknowledge_local_topology(&mut self, meta: EventMeta, revision: u64) -> Vec<Effect> {
@@ -868,6 +929,9 @@ impl SessionCore {
             return rejected(RejectReason::TopologyRevisionMismatch);
         }
         self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+        if self.acknowledged_topology_revision == Some(revision) {
+            return Vec::new();
+        }
         self.acknowledged_topology_revision = Some(revision);
         vec![Effect::LocalTopologyReady { revision }]
     }
@@ -880,7 +944,7 @@ impl SessionCore {
         input: InputEvent,
     ) -> Vec<Effect> {
         let lane = input_sequence_lane(input);
-        if let Err(reason) = self.validate_remote_meta(&meta, lane) {
+        if let Err(reason) = self.validate_remote_identity(&meta) {
             return rejected(reason);
         }
         if lease_id.is_zero() {
@@ -888,6 +952,18 @@ impl SessionCore {
         }
         if !self.local_grant_allows_peer_input {
             return rejected(RejectReason::PeerInputNotAuthorized);
+        }
+        if !matches!(
+            self.focus,
+            FocusState::ControlledByRemote {
+                lease_id: active,
+                ..
+            } if active == lease_id
+        ) {
+            return Vec::new();
+        }
+        if let Err(reason) = self.validate_remote_sequence(&meta, lane) {
+            return rejected(reason);
         }
         if !self.inbound_pointer_enter.is_ready() {
             return rejected(RejectReason::InvalidTransition);
@@ -897,9 +973,6 @@ impl SessionCore {
         }
 
         match self.focus {
-            FocusState::ControlledByRemote {
-                lease_id: expected, ..
-            } if expected != lease_id => rejected(RejectReason::LeaseMismatch),
             FocusState::ControlledByRemote { expires_at, .. } if received_at >= expires_at => {
                 self.recover(DisconnectReason::FocusLeaseExpired)
             }
@@ -908,7 +981,7 @@ impl SessionCore {
                 self.injected_pressed.apply(&input);
                 vec![Effect::InjectInput(input)]
             }
-            _ => rejected(RejectReason::LeaseMismatch),
+            _ => Vec::new(),
         }
     }
 
@@ -930,6 +1003,13 @@ impl SessionCore {
         }
         if self.link != LinkState::Ready {
             return rejected(RejectReason::InvalidTransition);
+        }
+        if self.local_topology_refresh_pending()
+            || self.published_topology_revision.is_none()
+            || self.acknowledged_topology_revision != self.published_topology_revision
+        {
+            self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+            return vec![Effect::ReleaseRemoteFocus { lease_id }];
         }
 
         let renewal = match self.focus {
@@ -977,19 +1057,31 @@ impl SessionCore {
         received_at: MonotonicMillis,
         position: NormalizedPosition,
     ) -> Vec<Effect> {
-        if let Err(reason) = self.validate_remote_meta(&meta, SequenceLane::ReliableInput) {
+        if let Err(reason) = self.validate_remote_identity(&meta) {
             return rejected(reason);
         }
         if !self.local_grant_allows_peer_input {
             return rejected(RejectReason::PeerInputNotAuthorized);
         }
+        if lease_id.is_zero() {
+            return rejected(RejectReason::InvalidLease);
+        }
+        if !matches!(
+            self.focus,
+            FocusState::ControlledByRemote {
+                lease_id: active,
+                ..
+            } if active == lease_id
+        ) {
+            return Vec::new();
+        }
+        if let Err(reason) = self.validate_remote_sequence(&meta, SequenceLane::ReliableInput) {
+            return rejected(reason);
+        }
         if !matches!(self.inbound_pointer_enter, PointerEnterState::Awaiting) {
             return rejected(RejectReason::InvalidTransition);
         }
         match self.focus {
-            FocusState::ControlledByRemote {
-                lease_id: active, ..
-            } if active != lease_id => rejected(RejectReason::LeaseMismatch),
             FocusState::ControlledByRemote { expires_at, .. } if received_at >= expires_at => {
                 self.recover(DisconnectReason::FocusLeaseExpired)
             }
@@ -1001,7 +1093,7 @@ impl SessionCore {
                     Effect::AcknowledgePointerEnter { lease_id },
                 ]
             }
-            _ => rejected(RejectReason::LeaseMismatch),
+            _ => Vec::new(),
         }
     }
 
@@ -1012,6 +1104,10 @@ impl SessionCore {
     ) -> Vec<Effect> {
         if let Err(reason) = self.validate_remote_meta(&meta, SequenceLane::Control) {
             return rejected(reason);
+        }
+        if self.focus == FocusState::Local {
+            self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+            return Vec::new();
         }
         let FocusState::ControllingRemote {
             lease_id: active, ..
@@ -1071,6 +1167,10 @@ impl SessionCore {
         if !self.peer_grant_allows_local_input {
             return rejected(RejectReason::LocalInputNotAuthorized);
         }
+        if self.focus == FocusState::Local {
+            self.commit_remote_sequence(SequenceLane::Control, meta.sequence());
+            return Vec::new();
+        }
         if pointer_enter_required != self.outbound_pointer_enter.is_required() {
             return rejected(RejectReason::InvalidTransition);
         }
@@ -1116,7 +1216,7 @@ impl SessionCore {
         lease_id: LeaseId,
         received_at: MonotonicMillis,
     ) -> Vec<Effect> {
-        if let Err(reason) = self.validate_remote_meta(&meta, SequenceLane::ReliableInput) {
+        if let Err(reason) = self.validate_remote_identity(&meta) {
             return rejected(reason);
         }
         if lease_id.is_zero() {
@@ -1125,10 +1225,19 @@ impl SessionCore {
         if !self.local_grant_allows_peer_input {
             return rejected(RejectReason::PeerInputNotAuthorized);
         }
-        match self.focus {
+        if !matches!(
+            self.focus,
             FocusState::ControlledByRemote {
-                lease_id: active, ..
-            } if active != lease_id => rejected(RejectReason::LeaseMismatch),
+                lease_id: active,
+                ..
+            } if active == lease_id
+        ) {
+            return Vec::new();
+        }
+        if let Err(reason) = self.validate_remote_sequence(&meta, SequenceLane::ReliableInput) {
+            return rejected(reason);
+        }
+        match self.focus {
             FocusState::ControlledByRemote { expires_at, .. } if received_at >= expires_at => {
                 self.recover(DisconnectReason::FocusLeaseExpired)
             }
@@ -1138,7 +1247,7 @@ impl SessionCore {
                     releases: self.injected_pressed.take_forced_releases(),
                 }]
             }
-            _ => rejected(RejectReason::LeaseMismatch),
+            _ => Vec::new(),
         }
     }
 
@@ -1147,6 +1256,26 @@ impl SessionCore {
         meta: &EventMeta,
         lane: SequenceLane,
     ) -> Result<(), RejectReason> {
+        self.validate_remote_identity(meta)?;
+        self.validate_remote_sequence(meta, lane)
+    }
+
+    fn validate_remote_sequence(
+        &self,
+        meta: &EventMeta,
+        lane: SequenceLane,
+    ) -> Result<(), RejectReason> {
+        if self
+            .remote_sequences
+            .get(lane)
+            .is_some_and(|last| meta.sequence() <= last)
+        {
+            return Err(RejectReason::StaleSequence);
+        }
+        Ok(())
+    }
+
+    fn validate_remote_identity(&self, meta: &EventMeta) -> Result<(), RejectReason> {
         let Some(session_id) = self.session_id else {
             return Err(RejectReason::NoSession);
         };
@@ -1161,13 +1290,6 @@ impl SessionCore {
         }
         if meta.capability() != Capability::REMOTE_INPUT {
             return Err(RejectReason::WrongCapability);
-        }
-        if self
-            .remote_sequences
-            .get(lane)
-            .is_some_and(|last| meta.sequence() <= last)
-        {
-            return Err(RejectReason::StaleSequence);
         }
         Ok(())
     }
@@ -1222,6 +1344,7 @@ impl SessionCore {
         self.peer_grant_allows_local_input = false;
         self.published_topology_revision = None;
         self.acknowledged_topology_revision = None;
+        self.local_topology_snapshot_pending = false;
         self.remote_topology_revision = None;
         self.clear_pointer_enter_state();
 
@@ -1388,7 +1511,7 @@ mod tests {
                 received_at: MonotonicMillis::new(50),
                 input: key_down(4),
             }),
-            rejected(RejectReason::LeaseMismatch)
+            Vec::new()
         );
         assert_eq!(core.last_remote_sequence(SequenceLane::ReliableInput), None);
 
@@ -1565,20 +1688,347 @@ mod tests {
     }
 
     #[test]
-    fn topology_cannot_change_under_an_active_focus_lease() {
+    fn remote_topology_refresh_quiesces_an_active_focus_before_install() {
         let (mut core, session, epoch) = ready_core(true, true);
-        accept_peer_focus(&mut core, session, epoch, 1, LeaseId::new(7));
+        let lease = LeaseId::new(7);
+        accept_peer_focus(&mut core, session, epoch, 1, lease);
+        assert_eq!(
+            core.handle(Event::RemoteTopologyReceived {
+                meta: meta(session, epoch, 2),
+                revision: 1,
+            }),
+            rejected(RejectReason::StaleTopologyRevision)
+        );
+        assert_eq!(
+            core.focus_state(),
+            FocusState::ControlledByRemote {
+                lease_id: lease,
+                expires_at: MonotonicMillis::new(100),
+            }
+        );
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::Control),
+            Some(Sequence::new(1))
+        );
         assert_eq!(
             core.handle(Event::RemoteTopologyReceived {
                 meta: meta(session, epoch, 2),
                 revision: 2,
             }),
-            rejected(RejectReason::InvalidTransition)
+            vec![
+                Effect::ReleaseInjectedInput {
+                    releases: Vec::new()
+                },
+                Effect::ReleaseRoutedInput {
+                    lease_id: lease,
+                    releases: Vec::new(),
+                },
+                Effect::RestoreLocalOwnership,
+                Effect::CancelFocusLease,
+                Effect::ReleaseRemoteFocus { lease_id: lease },
+                Effect::AcceptRemoteTopology { revision: 2 },
+                Effect::AcknowledgeRemoteTopology { revision: 2 },
+            ]
         );
-        assert_eq!(core.remote_topology_revision(), Some(1));
+        assert_eq!(core.focus_state(), FocusState::Local);
+        assert_eq!(core.remote_topology_revision(), Some(2));
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::Control),
+            Some(Sequence::new(2))
+        );
+    }
+
+    #[test]
+    fn local_topology_refresh_blocks_focus_until_the_exact_ack() {
+        let (mut core, session, epoch) = ready_core(true, true);
+        assert!(
+            core.handle(Event::LocalTopologyPublished { revision: 2 })
+                .is_empty()
+        );
+        assert!(core.local_topology_refresh_pending());
+        assert_eq!(core.acknowledged_topology_revision(), None);
+
+        let lease = LeaseId::new(8);
+        assert_eq!(
+            core.handle(Event::RemoteFocusRequested {
+                meta: meta(session, epoch, 1),
+                lease_id: lease,
+                expires_at: MonotonicMillis::new(100),
+                pointer_enter_required: false,
+            }),
+            vec![Effect::ReleaseRemoteFocus { lease_id: lease }]
+        );
         assert_eq!(
             core.last_remote_sequence(SequenceLane::Control),
             Some(Sequence::new(1))
+        );
+        assert_eq!(
+            core.handle(Event::RemoteTopologyAcknowledged {
+                meta: meta(session, epoch, 2),
+                revision: 1,
+            }),
+            rejected(RejectReason::TopologyRevisionMismatch)
+        );
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::Control),
+            Some(Sequence::new(1))
+        );
+        assert_eq!(
+            core.handle(Event::RemoteTopologyAcknowledged {
+                meta: meta(session, epoch, 2),
+                revision: 2,
+            }),
+            vec![Effect::LocalTopologyReady { revision: 2 }]
+        );
+        assert!(!core.local_topology_refresh_pending());
+        assert_eq!(core.acknowledged_topology_revision(), Some(2));
+        assert_eq!(
+            core.handle(Event::RemoteFocusRequested {
+                meta: meta(session, epoch, 3),
+                lease_id: lease,
+                expires_at: MonotonicMillis::new(100),
+                pointer_enter_required: false,
+            }),
+            vec![
+                Effect::GrantRemoteFocus {
+                    lease_id: lease,
+                    expires_at: MonotonicMillis::new(100),
+                    pointer_enter_required: false,
+                },
+                Effect::ArmFocusLease {
+                    lease_id: lease,
+                    expires_at: MonotonicMillis::new(100),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_acquisition_gates_focus_before_a_revision_exists() {
+        let (mut core, session, epoch) = ready_core(true, true);
+        assert!(core.handle(Event::LocalTopologyRefreshStarted).is_empty());
+        assert!(core.local_topology_refresh_pending());
+
+        let blocked = LeaseId::new(9);
+        assert_eq!(
+            core.handle(Event::RemoteFocusRequested {
+                meta: meta(session, epoch, 1),
+                lease_id: blocked,
+                expires_at: MonotonicMillis::new(100),
+                pointer_enter_required: false,
+            }),
+            vec![Effect::ReleaseRemoteFocus { lease_id: blocked }]
+        );
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::Control),
+            Some(Sequence::new(1))
+        );
+        assert!(core.handle(Event::LocalTopologyRefreshUnchanged).is_empty());
+        assert!(!core.local_topology_refresh_pending());
+        let admitted = LeaseId::new(10);
+        assert_eq!(
+            core.handle(Event::RemoteFocusRequested {
+                meta: meta(session, epoch, 2),
+                lease_id: admitted,
+                expires_at: MonotonicMillis::new(100),
+                pointer_enter_required: false,
+            }),
+            vec![
+                Effect::GrantRemoteFocus {
+                    lease_id: admitted,
+                    expires_at: MonotonicMillis::new(100),
+                    pointer_enter_required: false,
+                },
+                Effect::ArmFocusLease {
+                    lease_id: admitted,
+                    expires_at: MonotonicMillis::new(100),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn local_refresh_orders_outbound_release_before_new_revision() {
+        let (mut core, session, epoch) = ready_core(true, true);
+        let lease = LeaseId::new(13);
+        let _ = core.handle(Event::LocalFocusRequested {
+            lease_id: lease,
+            expires_at: MonotonicMillis::new(100),
+            pointer_enter_required: false,
+        });
+        let _ = core.handle(Event::RemoteFocusGranted {
+            meta: meta(session, epoch, 1),
+            lease_id: lease,
+            expires_at: MonotonicMillis::new(100),
+            pointer_enter_required: false,
+        });
+        assert_eq!(
+            core.handle(Event::LocalInput(key_down(4))),
+            vec![Effect::SendInput {
+                lease_id: lease,
+                input: key_down(4),
+            }]
+        );
+
+        assert_eq!(
+            core.handle(Event::LocalTopologyPublished { revision: 2 }),
+            vec![
+                Effect::ReleaseInjectedInput {
+                    releases: Vec::new()
+                },
+                Effect::ReleaseRoutedInput {
+                    lease_id: lease,
+                    releases: vec![key(4, KeyState::Released)],
+                },
+                Effect::SendReleaseAll { lease_id: lease },
+                Effect::RestoreLocalOwnership,
+                Effect::CancelFocusLease,
+                Effect::ReleaseRemoteFocus { lease_id: lease },
+            ]
+        );
+        assert_eq!(core.focus_state(), FocusState::Local);
+        assert!(core.local_topology_refresh_pending());
+        assert!(core.routed_input_is_clear());
+    }
+
+    #[test]
+    fn drained_press_and_release_are_reduced_before_refresh_quiesce() {
+        let (mut core, session, epoch) = ready_core(true, true);
+        let lease = LeaseId::new(14);
+        let _ = core.handle(Event::LocalFocusRequested {
+            lease_id: lease,
+            expires_at: MonotonicMillis::new(100),
+            pointer_enter_required: false,
+        });
+        let _ = core.handle(Event::RemoteFocusGranted {
+            meta: meta(session, epoch, 1),
+            lease_id: lease,
+            expires_at: MonotonicMillis::new(100),
+            pointer_enter_required: false,
+        });
+        assert_eq!(
+            core.handle(Event::LocalInput(key_down(4))),
+            vec![Effect::SendInput {
+                lease_id: lease,
+                input: key_down(4),
+            }]
+        );
+        let released = key(4, KeyState::Released);
+        assert_eq!(
+            core.handle(Event::LocalInput(released)),
+            vec![Effect::SendInput {
+                lease_id: lease,
+                input: released,
+            }]
+        );
+
+        assert_eq!(
+            core.handle(Event::LocalTopologyRefreshStarted),
+            vec![
+                Effect::ReleaseInjectedInput {
+                    releases: Vec::new()
+                },
+                Effect::ReleaseRoutedInput {
+                    lease_id: lease,
+                    releases: Vec::new(),
+                },
+                Effect::SendReleaseAll { lease_id: lease },
+                Effect::RestoreLocalOwnership,
+                Effect::CancelFocusLease,
+                Effect::ReleaseRemoteFocus { lease_id: lease },
+            ]
+        );
+        assert!(core.routed_input_is_clear());
+    }
+
+    #[test]
+    fn every_noncurrent_input_lease_is_inert_across_multiple_lease_generations() {
+        let (mut core, session, epoch) = ready_core(true, true);
+        let first = LeaseId::new(7);
+        accept_peer_focus(&mut core, session, epoch, 1, first);
+        let _ = core.handle(Event::LocalTopologyPublished { revision: 2 });
+
+        assert!(
+            core.handle(Event::RemoteInput {
+                meta: meta(session, epoch, 100),
+                lease_id: first,
+                received_at: MonotonicMillis::new(20),
+                input: pointer_motion(),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::ReplaceableInput),
+            None
+        );
+        assert_eq!(
+            core.handle(Event::RemoteTopologyAcknowledged {
+                meta: meta(session, epoch, 2),
+                revision: 2,
+            }),
+            vec![Effect::LocalTopologyReady { revision: 2 }]
+        );
+
+        let second = LeaseId::new(8);
+        accept_peer_focus(&mut core, session, epoch, 3, second);
+        assert_eq!(
+            core.handle(Event::RemoteInput {
+                meta: meta(session, epoch, 100),
+                lease_id: second,
+                received_at: MonotonicMillis::new(29),
+                input: pointer_motion(),
+            }),
+            vec![Effect::InjectInput(pointer_motion())]
+        );
+        assert_eq!(
+            core.handle(Event::RemoteFocusReleased {
+                meta: meta(session, epoch, 4),
+                lease_id: second,
+            })
+            .last(),
+            Some(&Effect::CancelFocusLease)
+        );
+
+        let active = LeaseId::new(9);
+        accept_peer_focus(&mut core, session, epoch, 5, active);
+        for inactive in [first, second, LeaseId::new(99)] {
+            assert!(
+                core.handle(Event::RemoteInput {
+                    // Even a sequence older than the current lane watermark is
+                    // inert for a non-current lease and cannot poison the lane.
+                    meta: meta(session, epoch, 1),
+                    lease_id: inactive,
+                    received_at: MonotonicMillis::new(30),
+                    input: pointer_motion(),
+                })
+                .is_empty()
+            );
+        }
+        assert!(
+            core.handle(Event::RemoteInput {
+                meta: meta(session, epoch, 101),
+                lease_id: first,
+                received_at: MonotonicMillis::new(30),
+                input: pointer_motion(),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            core.last_remote_sequence(SequenceLane::ReplaceableInput),
+            Some(Sequence::new(100))
+        );
+        assert_eq!(
+            core.handle(Event::RemoteInput {
+                meta: meta(session, epoch, 101),
+                lease_id: active,
+                received_at: MonotonicMillis::new(32),
+                input: pointer_motion(),
+            }),
+            vec![Effect::InjectInput(pointer_motion())]
+        );
+        assert_eq!(
+            core.focus_state().lease().map(|(lease, _)| lease),
+            Some(active)
         );
     }
 

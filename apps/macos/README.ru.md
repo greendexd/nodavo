@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 13 -->
+<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 14 -->
 
 # Nodavo для macOS
 
@@ -25,6 +25,8 @@ swift run --package-path apps/macos \
 ## Готовность и Accessibility
 
 Readiness — строгий public snapshot из enum states, а не diagnostic dump. Оболочка отклоняет отсутствующие, неизвестные или повреждённые значения. За конечным deadline и коротким cache агент проверяет Accessibility trust, обнаружение локальных дисплеев и prerequisite injector без отправки events; вторая capture runtime не создаётся, ввод не suppress и не inject. Поэтому **Готов** означает текущую доступность локальных prerequisites, а не live capture proof. Подключённая сессия показывает peer topology как ready только после аутентифицированного обмена topology и совпадающего acknowledgement локальной revision.
+
+Platform source macOS теперь наблюдает CoreGraphics display reconfiguration через callback, который только помечает coalesced dirty generation. Capture и injection используют один стабильный ограниченный полный snapshot с непереиспользуемыми opaque identities. Агент закрывает routing admission, дренирует уже принятый input, освобождает старую focus lease и ждёт acknowledgement точной replacement topology до повторного состояния ready. Focused/inert tests покрывают callback interleavings, teardown, stale identities, deadlines и safety latching; реальный signed Mac с Windows peer ещё не прошёл физическую квалификацию hot-plug.
 
 Кнопка **Разрешить универсальный доступ** запрашивает macOS от процесса агента, которому требуется permission, а затем выполняет свежую проверку. Возвращаемое prompt API значение не считается авторизацией, поэтому отмена prompt или отсутствие изменений в Системных настройках оставляет состояние **Требуется действие**. Это поведение source и focused prerequisite tests реализовано; полный TCC flow ещё не доказан на чистом Mac с signed, provisioned и notarized сборкой Nodavo.
 

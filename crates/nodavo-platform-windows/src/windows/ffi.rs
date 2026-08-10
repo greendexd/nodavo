@@ -9,18 +9,24 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
-use nodavo_input::DisplayId;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use windows::Win32::Devices::Display::{
+    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+    DISPLAYCONFIG_DEVICE_INFO_HEADER, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
+    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
+    GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+};
 use windows::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME,
-    GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, POINT, RECT,
-    WAIT_TIMEOUT, WPARAM,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
+    ERROR_SUCCESS, FILETIME, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT,
+    LocalFree, POINT, RECT, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    DEVMODEW, DM_DISPLAYORIENTATION, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
+    EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -78,7 +84,11 @@ use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    GetDpiAwarenessContextForProcess, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
+    SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS,
     KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS,
@@ -99,31 +109,35 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, HHOOK, HWND_MESSAGE, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LLKHF_INJECTED,
     LLKHF_LOWER_IL_INJECTED, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT,
     PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
-    PostMessageW, PostQuitMessage, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RI_MOUSE_BUTTON_1_DOWN,
-    RI_MOUSE_BUTTON_1_UP, RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_2_UP, RI_MOUSE_BUTTON_3_DOWN,
-    RI_MOUSE_BUTTON_3_UP, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
-    RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW, SetTimer,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE,
-    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT,
-    WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    PostMessageW, PostQuitMessage, PostThreadMessageW, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
+    RI_MOUSE_BUTTON_1_DOWN, RI_MOUSE_BUTTON_1_UP, RI_MOUSE_BUTTON_2_DOWN, RI_MOUSE_BUTTON_2_UP,
+    RI_MOUSE_BUTTON_3_DOWN, RI_MOUSE_BUTTON_3_UP, RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP,
+    RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, RegisterClassW,
+    SetTimer, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
+    WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DISPLAYCHANGE, WM_INPUT,
+    WM_INPUT_DEVICE_CHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_POWERBROADCAST, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT,
+    WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
-use windows::core::{BOOL, PCWSTR, PWSTR, w};
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR, w};
 use zeroize::Zeroizing;
 
 use crate::clipboard::{
     bmp_to_dib, decode_cf_html, dib_to_bmp, encode_cf_html, maximum_cf_html_bytes, validate_png,
 };
+use crate::display_runtime::{
+    NativeDisplayGeometry, NativeDisplayKey, display_rotation, unique_native_display_key,
+};
 use crate::input_runtime::{
-    NativeInputEvent, NativeLifecycleEvent, NativeModifierState, native_keyboard_is_supported,
+    NativeInputEvent, NativeLifecycleEvent, NativeModifierState, NativeRoutingObservation,
+    RoutingAdmission, native_keyboard_is_supported,
 };
 use crate::{
-    ClipboardFormat, ClipboardFormatMetadata, ClipboardMetadata, DisplayGeometry,
-    EnvironmentCapabilities, MAX_DISPLAYS, MAX_PROTECTED_SECRET_BLOB_BYTES,
-    MAX_PROTECTED_SECRET_BYTES, NODAVO_INPUT_TAG, WindowsPlatformError,
+    ClipboardFormat, ClipboardFormatMetadata, ClipboardMetadata, EnvironmentCapabilities,
+    MAX_DISPLAYS, MAX_PROTECTED_SECRET_BLOB_BYTES, MAX_PROTECTED_SECRET_BYTES, NODAVO_INPUT_TAG,
+    WindowsPlatformError,
 };
 
 const CF_DIB: u32 = 8;
@@ -162,16 +176,28 @@ const HOOK_OBSERVATION_MAX_AGE_MS: u32 = 250;
 const CAPTURE_TIMER_ID: usize = 1;
 const CAPTURE_TIMER_INTERVAL_MS: u32 = 500;
 const WM_NODAVO_CAPTURE_STOP: u32 = WM_APP + 0x4e;
+const DISPLAY_TIMER_ID: usize = 1;
+const DISPLAY_TIMER_INTERVAL_MS: u32 = 1_000;
+const WM_NODAVO_DISPLAY_STOP: u32 = WM_APP + 0x4f;
 const NODAVO_INPUT_TAG_LOW32: u32 = 0x564f_5749;
 const MAX_APPMODEL_STRING_UNITS: usize = 32_768;
 const MAX_TOKEN_INFORMATION_BYTES: usize = 64 * 1024;
+const MAX_DISPLAY_CONFIG_MODES: usize = MAX_DISPLAYS * 2;
+const DISPLAY_CONFIG_QUERY_ATTEMPTS: usize = 4;
+#[cfg(not(test))]
+const RELIABLE_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const RELIABLE_LIFECYCLE_DRAIN_TIMEOUT: Duration = Duration::from_millis(50);
+
+static PROCESS_DPI_AWARENESS: OnceLock<Result<(), WindowsPlatformError>> = OnceLock::new();
 
 thread_local! {
     static CAPTURE_CONTEXT: Cell<*mut InputCaptureContext> = const { Cell::new(ptr::null_mut()) };
 }
 
-type NativeInputCallback =
-    dyn FnMut(NativeInputEvent) -> Result<(), WindowsPlatformError> + Send + 'static;
+type NativeInputCallback = dyn FnMut(NativeInputEvent, Option<NativeRoutingObservation>) -> Result<(), WindowsPlatformError>
+    + Send
+    + 'static;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HookObservationKey {
@@ -190,38 +216,107 @@ struct HookObservation {
     key: HookObservationKey,
     disposition: crate::CaptureDisposition,
     timestamp: u32,
+    suppressed: bool,
+    reliable_suppressed: bool,
+    routed_at_hook: bool,
+    routing_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HookAdmission {
+    disposition: crate::CaptureDisposition,
+    suppressed: bool,
+    reliable_suppressions: usize,
+    routed_at_hook: bool,
+    routing_epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingReliableLifecycle {
+    event: NativeLifecycleEvent,
+    deadline: Instant,
 }
 
 #[allow(clippy::struct_excessive_bools)]
 struct InputCaptureContext {
     callback: Box<NativeInputCallback>,
-    routing_to_peer: Arc<AtomicBool>,
+    routing_to_peer: Arc<RoutingAdmission>,
     observations: VecDeque<HookObservation>,
     session_active: bool,
     desktop_available: bool,
     callback_failed: bool,
     native_failed: bool,
+    reliable_delivery_failed: bool,
+    pending_lifecycle: Option<PendingReliableLifecycle>,
 }
 
 impl InputCaptureContext {
-    fn record_hook(&mut self, observation: HookObservation) {
+    fn record_hook(&mut self, mut observation: HookObservation) -> bool {
         if self.observations.len() == MAX_HOOK_OBSERVATIONS {
-            self.observations.pop_front();
+            let mut reliable_delivery_failed = observation.reliable_suppressed;
+            if let Some(retired) = self.observations.pop_front()
+                && retired.reliable_suppressed
+            {
+                reliable_delivery_failed = true;
+                let _ = self.routing_to_peer.complete_reliable_suppressions(1);
+            }
+            if observation.reliable_suppressed {
+                let _ = self.routing_to_peer.complete_reliable_suppressions(1);
+            }
+            observation.suppressed = false;
+            observation.reliable_suppressed = false;
+            self.native_failed = true;
+            self.reliable_delivery_failed |= reliable_delivery_failed;
+            self.routing_to_peer.close_admission();
+            // SAFETY: hook callbacks execute on this capture thread; queue
+            // overflow terminates its own message loop after allowing the
+            // current physical event through locally.
+            unsafe { PostQuitMessage(1) };
         }
+        let suppressed = observation.suppressed;
         self.observations.push_back(observation);
+        suppressed
     }
 
-    fn take_origin(
-        &mut self,
-        key: HookObservationKey,
-        timestamp: u32,
-    ) -> Option<crate::CaptureDisposition> {
+    fn take_origin(&mut self, key: HookObservationKey, timestamp: u32) -> Option<HookAdmission> {
         while self.observations.front().is_some_and(|observation| {
             timestamp.wrapping_sub(observation.timestamp) > HOOK_OBSERVATION_MAX_AGE_MS
         }) {
-            self.observations.pop_front();
+            if let Some(expired) = self.observations.pop_front()
+                && expired.reliable_suppressed
+            {
+                let _ = self.routing_to_peer.complete_reliable_suppressions(1);
+                self.native_failed = true;
+                self.reliable_delivery_failed = true;
+                self.routing_to_peer.close_admission();
+                // SAFETY: this runs on the capture thread and terminates its
+                // own loop after a reliable suppressed observation expired.
+                unsafe { PostQuitMessage(1) };
+            }
         }
-        let mut matched = None;
+        let first_index = self
+            .observations
+            .iter()
+            .position(|observation| observation.key == key && observation.timestamp == timestamp)?;
+        let first_disposition = self.observations[first_index].disposition;
+        let conflicting_origin = self.observations.iter().any(|observation| {
+            observation.key == key
+                && observation.timestamp == timestamp
+                && observation.disposition != first_disposition
+        });
+        if !conflicting_origin {
+            let observation = self.observations.remove(first_index)?;
+            return Some(HookAdmission {
+                disposition: observation.disposition,
+                suppressed: observation.suppressed,
+                reliable_suppressions: usize::from(observation.reliable_suppressed),
+                routed_at_hook: observation.routed_at_hook,
+                routing_epoch: observation.routing_epoch,
+            });
+        }
+
+        let mut disposition = first_disposition;
+        let mut reliable_suppressions = 0_usize;
         let mut index = 0;
         while index < self.observations.len() {
             if self.observations[index].key != key
@@ -231,25 +326,54 @@ impl InputCaptureContext {
                 continue;
             }
             let observation = self.observations.remove(index)?;
+            reliable_suppressions += usize::from(observation.reliable_suppressed);
             if observation.disposition != crate::CaptureDisposition::AcceptPhysical {
-                matched = Some(observation.disposition);
-            } else if matched.is_none() {
-                matched = Some(crate::CaptureDisposition::AcceptPhysical);
+                disposition = observation.disposition;
             }
         }
-        matched
+        self.native_failed = true;
+        self.reliable_delivery_failed |= reliable_suppressions != 0;
+        self.routing_to_peer.close_admission();
+        // SAFETY: an injected/physical origin collision is terminal for this
+        // capture thread; its reliable token is completed only as abort by the
+        // raw-input caller before this loop exits.
+        unsafe { PostQuitMessage(1) };
+        Some(HookAdmission {
+            disposition,
+            suppressed: false,
+            reliable_suppressions,
+            routed_at_hook: false,
+            routing_epoch: 0,
+        })
     }
 
-    fn emit(&mut self, event: NativeInputEvent) {
+    fn emit(
+        &mut self,
+        event: NativeInputEvent,
+        routing: Option<NativeRoutingObservation>,
+        reliable_suppressions: usize,
+    ) {
         if self.callback_failed {
+            self.reliable_delivery_failed |= reliable_suppressions != 0;
+            let _ = self
+                .routing_to_peer
+                .complete_reliable_suppressions(reliable_suppressions);
             return;
         }
-        if !matches!(
-            catch_unwind(AssertUnwindSafe(|| (self.callback)(event))),
+        let delivered = matches!(
+            catch_unwind(AssertUnwindSafe(|| (self.callback)(event, routing))),
             Ok(Ok(()))
-        ) {
+        );
+        let completed = self
+            .routing_to_peer
+            .complete_reliable_suppressions(reliable_suppressions);
+        if !delivered || !completed {
             self.callback_failed = true;
-            self.routing_to_peer.store(false, Ordering::Release);
+            if (!delivered || !completed) && reliable_suppressions != 0 {
+                self.reliable_delivery_failed = true;
+            }
+            self.abort_pending_observations();
+            self.routing_to_peer.disable_fail_closed();
             // SAFETY: this callback runs only on the capture thread and requests
             // termination of that thread's own message loop.
             unsafe { PostQuitMessage(1) };
@@ -257,6 +381,10 @@ impl InputCaptureContext {
     }
 
     fn emit_lifecycle(&mut self, event: NativeLifecycleEvent) {
+        if self.pending_lifecycle.is_some() {
+            self.fail_native();
+            return;
+        }
         if matches!(
             event,
             NativeLifecycleEvent::SessionLocked
@@ -264,17 +392,82 @@ impl InputCaptureContext {
                 | NativeLifecycleEvent::SystemSuspending
                 | NativeLifecycleEvent::DefaultDesktopUnavailable
         ) {
-            self.routing_to_peer.store(false, Ordering::Release);
+            self.routing_to_peer.close_admission();
+            if self.routing_to_peer.has_outstanding_reliable_suppressions() {
+                self.pending_lifecycle = Some(PendingReliableLifecycle {
+                    event,
+                    deadline: Instant::now() + RELIABLE_LIFECYCLE_DRAIN_TIMEOUT,
+                });
+                return;
+            }
+            if self.routing_to_peer.disable().is_err() {
+                self.fail_native();
+                return;
+            }
         }
-        self.emit(NativeInputEvent::Lifecycle(event));
+        self.emit(NativeInputEvent::Lifecycle(event), None, 0);
+    }
+
+    fn finish_pending_lifecycle_if_drained(&mut self) {
+        let Some(pending) = self.pending_lifecycle else {
+            return;
+        };
+        if self.reliable_delivery_failed || self.callback_failed || self.native_failed {
+            self.pending_lifecycle = None;
+            return;
+        }
+        if self.routing_to_peer.has_outstanding_reliable_suppressions() {
+            return;
+        }
+        self.pending_lifecycle = None;
+        if self.routing_to_peer.disable().is_err() {
+            self.fail_native();
+            return;
+        }
+        self.emit(NativeInputEvent::Lifecycle(pending.event), None, 0);
+    }
+
+    fn poll_pending_lifecycle(&mut self) {
+        let Some(pending) = self.pending_lifecycle else {
+            return;
+        };
+        if self.reliable_delivery_failed || self.callback_failed || self.native_failed {
+            self.pending_lifecycle = None;
+            return;
+        }
+        if !self.routing_to_peer.has_outstanding_reliable_suppressions() {
+            self.finish_pending_lifecycle_if_drained();
+        } else if Instant::now() >= pending.deadline {
+            self.pending_lifecycle = None;
+            self.fail_reliable_delivery();
+        }
+    }
+
+    fn fail_reliable_delivery(&mut self) {
+        self.reliable_delivery_failed = true;
+        self.fail_native();
     }
 
     fn fail_native(&mut self) {
         self.native_failed = true;
-        self.routing_to_peer.store(false, Ordering::Release);
+        self.abort_pending_observations();
+        self.routing_to_peer.disable_fail_closed();
         // SAFETY: this method is called only while dispatching on the capture
         // thread and terminates that thread's own message loop.
         unsafe { PostQuitMessage(1) };
+    }
+
+    fn abort_pending_observations(&mut self) {
+        self.pending_lifecycle = None;
+        let reliable = self
+            .observations
+            .drain(..)
+            .filter(|observation| observation.reliable_suppressed)
+            .count();
+        self.reliable_delivery_failed |= reliable != 0;
+        let _ = self
+            .routing_to_peer
+            .complete_reliable_suppressions(reliable);
     }
 }
 
@@ -327,9 +520,15 @@ pub(super) struct NativeInputCapture {
 impl NativeInputCapture {
     #[allow(clippy::too_many_lines)]
     pub(super) fn new(
-        routing_to_peer: Arc<AtomicBool>,
-        callback: impl FnMut(NativeInputEvent) -> Result<(), WindowsPlatformError> + Send + 'static,
+        routing_to_peer: Arc<RoutingAdmission>,
+        callback: impl FnMut(
+            NativeInputEvent,
+            Option<NativeRoutingObservation>,
+        ) -> Result<(), WindowsPlatformError>
+        + Send
+        + 'static,
     ) -> Result<Self, WindowsPlatformError> {
+        ensure_process_dpi_awareness()?;
         probe_environment()?;
         let mut context = Box::new(InputCaptureContext {
             callback: Box::new(callback),
@@ -339,6 +538,8 @@ impl NativeInputCapture {
             desktop_available: true,
             callback_failed: false,
             native_failed: false,
+            reliable_delivery_failed: false,
+            pending_lifecycle: None,
         });
         let already_active = CAPTURE_CONTEXT.with(|slot| {
             if slot.get().is_null() {
@@ -487,7 +688,9 @@ impl NativeInputCapture {
                 DispatchMessageW(&raw const message);
             }
         }
-        if self.context.callback_failed {
+        if self.context.reliable_delivery_failed {
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        } else if self.context.callback_failed {
             Err(WindowsPlatformError::CaptureCallbackFailed)
         } else if self.context.native_failed {
             Err(WindowsPlatformError::RawInputUnavailable)
@@ -499,7 +702,8 @@ impl NativeInputCapture {
 
 impl Drop for NativeInputCapture {
     fn drop(&mut self) {
-        self.context.routing_to_peer.store(false, Ordering::Release);
+        self.context.abort_pending_observations();
+        self.context.routing_to_peer.disable_fail_closed();
         if let Some(hook) = self.mouse_hook.take() {
             // SAFETY: this is the uniquely owned live hook returned at creation.
             let _ = unsafe { UnhookWindowsHookEx(hook) };
@@ -533,6 +737,254 @@ impl Drop for NativeInputCapture {
         let _ = unsafe { UnregisterClassW(PCWSTR(self.class_name.as_ptr()), Some(self.module)) };
         CAPTURE_CONTEXT.with(|slot| slot.set(ptr::null_mut()));
     }
+}
+
+struct DisplayStopState {
+    window: Mutex<Option<isize>>,
+    thread_id: u32,
+}
+
+pub(super) struct NativeDisplayMonitorStopHandle {
+    state: Arc<DisplayStopState>,
+}
+
+impl NativeDisplayMonitorStopHandle {
+    pub(super) fn stop(&self) -> Result<(), WindowsPlatformError> {
+        let window = self
+            .state
+            .window
+            .lock()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        let Some(raw) = *window else {
+            return Ok(());
+        };
+        // SAFETY: the mutex serializes this post with display-window teardown.
+        let posted = unsafe {
+            PostMessageW(
+                Some(HWND(raw as *mut c_void)),
+                WM_NODAVO_DISPLAY_STOP,
+                WPARAM(0),
+                LPARAM(0),
+            )
+        };
+        if posted.is_ok() {
+            return Ok(());
+        }
+        // SAFETY: thread_id belongs to this owned message-loop thread and
+        // WM_QUIT carries no pointer-bearing payload.
+        unsafe { PostThreadMessageW(self.state.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)
+    }
+}
+
+/// Dedicated hidden top-level window used only as an early display-change wake.
+/// The one-second timer remains the authoritative full-snapshot source.
+pub(super) struct NativeDisplayMonitor {
+    stop_state: Arc<DisplayStopState>,
+    window: HWND,
+    module: HINSTANCE,
+    class_name: Vec<u16>,
+    timer_registered: bool,
+    session_registered: bool,
+    power_notification: Option<HPOWERNOTIFY>,
+}
+
+impl NativeDisplayMonitor {
+    pub(super) fn new() -> Result<Self, WindowsPlatformError> {
+        ensure_process_dpi_awareness()?;
+        // SAFETY: a null module name requests the module containing this code.
+        let module = HINSTANCE(
+            unsafe { GetModuleHandleW(None) }
+                .map_err(|_| WindowsPlatformError::DisplayUnavailable)?
+                .0,
+        );
+        let class_name = format!(
+            "NodavoDisplayMonitor-{}-{}",
+            // SAFETY: scalar process/thread identifiers have no ownership.
+            unsafe { GetCurrentProcessId() },
+            unsafe { GetCurrentThreadId() }
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(display_window_proc),
+            hInstance: module,
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: the class and its name remain live until this owner drops.
+        if unsafe { RegisterClassW(&raw const class) } == 0 {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        // No HWND_MESSAGE parent is used: this is an unowned, never-shown
+        // top-level window so broadcast WM_DISPLAYCHANGE can wake polling.
+        let Ok(window) = (unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                PCWSTR(class_name.as_ptr()),
+                w!("Nodavo Display Monitor"),
+                WINDOW_STYLE::default(),
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                0,
+                0,
+                None,
+                None,
+                Some(module),
+                None,
+            )
+        }) else {
+            // SAFETY: this unregisters the class registered immediately above.
+            let _ = unsafe { UnregisterClassW(PCWSTR(class_name.as_ptr()), Some(module)) };
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        };
+        let stop_state = Arc::new(DisplayStopState {
+            window: Mutex::new(Some(window.0.addr().cast_signed())),
+            // SAFETY: creation and the message loop run on this owned thread.
+            thread_id: unsafe { GetCurrentThreadId() },
+        });
+        let mut monitor = Self {
+            stop_state,
+            window,
+            module,
+            class_name,
+            timer_registered: false,
+            session_registered: false,
+            power_notification: None,
+        };
+        // SAFETY: this live top-level window remains registered until Drop.
+        unsafe { WTSRegisterSessionNotification(window, NOTIFY_FOR_THIS_SESSION) }
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        monitor.session_registered = true;
+        // SAFETY: the registration is owned by this still-live window.
+        monitor.power_notification = Some(
+            unsafe {
+                RegisterSuspendResumeNotification(HANDLE(window.0), DEVICE_NOTIFY_WINDOW_HANDLE)
+            }
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?,
+        );
+        // SAFETY: the window remains live until Drop and owns this timer.
+        if unsafe {
+            SetTimer(
+                Some(window),
+                DISPLAY_TIMER_ID,
+                DISPLAY_TIMER_INTERVAL_MS,
+                None,
+            )
+        } == 0
+        {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        monitor.timer_registered = true;
+        Ok(monitor)
+    }
+
+    pub(super) fn stop_handle(&self) -> NativeDisplayMonitorStopHandle {
+        NativeDisplayMonitorStopHandle {
+            state: Arc::clone(&self.stop_state),
+        }
+    }
+
+    pub(super) fn run(
+        &mut self,
+        mut poll_full_snapshot: impl FnMut(bool),
+    ) -> Result<(), WindowsPlatformError> {
+        if self.window.0.is_null() {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        let mut session_active = true;
+        let mut power_active = true;
+        // Two complete back-to-back samples establish initial stability without
+        // forcing callers to wait for the first timer tick. Later changes still
+        // require a second observation, with the one-second timer authoritative.
+        poll_full_snapshot(true);
+        poll_full_snapshot(true);
+        let mut message = MSG::default();
+        loop {
+            // SAFETY: this owned thread pumps all messages for its hidden window.
+            let result = unsafe { GetMessageW(&raw mut message, None, 0, 0) };
+            if result.0 == -1 {
+                return Err(WindowsPlatformError::DisplayUnavailable);
+            }
+            if result.0 == 0 {
+                return Ok(());
+            }
+            match message.message {
+                WM_WTSSESSION_CHANGE => {
+                    match u32::try_from(message.wParam.0).unwrap_or(u32::MAX) {
+                        WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT => {
+                            session_active = false;
+                        }
+                        WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => {
+                            session_active = true;
+                        }
+                        _ => {}
+                    }
+                    poll_full_snapshot(session_active && power_active);
+                }
+                WM_POWERBROADCAST => {
+                    match u32::try_from(message.wParam.0).unwrap_or(u32::MAX) {
+                        PBT_APMSUSPEND => power_active = false,
+                        PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMECRITICAL | PBT_APMRESUMESUSPEND => {
+                            power_active = true;
+                        }
+                        _ => {}
+                    }
+                    poll_full_snapshot(session_active && power_active);
+                }
+                WM_DISPLAYCHANGE | WM_TIMER
+                    if message.message != WM_TIMER || message.wParam.0 == DISPLAY_TIMER_ID =>
+                {
+                    poll_full_snapshot(session_active && power_active);
+                }
+                _ => {}
+            }
+            // SAFETY: GetMessageW initialized this MSG; neither call retains it.
+            unsafe {
+                let _ = TranslateMessage(&raw const message);
+                DispatchMessageW(&raw const message);
+            }
+        }
+    }
+}
+
+impl Drop for NativeDisplayMonitor {
+    fn drop(&mut self) {
+        if self.timer_registered {
+            // SAFETY: the timer belongs to this still-live window.
+            let _ = unsafe { KillTimer(Some(self.window), DISPLAY_TIMER_ID) };
+        }
+        if self.session_registered {
+            // SAFETY: registration belongs to this still-live window.
+            let _ = unsafe { WTSUnRegisterSessionNotification(self.window) };
+        }
+        if let Some(notification) = self.power_notification.take() {
+            // SAFETY: this registration is released exactly once.
+            let _ = unsafe { UnregisterSuspendResumeNotification(notification) };
+        }
+        if let Ok(mut window) = self.stop_state.window.lock() {
+            *window = None;
+        }
+        // SAFETY: the window and class are owned by this monitor thread.
+        let _ = unsafe { DestroyWindow(self.window) };
+        let _ = unsafe { UnregisterClassW(PCWSTR(self.class_name.as_ptr()), Some(self.module)) };
+    }
+}
+
+unsafe extern "system" fn display_window_proc(
+    window: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_NODAVO_DISPLAY_STOP {
+        // SAFETY: this runs on the display-monitor thread and stops its loop.
+        unsafe { PostQuitMessage(0) };
+        return LRESULT(0);
+    }
+    // SAFETY: Nodavo has no custom pointer-bearing state for this window.
+    unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
 fn register_raw_input(
@@ -624,6 +1076,8 @@ unsafe extern "system" fn input_window_proc(
             // duration of this window-procedure call.
             if unsafe { process_raw_input(context, HRAWINPUT(lparam.0 as *mut c_void)) }.is_err() {
                 context.fail_native();
+            } else {
+                context.finish_pending_lifecycle_if_drained();
             }
         }
         WM_INPUT_DEVICE_CHANGE
@@ -640,7 +1094,10 @@ unsafe extern "system" fn input_window_proc(
         WM_POWERBROADCAST => {
             handle_power_change(context, u32::try_from(wparam.0).unwrap_or(u32::MAX));
         }
-        WM_TIMER if wparam.0 == CAPTURE_TIMER_ID => refresh_desktop_state(context),
+        WM_TIMER if wparam.0 == CAPTURE_TIMER_ID => {
+            refresh_desktop_state(context);
+            context.poll_pending_lifecycle();
+        }
         _ => {}
     }
     // SAFETY: default processing is required for WM_INPUT cleanup and is valid
@@ -726,7 +1183,27 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     if !context.is_null() {
         // SAFETY: the TLS invariant is documented in input_window_proc.
         let context = unsafe { &mut *context };
-        context.record_hook(HookObservation {
+        let routing = Arc::clone(&context.routing_to_peer);
+        let admission = routing.begin();
+        let routed_at_hook = disposition == crate::CaptureDisposition::AcceptPhysical
+            && context.session_active
+            && context.desktop_available
+            && admission.enabled();
+        let mut suppressed = routed_at_hook
+            && native_keyboard_is_supported(scan_code, virtual_key, extended, virtual_key == 0x13);
+        let mut reliable_suppressed = false;
+        if suppressed {
+            if admission.commit_reliable_suppression().is_ok() {
+                reliable_suppressed = true;
+            } else {
+                suppressed = false;
+                context.native_failed = true;
+                context.routing_to_peer.close_admission();
+                // SAFETY: hook callbacks execute on the owned capture thread.
+                unsafe { PostQuitMessage(1) };
+            }
+        }
+        suppressed = context.record_hook(HookObservation {
             key: HookObservationKey::Keyboard {
                 scan_code,
                 virtual_key,
@@ -734,13 +1211,12 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             },
             disposition,
             timestamp: data.time,
+            suppressed,
+            reliable_suppressed,
+            routed_at_hook,
+            routing_epoch: admission.epoch(),
         });
-        if disposition == crate::CaptureDisposition::AcceptPhysical
-            && context.session_active
-            && context.desktop_available
-            && context.routing_to_peer.load(Ordering::Acquire)
-            && native_keyboard_is_supported(scan_code, virtual_key, extended, virtual_key == 0x13)
-        {
+        if suppressed {
             return LRESULT(1);
         }
     }
@@ -769,16 +1245,35 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     if !context.is_null() {
         // SAFETY: the TLS invariant is documented in input_window_proc.
         let context = unsafe { &mut *context };
-        context.record_hook(HookObservation {
+        let routing = Arc::clone(&context.routing_to_peer);
+        let admission = routing.begin();
+        let routed_at_hook = disposition == crate::CaptureDisposition::AcceptPhysical
+            && context.session_active
+            && context.desktop_available
+            && admission.enabled();
+        let mut suppressed = routed_at_hook;
+        let mut reliable_suppressed = false;
+        if suppressed && mouse_message_is_reliable(message) {
+            if admission.commit_reliable_suppression().is_ok() {
+                reliable_suppressed = true;
+            } else {
+                suppressed = false;
+                context.native_failed = true;
+                context.routing_to_peer.close_admission();
+                // SAFETY: hook callbacks execute on the owned capture thread.
+                unsafe { PostQuitMessage(1) };
+            }
+        }
+        suppressed = context.record_hook(HookObservation {
             key: HookObservationKey::Mouse { message },
             disposition,
             timestamp: data.time,
+            suppressed,
+            reliable_suppressed,
+            routed_at_hook,
+            routing_epoch: admission.epoch(),
         });
-        if disposition == crate::CaptureDisposition::AcceptPhysical
-            && context.session_active
-            && context.desktop_available
-            && context.routing_to_peer.load(Ordering::Acquire)
-        {
+        if suppressed {
             return LRESULT(1);
         }
     }
@@ -799,6 +1294,22 @@ const fn mouse_message_is_supported(message: u32) -> bool {
         message,
         WM_MOUSEMOVE
             | WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_XBUTTONDOWN
+            | WM_XBUTTONUP
+            | WM_MOUSEWHEEL
+            | WM_MOUSEHWHEEL
+    )
+}
+
+const fn mouse_message_is_reliable(message: u32) -> bool {
+    matches!(
+        message,
+        WM_LBUTTONDOWN
             | WM_LBUTTONUP
             | WM_RBUTTONDOWN
             | WM_RBUTTONUP
@@ -866,7 +1377,7 @@ unsafe fn process_raw_input(
                 pressed,
             };
             if keyboard.ExtraInformation == NODAVO_INPUT_TAG_LOW32 {
-                let _ = context.take_origin(key, timestamp);
+                discard_origin(context, key, timestamp);
                 return Ok(());
             }
             emit_if_physical(
@@ -885,11 +1396,17 @@ unsafe fn process_raw_input(
         value if value == RIM_TYPEMOUSE.0 => {
             // SAFETY: dwType selects the initialized mouse union member.
             let mouse = unsafe { raw.data.mouse };
-            if mouse.ulExtraInformation == NODAVO_INPUT_TAG_LOW32 {
-                return Ok(());
-            }
             // SAFETY: RAWMOUSE always initializes its button-flags/data view.
             let buttons = unsafe { mouse.Anonymous.Anonymous };
+            if mouse.ulExtraInformation == NODAVO_INPUT_TAG_LOW32 {
+                discard_raw_mouse_origins(
+                    context,
+                    mouse.lLastX != 0 || mouse.lLastY != 0,
+                    buttons.usButtonFlags,
+                    timestamp,
+                );
+                return Ok(());
+            }
             if mouse.lLastX != 0 || mouse.lLastY != 0 {
                 let mut point = POINT::default();
                 // SAFETY: point is a live output location.
@@ -945,18 +1462,7 @@ unsafe fn process_raw_input(
 
 fn emit_raw_mouse_buttons(context: &mut InputCaptureContext, flags: u16, timestamp: u32) {
     let flags = u32::from(flags);
-    for (mask, message, button, pressed) in [
-        (RI_MOUSE_BUTTON_1_DOWN, WM_LBUTTONDOWN, 1, true),
-        (RI_MOUSE_BUTTON_1_UP, WM_LBUTTONUP, 1, false),
-        (RI_MOUSE_BUTTON_2_DOWN, WM_RBUTTONDOWN, 2, true),
-        (RI_MOUSE_BUTTON_2_UP, WM_RBUTTONUP, 2, false),
-        (RI_MOUSE_BUTTON_3_DOWN, WM_MBUTTONDOWN, 3, true),
-        (RI_MOUSE_BUTTON_3_UP, WM_MBUTTONUP, 3, false),
-        (RI_MOUSE_BUTTON_4_DOWN, WM_XBUTTONDOWN, 4, true),
-        (RI_MOUSE_BUTTON_4_UP, WM_XBUTTONUP, 4, false),
-        (RI_MOUSE_BUTTON_5_DOWN, WM_XBUTTONDOWN, 5, true),
-        (RI_MOUSE_BUTTON_5_UP, WM_XBUTTONUP, 5, false),
-    ] {
+    for (mask, message, button, pressed) in raw_mouse_button_messages() {
         if flags & mask != 0 {
             emit_if_physical(
                 context,
@@ -968,18 +1474,110 @@ fn emit_raw_mouse_buttons(context: &mut InputCaptureContext, flags: u16, timesta
     }
 }
 
+fn discard_raw_mouse_origins(
+    context: &mut InputCaptureContext,
+    moved: bool,
+    flags: u16,
+    timestamp: u32,
+) {
+    if moved {
+        discard_origin(
+            context,
+            HookObservationKey::Mouse {
+                message: WM_MOUSEMOVE,
+            },
+            timestamp,
+        );
+    }
+    let flags = u32::from(flags);
+    for (mask, message, _, _) in raw_mouse_button_messages() {
+        if flags & mask != 0 {
+            discard_origin(context, HookObservationKey::Mouse { message }, timestamp);
+        }
+    }
+    if flags & RI_MOUSE_WHEEL != 0 {
+        discard_origin(
+            context,
+            HookObservationKey::Mouse {
+                message: WM_MOUSEWHEEL,
+            },
+            timestamp,
+        );
+    }
+    if flags & RI_MOUSE_HWHEEL != 0 {
+        discard_origin(
+            context,
+            HookObservationKey::Mouse {
+                message: WM_MOUSEHWHEEL,
+            },
+            timestamp,
+        );
+    }
+}
+
+const fn raw_mouse_button_messages() -> [(u32, u32, u8, bool); 10] {
+    [
+        (RI_MOUSE_BUTTON_1_DOWN, WM_LBUTTONDOWN, 1, true),
+        (RI_MOUSE_BUTTON_1_UP, WM_LBUTTONUP, 1, false),
+        (RI_MOUSE_BUTTON_2_DOWN, WM_RBUTTONDOWN, 2, true),
+        (RI_MOUSE_BUTTON_2_UP, WM_RBUTTONUP, 2, false),
+        (RI_MOUSE_BUTTON_3_DOWN, WM_MBUTTONDOWN, 3, true),
+        (RI_MOUSE_BUTTON_3_UP, WM_MBUTTONUP, 3, false),
+        (RI_MOUSE_BUTTON_4_DOWN, WM_XBUTTONDOWN, 4, true),
+        (RI_MOUSE_BUTTON_4_UP, WM_XBUTTONUP, 4, false),
+        (RI_MOUSE_BUTTON_5_DOWN, WM_XBUTTONDOWN, 5, true),
+        (RI_MOUSE_BUTTON_5_UP, WM_XBUTTONUP, 5, false),
+    ]
+}
+
+fn discard_origin(context: &mut InputCaptureContext, key: HookObservationKey, timestamp: u32) {
+    if let Some(admission) = context.take_origin(key, timestamp) {
+        let _ = context
+            .routing_to_peer
+            .complete_reliable_suppressions(admission.reliable_suppressions);
+    }
+}
+
 fn emit_if_physical(
     context: &mut InputCaptureContext,
     key: HookObservationKey,
     timestamp: u32,
     event: NativeInputEvent,
 ) {
-    if context.session_active
-        && context.desktop_available
-        && context.take_origin(key, timestamp) == Some(crate::CaptureDisposition::AcceptPhysical)
+    let Some(admission) = context.take_origin(key, timestamp) else {
+        if native_event_is_reliable(event) && context.routing_to_peer.is_enabled() {
+            context.fail_reliable_delivery();
+        }
+        return;
+    };
+    let reliable_suppressed = admission.reliable_suppressions != 0;
+    if admission.disposition == crate::CaptureDisposition::AcceptPhysical
+        && ((context.session_active && context.desktop_available) || reliable_suppressed)
     {
-        context.emit(event);
+        context.emit(
+            event,
+            Some(NativeRoutingObservation {
+                hook_suppressed: admission.suppressed,
+                routed_at_hook: admission.routed_at_hook,
+                reliable_suppressed,
+                epoch: admission.routing_epoch,
+            }),
+            admission.reliable_suppressions,
+        );
+    } else {
+        let _ = context
+            .routing_to_peer
+            .complete_reliable_suppressions(admission.reliable_suppressions);
     }
+}
+
+const fn native_event_is_reliable(event: NativeInputEvent) -> bool {
+    matches!(
+        event,
+        NativeInputEvent::Keyboard { .. }
+            | NativeInputEvent::PointerButton { .. }
+            | NativeInputEvent::Scroll { .. }
+    )
 }
 
 #[cfg(test)]
@@ -988,53 +1586,474 @@ mod capture_tests {
 
     fn context() -> InputCaptureContext {
         InputCaptureContext {
-            callback: Box::new(|_| Ok(())),
-            routing_to_peer: Arc::new(AtomicBool::new(false)),
+            callback: Box::new(|_, _| Ok(())),
+            routing_to_peer: Arc::new(RoutingAdmission::default()),
             observations: VecDeque::new(),
             session_active: true,
             desktop_available: true,
             callback_failed: false,
             native_failed: false,
+            reliable_delivery_failed: false,
+            pending_lifecycle: None,
         }
     }
 
     #[test]
     fn ambiguous_hook_origins_fail_closed() {
         let mut context = context();
+        context.routing_to_peer.enable().unwrap();
         let key = HookObservationKey::Keyboard {
             scan_code: 0x1e,
             virtual_key: 0x41,
             pressed: true,
         };
-        for disposition in [
-            crate::CaptureDisposition::AcceptPhysical,
-            crate::CaptureDisposition::RejectOtherInjected,
-        ] {
-            context.record_hook(HookObservation {
-                key,
-                disposition,
-                timestamp: 10,
-            });
-        }
+        let routing = Arc::clone(&context.routing_to_peer);
+        let physical = routing.begin();
+        physical.commit_reliable_suppression().unwrap();
+        let epoch = physical.epoch();
+        assert!(context.record_hook(HookObservation {
+            key,
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 10,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: epoch,
+        }));
+        drop(physical);
+        context.record_hook(HookObservation {
+            key,
+            disposition: crate::CaptureDisposition::RejectOtherInjected,
+            timestamp: 10,
+            suppressed: false,
+            reliable_suppressed: false,
+            routed_at_hook: false,
+            routing_epoch: epoch,
+        });
+        let conflict = context.take_origin(key, 10).unwrap();
         assert_eq!(
-            context.take_origin(key, 10),
-            Some(crate::CaptureDisposition::RejectOtherInjected)
+            conflict.disposition,
+            crate::CaptureDisposition::RejectOtherInjected
+        );
+        assert_eq!(conflict.reliable_suppressions, 1);
+        assert!(context.native_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(!context.routing_to_peer.is_enabled());
+        assert!(
+            context
+                .routing_to_peer
+                .complete_reliable_suppressions(conflict.reliable_suppressions)
         );
         assert!(context.take_origin(key, 10).is_none());
     }
 
     #[test]
+    fn duplicate_physical_origins_complete_one_reliable_event_each() {
+        let mut context = context();
+        context.routing_to_peer.enable().unwrap();
+        let key = HookObservationKey::Keyboard {
+            scan_code: 0x1e,
+            virtual_key: 0x41,
+            pressed: true,
+        };
+        for _ in 0..2 {
+            let routing = Arc::clone(&context.routing_to_peer);
+            let hook = routing.begin();
+            hook.commit_reliable_suppression().unwrap();
+            let epoch = hook.epoch();
+            assert!(context.record_hook(HookObservation {
+                key,
+                disposition: crate::CaptureDisposition::AcceptPhysical,
+                timestamp: 10,
+                suppressed: true,
+                reliable_suppressed: true,
+                routed_at_hook: true,
+                routing_epoch: epoch,
+            }));
+            drop(hook);
+        }
+
+        let first = context.take_origin(key, 10).unwrap();
+        let second = context.take_origin(key, 10).unwrap();
+        assert_eq!(first.reliable_suppressions, 1);
+        assert_eq!(second.reliable_suppressions, 1);
+        assert!(
+            context
+                .routing_to_peer
+                .complete_reliable_suppressions(first.reliable_suppressions)
+        );
+        assert!(
+            context
+                .routing_to_peer
+                .complete_reliable_suppressions(second.reliable_suppressions)
+        );
+        assert!(context.routing_to_peer.disable().is_ok());
+    }
+
+    #[test]
     fn callback_error_immediately_disables_routing() {
         let mut context = context();
-        context.routing_to_peer.store(true, Ordering::Release);
-        context.callback = Box::new(|_| Err(WindowsPlatformError::CaptureCallbackFailed));
+        context.routing_to_peer.enable().unwrap();
+        context.callback = Box::new(|_, _| Err(WindowsPlatformError::CaptureCallbackFailed));
 
-        context.emit(NativeInputEvent::Lifecycle(
-            NativeLifecycleEvent::InputDeviceChanged,
-        ));
+        context.emit(
+            NativeInputEvent::Lifecycle(NativeLifecycleEvent::InputDeviceChanged),
+            None,
+            0,
+        );
 
         assert!(context.callback_failed);
-        assert!(!context.routing_to_peer.load(Ordering::Acquire));
+        assert!(!context.routing_to_peer.is_enabled());
+    }
+
+    #[test]
+    fn suppressed_reliable_callback_error_requires_process_poison_result() {
+        let mut context = context();
+        context.routing_to_peer.enable().unwrap();
+        context.callback = Box::new(|_, _| Err(WindowsPlatformError::CaptureCallbackFailed));
+        let key = HookObservationKey::Keyboard {
+            scan_code: 0x1e,
+            virtual_key: 0x41,
+            pressed: true,
+        };
+        let routing = Arc::clone(&context.routing_to_peer);
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        assert!(context.record_hook(HookObservation {
+            key,
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 15,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: hook.epoch(),
+        }));
+        drop(hook);
+
+        emit_if_physical(
+            &mut context,
+            key,
+            15,
+            NativeInputEvent::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                extended: false,
+                e1: false,
+                pressed: true,
+            },
+        );
+
+        assert!(context.callback_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(!context.routing_to_peer.is_enabled());
+    }
+
+    #[test]
+    fn reliable_suppression_barrier_waits_for_raw_bridge_delivery() {
+        let (bridge, delivered) = std::sync::mpsc::sync_channel(1);
+        let mut context = context();
+        context.callback = Box::new(move |event, suppressed| {
+            bridge.send((event, suppressed)).unwrap();
+            Ok(())
+        });
+        context.routing_to_peer.enable().unwrap();
+        let key = HookObservationKey::Keyboard {
+            scan_code: 0x1e,
+            virtual_key: 0x41,
+            pressed: false,
+        };
+        let hook_routing = Arc::clone(&context.routing_to_peer);
+        let hook = hook_routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        let epoch = hook.epoch();
+        assert!(context.record_hook(HookObservation {
+            key,
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 10,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: epoch,
+        }));
+        drop(hook);
+
+        let routing = Arc::clone(&context.routing_to_peer);
+        let (barrier, barrier_result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || barrier.send(routing.disable()).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while context.routing_to_peer.is_enabled() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!context.routing_to_peer.is_enabled());
+        assert!(matches!(
+            barrier_result.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        emit_if_physical(
+            &mut context,
+            key,
+            10,
+            NativeInputEvent::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                extended: false,
+                e1: false,
+                pressed: false,
+            },
+        );
+        assert_eq!(barrier_result.recv().unwrap(), Ok(()));
+        assert_eq!(
+            delivered.recv().unwrap(),
+            (
+                NativeInputEvent::Keyboard {
+                    scan_code: 0x1e,
+                    virtual_key: 0x41,
+                    extended: false,
+                    e1: false,
+                    pressed: false,
+                },
+                Some(NativeRoutingObservation {
+                    hook_suppressed: true,
+                    routed_at_hook: true,
+                    reliable_suppressed: true,
+                    epoch,
+                }),
+            )
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn lifecycle_loss_delivers_suppressed_reliable_input_before_callback() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback_delivered = Arc::clone(&delivered);
+        let mut context = context();
+        context.callback = Box::new(move |event, routing| {
+            callback_delivered.lock().unwrap().push((event, routing));
+            Ok(())
+        });
+        context.routing_to_peer.enable().unwrap();
+        let key = HookObservationKey::Keyboard {
+            scan_code: 0x1e,
+            virtual_key: 0x41,
+            pressed: false,
+        };
+        let hook_routing = Arc::clone(&context.routing_to_peer);
+        let hook = hook_routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        let epoch = hook.epoch();
+        assert!(context.record_hook(HookObservation {
+            key,
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 20,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: epoch,
+        }));
+        drop(hook);
+
+        context.session_active = false;
+        context.emit_lifecycle(NativeLifecycleEvent::SessionLocked);
+        assert!(context.pending_lifecycle.is_some());
+        assert!(!context.routing_to_peer.is_enabled());
+        assert!(delivered.lock().unwrap().is_empty());
+
+        emit_if_physical(
+            &mut context,
+            key,
+            20,
+            NativeInputEvent::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                extended: false,
+                e1: false,
+                pressed: false,
+            },
+        );
+        context.finish_pending_lifecycle_if_drained();
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 2);
+        assert!(matches!(
+            delivered[0],
+            (
+                NativeInputEvent::Keyboard { pressed: false, .. },
+                Some(NativeRoutingObservation {
+                    reliable_suppressed: true,
+                    ..
+                })
+            )
+        ));
+        assert_eq!(
+            delivered[1],
+            (
+                NativeInputEvent::Lifecycle(NativeLifecycleEvent::SessionLocked),
+                None
+            )
+        );
+        assert!(context.pending_lifecycle.is_none());
+        assert!(!context.native_failed);
+    }
+
+    #[test]
+    fn lifecycle_missing_reliable_raw_input_is_terminal_not_clean() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback_delivered = Arc::clone(&delivered);
+        let mut context = context();
+        context.callback = Box::new(move |event, routing| {
+            callback_delivered.lock().unwrap().push((event, routing));
+            Ok(())
+        });
+        context.routing_to_peer.enable().unwrap();
+        let routing = Arc::clone(&context.routing_to_peer);
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        assert!(context.record_hook(HookObservation {
+            key: HookObservationKey::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                pressed: false,
+            },
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 30,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: hook.epoch(),
+        }));
+        drop(hook);
+
+        context.session_active = false;
+        context.emit_lifecycle(NativeLifecycleEvent::SessionLocked);
+        std::thread::sleep(RELIABLE_LIFECYCLE_DRAIN_TIMEOUT + Duration::from_millis(10));
+        context.poll_pending_lifecycle();
+
+        assert!(context.native_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(context.pending_lifecycle.is_none());
+        assert!(!context.routing_to_peer.is_enabled());
+        assert!(delivered.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn second_lifecycle_while_reliable_delivery_pending_is_terminal() {
+        let mut context = context();
+        context.routing_to_peer.enable().unwrap();
+        let routing = Arc::clone(&context.routing_to_peer);
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        assert!(context.record_hook(HookObservation {
+            key: HookObservationKey::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                pressed: false,
+            },
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 35,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: hook.epoch(),
+        }));
+        drop(hook);
+
+        context.session_active = false;
+        context.emit_lifecycle(NativeLifecycleEvent::SessionLocked);
+        assert!(context.pending_lifecycle.is_some());
+        context.emit_lifecycle(NativeLifecycleEvent::InputDeviceChanged);
+
+        assert!(context.native_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(context.pending_lifecycle.is_none());
+        assert!(!context.routing_to_peer.is_enabled());
+    }
+
+    #[test]
+    fn expired_reliable_observation_never_emits_pending_lifecycle() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback_delivered = Arc::clone(&delivered);
+        let mut context = context();
+        context.callback = Box::new(move |event, routing| {
+            callback_delivered.lock().unwrap().push((event, routing));
+            Ok(())
+        });
+        context.routing_to_peer.enable().unwrap();
+        let routing = Arc::clone(&context.routing_to_peer);
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        assert!(context.record_hook(HookObservation {
+            key: HookObservationKey::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                pressed: false,
+            },
+            disposition: crate::CaptureDisposition::AcceptPhysical,
+            timestamp: 10,
+            suppressed: true,
+            reliable_suppressed: true,
+            routed_at_hook: true,
+            routing_epoch: hook.epoch(),
+        }));
+        drop(hook);
+        context.session_active = false;
+        context.emit_lifecycle(NativeLifecycleEvent::SessionLocked);
+        assert!(context.pending_lifecycle.is_some());
+
+        emit_if_physical(
+            &mut context,
+            HookObservationKey::Mouse {
+                message: WM_MOUSEMOVE,
+            },
+            10 + HOOK_OBSERVATION_MAX_AGE_MS + 1,
+            NativeInputEvent::PointerMotion {
+                x: 0,
+                y: 0,
+                delta_x: 1,
+                delta_y: 1,
+            },
+        );
+        context.finish_pending_lifecycle_if_drained();
+
+        assert!(context.native_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(context.pending_lifecycle.is_none());
+        assert!(delivered.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_reliable_hook_observation_terminates_enabled_capture() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let callback_delivered = Arc::clone(&delivered);
+        let mut context = context();
+        context.callback = Box::new(move |event, routing| {
+            callback_delivered.lock().unwrap().push((event, routing));
+            Ok(())
+        });
+        context.routing_to_peer.enable().unwrap();
+
+        emit_if_physical(
+            &mut context,
+            HookObservationKey::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                pressed: true,
+            },
+            40,
+            NativeInputEvent::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                extended: false,
+                e1: false,
+                pressed: true,
+            },
+        );
+
+        assert!(context.native_failed);
+        assert!(context.reliable_delivery_failed);
+        assert!(!context.routing_to_peer.is_enabled());
+        assert!(delivered.lock().unwrap().is_empty());
     }
 }
 
@@ -1271,7 +2290,7 @@ pub(super) fn derive_package_family_name(
         publisherId: PWSTR::null(),
         ..PACKAGE_ID::default()
     };
-    package_family_name_from_id(&package_id)
+    package_family_name_from_id(&raw const package_id)
 }
 
 pub(super) struct NativeNamedPipeClient {
@@ -2197,6 +3216,34 @@ pub(super) enum NativeInput {
     },
 }
 
+/// Establishes the process-wide per-monitor-v2 contract before any Nodavo
+/// display enumeration or window creation.
+pub(super) fn ensure_process_dpi_awareness() -> Result<(), WindowsPlatformError> {
+    *PROCESS_DPI_AWARENESS.get_or_init(|| {
+        // SAFETY: this process-wide call has no pointer parameters. Nodavo calls
+        // it before its first display or window boundary.
+        let result =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let Err(error) = result else { return Ok(()) };
+        // A manifest or earlier Nodavo boundary may already have established
+        // the process default. Accept only the exact PMv2 context; an unrelated
+        // shell process cannot affect this process-local query.
+        // SAFETY: both calls only inspect process/thread DPI state.
+        let denied = error.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0);
+        let current = unsafe { GetDpiAwarenessContextForProcess(GetCurrentProcess()) };
+        if denied
+            && unsafe {
+                AreDpiAwarenessContextsEqual(current, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+            }
+            .as_bool()
+        {
+            Ok(())
+        } else {
+            Err(WindowsPlatformError::NativeApi)
+        }
+    })
+}
+
 pub(super) fn probe_environment() -> Result<EnvironmentCapabilities, WindowsPlatformError> {
     let mut process_session_id = 0_u32;
     // SAFETY: the output pointer refers to a live `u32`, and the current PID is
@@ -2268,7 +3315,8 @@ impl Drop for DesktopGuard {
     }
 }
 
-pub(super) fn enumerate_displays() -> Result<Vec<DisplayGeometry>, WindowsPlatformError> {
+pub(super) fn enumerate_displays() -> Result<Vec<NativeDisplayGeometry>, WindowsPlatformError> {
+    ensure_process_dpi_awareness()?;
     let mut context = MonitorContext {
         displays: Vec::new(),
         error: None,
@@ -2287,7 +3335,7 @@ pub(super) fn enumerate_displays() -> Result<Vec<DisplayGeometry>, WindowsPlatfo
 }
 
 struct MonitorContext {
-    displays: Vec<DisplayGeometry>,
+    displays: Vec<NativeDisplayGeometry>,
     error: Option<WindowsPlatformError>,
 }
 
@@ -2314,19 +3362,24 @@ unsafe extern "system" fn monitor_callback(
     true.into()
 }
 
-unsafe fn describe_monitor(monitor: HMONITOR) -> Result<DisplayGeometry, WindowsPlatformError> {
-    let mut info = MONITORINFO {
-        cbSize: u32::try_from(size_of::<MONITORINFO>())
-            .map_err(|_| WindowsPlatformError::NativeApi)?,
+unsafe fn describe_monitor(
+    monitor: HMONITOR,
+) -> Result<NativeDisplayGeometry, WindowsPlatformError> {
+    let mut info = MONITORINFOEXW {
+        monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: u32::try_from(size_of::<MONITORINFOEXW>())
+                .map_err(|_| WindowsPlatformError::NativeApi)?,
+            ..Default::default()
+        },
         ..Default::default()
     };
     // SAFETY: `info` has the required cbSize and remains writable for the call.
-    if !unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+    if !unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast()) }.as_bool() {
         return Err(WindowsPlatformError::NativeApi);
     }
-    let width = u32::try_from(info.rcMonitor.right - info.rcMonitor.left)
+    let width = u32::try_from(info.monitorInfo.rcMonitor.right - info.monitorInfo.rcMonitor.left)
         .map_err(|_| WindowsPlatformError::InvalidDisplay)?;
-    let height = u32::try_from(info.rcMonitor.bottom - info.rcMonitor.top)
+    let height = u32::try_from(info.monitorInfo.rcMonitor.bottom - info.monitorInfo.rcMonitor.top)
         .map_err(|_| WindowsPlatformError::InvalidDisplay)?;
     if width == 0 || height == 0 {
         return Err(WindowsPlatformError::InvalidDisplay);
@@ -2340,16 +3393,160 @@ unsafe fn describe_monitor(monitor: HMONITOR) -> Result<DisplayGeometry, Windows
     if dpi_x == 0 || dpi_y == 0 {
         return Err(WindowsPlatformError::InvalidDisplay);
     }
-    Ok(DisplayGeometry {
-        id: DisplayId::new(monitor.0.addr() as u64),
-        left: info.rcMonitor.left,
-        top: info.rcMonitor.top,
+    Ok(NativeDisplayGeometry {
+        key: monitor_identity_key(&info.szDevice)?,
+        left: info.monitorInfo.rcMonitor.left,
+        top: info.monitorInfo.rcMonitor.top,
         width_pixels: width,
         height_pixels: height,
         dpi_x,
         dpi_y,
-        primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+        rotation: monitor_rotation(&info.szDevice)?,
+        primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
     })
+}
+
+fn monitor_rotation(
+    adapter_name: &[u16; 32],
+) -> Result<nodavo_protocol::DisplayRotation, WindowsPlatformError> {
+    let mut mode = DEVMODEW {
+        dmSize: u16::try_from(size_of::<DEVMODEW>())
+            .map_err(|_| WindowsPlatformError::NativeApi)?,
+        ..Default::default()
+    };
+    // SAFETY: adapter_name is the NUL-terminated MONITORINFOEXW source name;
+    // `mode` has the required dmSize and remains writable during the call.
+    if !unsafe {
+        EnumDisplaySettingsW(
+            PCWSTR(adapter_name.as_ptr()),
+            ENUM_CURRENT_SETTINGS,
+            &raw mut mode,
+        )
+    }
+    .as_bool()
+        || mode.dmFields & DM_DISPLAYORIENTATION != DM_DISPLAYORIENTATION
+    {
+        return Err(WindowsPlatformError::InvalidDisplay);
+    }
+    // SAFETY: EnumDisplaySettingsW succeeded and explicitly marked the display
+    // orientation member as valid in dmFields.
+    display_rotation(unsafe { mode.Anonymous1.Anonymous2.dmDisplayOrientation }.0)
+}
+
+fn monitor_identity_key(
+    adapter_name: &[u16; 32],
+) -> Result<NativeDisplayKey, WindowsPlatformError> {
+    let source_key = NativeDisplayKey::new(adapter_name)?;
+    let mut active_interfaces = Vec::new();
+    for path in active_display_config_paths()? {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: u32::try_from(size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>())
+                    .map_err(|_| WindowsPlatformError::NativeApi)?,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the request header has the exact source structure size and
+        // an adapter/source pair returned by QueryDisplayConfig.
+        if unsafe { DisplayConfigGetDeviceInfo(&raw mut source.header) } != 0 {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        if NativeDisplayKey::new(&source.viewGdiDeviceName)? != source_key {
+            continue;
+        }
+
+        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+                size: u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>())
+                    .map_err(|_| WindowsPlatformError::NativeApi)?,
+                adapterId: path.targetInfo.adapterId,
+                id: path.targetInfo.id,
+            },
+            ..Default::default()
+        };
+        // SAFETY: the request header has the exact target structure size and
+        // an adapter/target pair returned by QueryDisplayConfig.
+        if unsafe { DisplayConfigGetDeviceInfo(&raw mut target.header) } != 0 {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        active_interfaces.push(NativeDisplayKey::from_display_config_target(
+            path.targetInfo.adapterId.LowPart,
+            path.targetInfo.adapterId.HighPart,
+            path.targetInfo.id,
+            &target.monitorDevicePath,
+        )?);
+    }
+    // The GDI source name is used only to join two observations made during the
+    // same sample. It is never persisted as identity. Mirroring or a missing
+    // target interface fails closed instead of inheriting a retired identifier.
+    unique_native_display_key(active_interfaces)
+}
+
+fn active_display_config_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, WindowsPlatformError> {
+    for _ in 0..DISPLAY_CONFIG_QUERY_ATTEMPTS {
+        let mut path_count = 0_u32;
+        let mut mode_count = 0_u32;
+        // SAFETY: both count outputs are live and no buffers are supplied.
+        if unsafe {
+            GetDisplayConfigBufferSizes(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                &raw mut mode_count,
+            )
+        } != ERROR_SUCCESS
+        {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        let path_capacity =
+            usize::try_from(path_count).map_err(|_| WindowsPlatformError::InvalidDisplay)?;
+        let mode_capacity =
+            usize::try_from(mode_count).map_err(|_| WindowsPlatformError::InvalidDisplay)?;
+        if path_capacity == 0
+            || path_capacity > MAX_DISPLAYS
+            || mode_capacity == 0
+            || mode_capacity > MAX_DISPLAY_CONFIG_MODES
+        {
+            return Err(WindowsPlatformError::InvalidDisplay);
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_capacity];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_capacity];
+        // SAFETY: both vectors have the capacities advertised immediately above;
+        // the call updates counts to the initialized prefix lengths.
+        let status = unsafe {
+            QueryDisplayConfig(
+                QDC_ONLY_ACTIVE_PATHS,
+                &raw mut path_count,
+                paths.as_mut_ptr(),
+                &raw mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if status == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if status != ERROR_SUCCESS {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        let path_count =
+            usize::try_from(path_count).map_err(|_| WindowsPlatformError::InvalidDisplay)?;
+        let mode_count =
+            usize::try_from(mode_count).map_err(|_| WindowsPlatformError::InvalidDisplay)?;
+        if path_count == 0
+            || path_count > paths.len()
+            || mode_count == 0
+            || mode_count > modes.len()
+        {
+            return Err(WindowsPlatformError::InvalidDisplay);
+        }
+        paths.truncate(path_count);
+        return Ok(paths);
+    }
+    Err(WindowsPlatformError::DisplayUnavailable)
 }
 
 pub(super) fn send_input(input: NativeInput) -> Result<(), WindowsPlatformError> {

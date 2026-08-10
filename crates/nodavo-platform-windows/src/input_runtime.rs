@@ -3,15 +3,21 @@
 #![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use std::collections::BTreeSet;
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use nodavo_input::{
     ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, Modifiers,
     NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, ScrollUnit,
 };
 
-use crate::DisplayGeometry;
+use crate::{DisplayGeometry, WindowsPlatformError};
 
 const WHEEL_DELTA: i32 = 120;
+#[cfg(not(test))]
+const ROUTING_DISABLE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const ROUTING_DISABLE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Synchronous confirmation that every tracked release was injected.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,6 +101,239 @@ pub(crate) enum NativeLifecycleEvent {
     DefaultDesktopUnavailable,
     DefaultDesktopAvailable,
     InputDeviceChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NativeRoutingObservation {
+    pub(crate) hook_suppressed: bool,
+    pub(crate) routed_at_hook: bool,
+    pub(crate) reliable_suppressed: bool,
+    pub(crate) epoch: u64,
+}
+
+/// Serializes routing decisions with disable acknowledgement.
+///
+/// A hook increments the active-admission count until it has recorded whether
+/// its event was suppressed. Disabling first closes admission and then waits a
+/// bounded interval for the old enabled admissions and every reliable
+/// suppressed key/button/scroll observation to reach the bridge. A timeout
+/// leaves admission disabled; re-enabling is refused until both counts drain.
+pub(crate) struct RoutingAdmission {
+    state: Mutex<RoutingAdmissionState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct RoutingAdmissionState {
+    enabled: bool,
+    epoch: u64,
+    active_enabled_admissions: usize,
+    outstanding_reliable_suppressions: usize,
+}
+
+impl Default for RoutingAdmission {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(RoutingAdmissionState::default()),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+impl RoutingAdmission {
+    pub(crate) fn begin(&self) -> RoutingAdmissionGuard<'_> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                state.enabled = false;
+                return RoutingAdmissionGuard {
+                    admission: self,
+                    enabled: false,
+                    epoch: state.epoch,
+                };
+            }
+        };
+        let mut enabled = state.enabled;
+        if enabled {
+            if let Some(next) = state.active_enabled_admissions.checked_add(1) {
+                state.active_enabled_admissions = next;
+            } else {
+                let _ = close_routing_epoch(&mut state);
+                enabled = false;
+            }
+        }
+        RoutingAdmissionGuard {
+            admission: self,
+            enabled,
+            epoch: state.epoch,
+        }
+    }
+
+    pub(crate) fn enable(&self) -> Result<(), WindowsPlatformError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                poisoned.into_inner().enabled = false;
+                return Err(WindowsPlatformError::CaptureBarrierTimeout);
+            }
+        };
+        if state.enabled {
+            return Ok(());
+        }
+        if !routing_is_drained(&state) {
+            state.enabled = false;
+            return Err(WindowsPlatformError::CaptureBarrierTimeout);
+        }
+        state.epoch = state
+            .epoch
+            .checked_add(1)
+            .ok_or(WindowsPlatformError::CaptureBarrierTimeout)?;
+        state.enabled = true;
+        Ok(())
+    }
+
+    pub(crate) fn disable(&self) -> Result<(), WindowsPlatformError> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                poisoned.into_inner().enabled = false;
+                return Err(WindowsPlatformError::CaptureBarrierTimeout);
+            }
+        };
+        close_routing_epoch(&mut state)?;
+        let waited = self
+            .drained
+            .wait_timeout_while(state, ROUTING_DISABLE_TIMEOUT, |state| {
+                !routing_is_drained(state)
+            });
+        let (mut state, timeout) = match waited {
+            Ok(waited) => waited,
+            Err(poisoned) => {
+                let (mut state, _) = poisoned.into_inner();
+                state.enabled = false;
+                return Err(WindowsPlatformError::CaptureBarrierTimeout);
+            }
+        };
+        state.enabled = false;
+        if timeout.timed_out() && !routing_is_drained(&state) {
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn close_admission(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = close_routing_epoch(&mut state);
+    }
+
+    pub(crate) fn complete_reliable_suppressions(&self, count: usize) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(remaining) = state.outstanding_reliable_suppressions.checked_sub(count) else {
+            let _ = close_routing_epoch(&mut state);
+            return false;
+        };
+        state.outstanding_reliable_suppressions = remaining;
+        if routing_is_drained(&state) {
+            self.drained.notify_all();
+        }
+        true
+    }
+
+    pub(crate) fn disable_fail_closed(&self) {
+        let _ = self.disable();
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.enabled)
+    }
+
+    pub(crate) fn epoch_is_current(&self, epoch: u64) -> bool {
+        self.state.lock().is_ok_and(|state| state.epoch == epoch)
+    }
+
+    pub(crate) fn has_outstanding_reliable_suppressions(&self) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return true;
+        };
+        state.outstanding_reliable_suppressions != 0
+    }
+}
+
+pub(crate) struct RoutingAdmissionGuard<'a> {
+    admission: &'a RoutingAdmission,
+    enabled: bool,
+    epoch: u64,
+}
+
+impl RoutingAdmissionGuard<'_> {
+    pub(crate) const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn commit_reliable_suppression(&self) -> Result<(), WindowsPlatformError> {
+        if !self.enabled {
+            return Err(WindowsPlatformError::CaptureBarrierTimeout);
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(next) = state.outstanding_reliable_suppressions.checked_add(1) else {
+            let _ = close_routing_epoch(&mut state);
+            return Err(WindowsPlatformError::CaptureBarrierTimeout);
+        };
+        state.outstanding_reliable_suppressions = next;
+        Ok(())
+    }
+}
+
+impl Drop for RoutingAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_enabled_admissions = state.active_enabled_admissions.saturating_sub(1);
+        if routing_is_drained(&state) {
+            self.admission.drained.notify_all();
+        }
+    }
+}
+
+const fn routing_is_drained(state: &RoutingAdmissionState) -> bool {
+    state.active_enabled_admissions == 0 && state.outstanding_reliable_suppressions == 0
+}
+
+fn close_routing_epoch(state: &mut RoutingAdmissionState) -> Result<(), WindowsPlatformError> {
+    if !state.enabled {
+        return Ok(());
+    }
+    state.enabled = false;
+    state.epoch = state
+        .epoch
+        .checked_add(1)
+        .ok_or(WindowsPlatformError::CaptureBarrierTimeout)?;
+    Ok(())
 }
 
 pub(crate) struct CaptureTranslator {
@@ -444,6 +683,10 @@ const fn scan_code_to_hid(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier, mpsc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use nodavo_input::DisplayId;
 
     use super::*;
@@ -457,8 +700,141 @@ mod tests {
             height_pixels: 1_080,
             dpi_x: 96,
             dpi_y: 96,
+            rotation: nodavo_protocol::DisplayRotation::Degrees0,
             primary: true,
         }
+    }
+
+    #[test]
+    fn routing_disable_waits_for_old_admission_to_finish() {
+        let routing = Arc::new(RoutingAdmission::default());
+        routing.enable().unwrap();
+        let admission = routing.begin();
+        assert!(admission.enabled());
+
+        let started = Arc::new(Barrier::new(2));
+        let worker_routing = Arc::clone(&routing);
+        let worker_started = Arc::clone(&started);
+        let (done, completed) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            worker_started.wait();
+            worker_routing.disable().unwrap();
+            done.send(()).unwrap();
+        });
+        started.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while routing.is_enabled() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!routing.is_enabled());
+        assert!(matches!(
+            completed.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(admission);
+        completed.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        assert!(!routing.is_enabled());
+    }
+
+    #[test]
+    fn routing_disable_timeout_stays_closed_until_old_admission_drains() {
+        let routing = RoutingAdmission::default();
+        routing.enable().unwrap();
+        let admission = routing.begin();
+        assert!(admission.enabled());
+
+        assert_eq!(
+            routing.disable(),
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        );
+        assert!(!routing.is_enabled());
+        assert_eq!(
+            routing.enable(),
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        );
+
+        drop(admission);
+        routing.enable().unwrap();
+        assert!(routing.is_enabled());
+    }
+
+    #[test]
+    fn disable_waits_until_suppressed_reliable_input_reaches_fake_bridge() {
+        let routing = Arc::new(RoutingAdmission::default());
+        routing.enable().unwrap();
+        let hook = routing.begin();
+        assert!(hook.enabled());
+        hook.commit_reliable_suppression().unwrap();
+        drop(hook);
+
+        let worker_routing = Arc::clone(&routing);
+        let (barrier_done, barrier_result) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            barrier_done.send(worker_routing.disable()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while routing.is_enabled() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!routing.is_enabled());
+        assert!(matches!(
+            barrier_result.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let (bridge, drained) = mpsc::sync_channel(1);
+        bridge.send("released").unwrap();
+        assert!(routing.complete_reliable_suppressions(1));
+        assert_eq!(
+            barrier_result.recv_timeout(Duration::from_secs(1)),
+            Ok(Ok(()))
+        );
+        assert_eq!(drained.recv().unwrap(), "released");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn missing_reliable_raw_input_times_out_and_blocks_reenable() {
+        let routing = RoutingAdmission::default();
+        routing.enable().unwrap();
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        drop(hook);
+
+        assert_eq!(
+            routing.disable(),
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        );
+        assert!(!routing.is_enabled());
+        assert_eq!(
+            routing.enable(),
+            Err(WindowsPlatformError::CaptureBarrierTimeout)
+        );
+
+        assert!(routing.complete_reliable_suppressions(1));
+        routing.enable().unwrap();
+        assert!(routing.is_enabled());
+    }
+
+    #[test]
+    fn routing_epochs_fence_both_enable_and_disable_boundaries() {
+        let routing = RoutingAdmission::default();
+        let disabled = routing.begin();
+        let disabled_epoch = disabled.epoch();
+        assert!(!disabled.enabled());
+        drop(disabled);
+
+        routing.enable().unwrap();
+        assert!(!routing.epoch_is_current(disabled_epoch));
+        let enabled = routing.begin();
+        let enabled_epoch = enabled.epoch();
+        assert!(enabled.enabled());
+        drop(enabled);
+
+        routing.disable().unwrap();
+        assert!(!routing.epoch_is_current(enabled_epoch));
     }
 
     #[test]

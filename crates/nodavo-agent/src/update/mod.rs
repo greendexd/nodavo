@@ -621,7 +621,7 @@ fn update_state_directory() -> Result<PathBuf, CoordinatorError> {
     #[cfg(target_os = "windows")]
     {
         let local = std::env::var_os("LOCALAPPDATA").ok_or(CoordinatorError::NotConfigured)?;
-        return Ok(PathBuf::from(local).join("Nodavo"));
+        Ok(PathBuf::from(local).join("Nodavo"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

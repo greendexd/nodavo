@@ -3,6 +3,7 @@
 #![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nodavo_input::{InputEvent, PointerDelta};
@@ -33,6 +34,7 @@ struct InputBuffer {
 pub(crate) struct NativeInputSender {
     buffer: Arc<Mutex<InputBuffer>>,
     revision: watch::Sender<u64>,
+    admission_paused: Arc<AtomicBool>,
 }
 
 pub(crate) struct NativeInputReceiver {
@@ -47,6 +49,7 @@ pub(crate) fn native_input_channel() -> (NativeInputSender, NativeInputReceiver)
         NativeInputSender {
             buffer: Arc::clone(&buffer),
             revision,
+            admission_paused: Arc::new(AtomicBool::new(false)),
         },
         NativeInputReceiver {
             buffer,
@@ -56,6 +59,23 @@ pub(crate) fn native_input_channel() -> (NativeInputSender, NativeInputReceiver)
 }
 
 impl NativeInputSender {
+    /// Stops future callback admission and waits for any sender already inside
+    /// the bounded queue critical section. The platform routing barrier must
+    /// complete before this method is called.
+    pub(crate) fn pause_admission(&self) -> Result<(), NativeInputBridgeError> {
+        self.admission_paused.store(true, Ordering::Release);
+        drop(
+            self.buffer
+                .lock()
+                .map_err(|_| NativeInputBridgeError::Poisoned)?,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn resume_admission(&self) {
+        self.admission_paused.store(false, Ordering::Release);
+    }
+
     /// Enqueues a physical event without ever evicting a key or button event.
     ///
     /// Absolute motion and scroll are replaceable. Relative motion coalesces by
@@ -65,10 +85,16 @@ impl NativeInputSender {
     /// events is an explicit failure so the adapter can restore local ownership
     /// instead of silently losing a release.
     pub(crate) fn send(&self, event: InputEvent) -> Result<(), NativeInputBridgeError> {
+        if self.admission_paused.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let mut buffer = self
             .buffer
             .lock()
             .map_err(|_| NativeInputBridgeError::Poisoned)?;
+        if self.admission_paused.load(Ordering::Acquire) {
+            return Ok(());
+        }
 
         if is_replaceable(event) {
             if let Some(index) = buffer
@@ -139,6 +165,17 @@ fn notify_revision(buffer: std::sync::MutexGuard<'_, InputBuffer>, revision: &wa
 }
 
 impl NativeInputReceiver {
+    /// Atomically removes every event admitted before the caller's platform
+    /// routing barrier completed. The bridge is hard-bounded, so this never
+    /// returns more than [`INPUT_CAPACITY`] events.
+    pub(crate) fn drain_pending(&mut self) -> Result<Vec<InputEvent>, NativeInputBridgeError> {
+        let mut buffer = self
+            .buffer
+            .lock()
+            .map_err(|_| NativeInputBridgeError::Poisoned)?;
+        Ok(buffer.events.drain(..).collect())
+    }
+
     pub(crate) async fn recv(&mut self) -> Result<InputEvent, NativeInputBridgeError> {
         loop {
             if let Some(event) = self
@@ -343,6 +380,25 @@ mod tests {
             sender.send(key(0x0100)),
             Err(NativeInputBridgeError::ReliableCapacityExhausted)
         );
+    }
+
+    #[test]
+    fn barrier_drain_preserves_order_and_empties_the_bounded_queue() {
+        let (sender, mut receiver) = native_input_channel();
+        let first = key(4);
+        let second = key(5);
+        sender.send(first).unwrap();
+        sender.send(second).unwrap();
+
+        assert_eq!(receiver.drain_pending().unwrap(), vec![first, second]);
+        assert!(receiver.drain_pending().unwrap().is_empty());
+
+        sender.pause_admission().unwrap();
+        sender.send(first).unwrap();
+        assert!(receiver.drain_pending().unwrap().is_empty());
+        sender.resume_admission();
+        sender.send(second).unwrap();
+        assert_eq!(receiver.drain_pending().unwrap(), vec![second]);
     }
 
     #[tokio::test]

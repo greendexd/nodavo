@@ -67,15 +67,13 @@ pub(super) async fn run_server() -> Result<(), String> {
             }
             connected = ipc_server.connect() => {
                 connected.map_err(|_| "local IPC accept failed".to_owned())?;
-                let authorization = match authorize_named_pipe_client(&ipc_server) {
-                    Ok(authorization) => WindowsUiFrameAuthorization(authorization),
-                    Err(_) => {
-                        warn!(code = "local_ipc_peer_rejected", "local IPC peer was rejected");
-                        ipc_server = create_private_named_pipe(&pipe_name, false)
-                            .map_err(|_| "failed to renew private local IPC".to_owned())?;
-                        continue;
-                    }
+                let Ok(authorization) = authorize_named_pipe_client(&ipc_server) else {
+                    warn!(code = "local_ipc_peer_rejected", "local IPC peer was rejected");
+                    ipc_server = create_private_named_pipe(&pipe_name, false)
+                        .map_err(|_| "failed to renew private local IPC".to_owned())?;
+                    continue;
                 };
+                let authorization = WindowsUiFrameAuthorization(authorization);
 
                 let stream = ipc_server;
                 ipc_server = create_private_named_pipe(&pipe_name, false)

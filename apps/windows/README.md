@@ -1,10 +1,12 @@
-<!-- doc-id: windows-app; lang: en; revision: 14 -->
+<!-- doc-id: windows-app; lang: en; revision: 15 -->
 
 # Nodavo for Windows
 
 [English](README.md) · [Русский](README.ru.md)
 
 This directory contains the first native WinUI 3 shell for Nodavo. It provides bilingual overview, devices, layout, transfers, and settings screens. The overview preserves connection phase, peer, and input owner while separately showing mutually authenticated agent reachability, local input readiness, local displays, and peer-topology synchronization. The Devices screen implements listening/manual pairing, code comparison and confirmation, a bounded trusted-device list, transactional changes for all four local grants, and confirmed destructive revocation. Transfers accepts only explicit Windows file/folder picker results, enforces the local 32-path/4-KiB-per-path bounds before IPC, and displays only redacted identifiers in a current/recent transfer feed with byte progress and agent-authorized cancellation. These are source and CI claims, not qualified Windows runtime claims.
+
+The Windows platform source now owns one process-wide per-monitor-v2 display service. A hidden broadcast-capable window shortens detection latency, while bounded full polling and two identical DisplayConfig-backed samples are authoritative. Capture and injection share the same snapshot and non-reused opaque identities; routing enable, suppressed reliable Raw Input delivery, absolute injection, stop/restart, and timed-detach poison are serialized against invalidation. The agent quiesces the old lease and requires the exact replacement-topology acknowledgement before focus resumes. Portable and Windows cross-target checks cover these contracts, but physical x64/ARM64 hot-plug, RDP, mixed-DPI, lock/UAC, and suspend/resume remain Windows runtime gates.
 
 ## Supported source targets
 

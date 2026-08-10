@@ -61,11 +61,26 @@ struct LocalDisplayMap {
     topology: Option<DisplayTopology>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LocalTopologyCandidate {
+    base_revision: u64,
+    mappings: Vec<DisplayMapping>,
+    next_session_id: u32,
+    topology: DisplayTopology,
+}
+
+impl LocalTopologyCandidate {
+    #[must_use]
+    pub(crate) const fn revision(&self) -> u64 {
+        self.topology.revision()
+    }
+}
+
 impl LocalDisplayMap {
-    fn reconcile(
-        &mut self,
+    fn prepare_reconcile(
+        &self,
         snapshots: &[NativeDisplaySnapshot],
-    ) -> Result<Option<DisplayTopology>, TopologyRuntimeError> {
+    ) -> Result<Option<LocalTopologyCandidate>, TopologyRuntimeError> {
         if snapshots.is_empty() || snapshots.len() > MAX_TOPOLOGY_DISPLAYS {
             return Err(TopologyRuntimeError::InvalidNativeSnapshot);
         }
@@ -78,6 +93,8 @@ impl LocalDisplayMap {
             }
         }
 
+        let mut next_session_id = self.next_session_id;
+        let mut candidate_mappings = Vec::with_capacity(snapshots.len());
         let mut descriptors = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
             let session = if let Some(mapping) = self
@@ -87,17 +104,15 @@ impl LocalDisplayMap {
             {
                 mapping.session
             } else {
-                self.next_session_id = self
-                    .next_session_id
+                next_session_id = next_session_id
                     .checked_add(1)
                     .ok_or(TopologyRuntimeError::InvalidNativeSnapshot)?;
-                let session = SessionDisplayId::new(self.next_session_id);
-                self.mappings.push(DisplayMapping {
-                    native: snapshot.native_id,
-                    session,
-                });
-                session
+                SessionDisplayId::new(next_session_id)
             };
+            candidate_mappings.push(DisplayMapping {
+                native: snapshot.native_id,
+                session,
+            });
             descriptors.push(
                 DisplayDescriptor::new(
                     session,
@@ -112,6 +127,12 @@ impl LocalDisplayMap {
                 .map_err(|_| TopologyRuntimeError::InvalidNativeSnapshot)?,
             );
         }
+        let mut ordered = candidate_mappings
+            .into_iter()
+            .zip(descriptors)
+            .collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|(mapping, _)| mapping.session.get());
+        let (candidate_mappings, descriptors): (Vec<_>, Vec<_>) = ordered.into_iter().unzip();
 
         if self
             .topology
@@ -120,14 +141,34 @@ impl LocalDisplayMap {
         {
             return Ok(None);
         }
-        self.revision = self
+        let revision = self
             .revision
             .checked_add(1)
             .ok_or(TopologyRuntimeError::InvalidNativeSnapshot)?;
-        let topology = DisplayTopology::new(self.revision, descriptors)
+        let topology = DisplayTopology::new(revision, descriptors)
             .map_err(|_| TopologyRuntimeError::InvalidNativeSnapshot)?;
-        self.topology = Some(topology.clone());
-        Ok(Some(topology))
+        Ok(Some(LocalTopologyCandidate {
+            base_revision: self.revision,
+            mappings: candidate_mappings,
+            next_session_id,
+            topology,
+        }))
+    }
+
+    fn commit(
+        &mut self,
+        candidate: LocalTopologyCandidate,
+    ) -> Result<DisplayTopology, TopologyRuntimeError> {
+        if self.revision != candidate.base_revision
+            || candidate.topology.revision() != candidate.base_revision.saturating_add(1)
+        {
+            return Err(TopologyRuntimeError::RevisionMismatch);
+        }
+        self.mappings = candidate.mappings;
+        self.next_session_id = candidate.next_session_id;
+        self.revision = candidate.topology.revision();
+        self.topology = Some(candidate.topology.clone());
+        Ok(candidate.topology)
     }
 
     fn topology(&self) -> Option<&DisplayTopology> {
@@ -246,11 +287,18 @@ impl PeerTopologyState {
         }
     }
 
-    pub(crate) fn reconcile_local(
-        &mut self,
+    pub(crate) fn prepare_local_candidate(
+        &self,
         snapshots: &[NativeDisplaySnapshot],
-    ) -> Result<Option<DisplayTopology>, TopologyRuntimeError> {
-        self.local.reconcile(snapshots)
+    ) -> Result<Option<LocalTopologyCandidate>, TopologyRuntimeError> {
+        self.local.prepare_reconcile(snapshots)
+    }
+
+    pub(crate) fn commit_local_candidate(
+        &mut self,
+        candidate: LocalTopologyCandidate,
+    ) -> Result<DisplayTopology, TopologyRuntimeError> {
+        self.local.commit(candidate)
     }
 
     pub(crate) fn invalidate_local_authorization(&mut self) {
@@ -295,6 +343,17 @@ impl PeerTopologyState {
     pub(crate) fn record_local_publish(&mut self, revision: u64) {
         self.published_local_revision = Some(revision);
         self.ready_local_revision = None;
+    }
+
+    #[must_use]
+    pub(crate) fn local_ack_pending(&self) -> bool {
+        self.published_local_revision != self.ready_local_revision
+    }
+
+    #[must_use]
+    pub(crate) fn local_is_ready(&self) -> bool {
+        self.published_local_revision.is_some()
+            && self.published_local_revision == self.ready_local_revision
     }
 
     pub(crate) fn mark_local_ready(&mut self, revision: u64) -> Result<(), TopologyRuntimeError> {
@@ -395,19 +454,6 @@ impl PeerTopologyState {
     #[must_use]
     pub(crate) const fn pointer_enter_required(&self) -> bool {
         self.pending_target.is_some()
-    }
-
-    pub(crate) fn resolve_incoming_position(
-        &self,
-        position: NormalizedPosition,
-    ) -> Result<NormalizedPosition, TopologyRuntimeError> {
-        let session_value = u32::try_from(position.display().get())
-            .map_err(|_| TopologyRuntimeError::DisplayMappingUnavailable)?;
-        let native = self
-            .local
-            .native_id(SessionDisplayId::new(session_value))
-            .ok_or(TopologyRuntimeError::DisplayMappingUnavailable)?;
-        Ok(NormalizedPosition::new(native, position.x(), position.y()))
     }
 
     pub(crate) fn clear_focus_route(&mut self) {
@@ -567,15 +613,87 @@ mod tests {
     #[test]
     fn native_ids_never_become_session_ids_and_remain_stable() {
         let mut map = LocalDisplayMap::default();
-        let first = map.reconcile(&[snapshot(0xDEAD_BEEF)]).unwrap().unwrap();
+        let first = map
+            .commit(
+                map.prepare_reconcile(&[snapshot(0xDEAD_BEEF)])
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
         assert_eq!(first.displays()[0].id(), SessionDisplayId::new(1));
-        assert_eq!(map.reconcile(&[snapshot(0xDEAD_BEEF)]).unwrap(), None);
-        let second = map
-            .reconcile(&[snapshot(0xDEAD_BEEF), snapshot(9)])
+        assert!(
+            map.prepare_reconcile(&[snapshot(0xDEAD_BEEF)])
+                .unwrap()
+                .is_none()
+        );
+        let candidate = map
+            .prepare_reconcile(&[snapshot(0xDEAD_BEEF), snapshot(9)])
             .unwrap()
             .unwrap();
+        let second = map.commit(candidate).unwrap();
         assert_eq!(second.displays()[0].id(), SessionDisplayId::new(1));
         assert_eq!(second.displays()[1].id(), SessionDisplayId::new(2));
+    }
+
+    #[test]
+    fn candidate_is_transactional_and_removed_ids_never_resolve() {
+        let mut map = LocalDisplayMap::default();
+        let initial = map
+            .prepare_reconcile(&[snapshot(100), snapshot(200)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(map.revision, 0, "prepare mutated the active revision");
+        assert!(map.session_id(DisplayId::new(100)).is_none());
+        map.commit(initial).unwrap();
+        let removed_session = map.session_id(DisplayId::new(100)).unwrap();
+        let retained_session = map.session_id(DisplayId::new(200)).unwrap();
+
+        let removal = map.prepare_reconcile(&[snapshot(200)]).unwrap().unwrap();
+        assert_eq!(map.native_id(removed_session), Some(DisplayId::new(100)));
+        map.commit(removal).unwrap();
+        assert_eq!(map.session_id(DisplayId::new(100)), None);
+        assert_eq!(map.native_id(removed_session), None);
+        assert_eq!(map.session_id(DisplayId::new(200)), Some(retained_session));
+
+        let readded = map
+            .prepare_reconcile(&[snapshot(100), snapshot(200)])
+            .unwrap()
+            .unwrap();
+        map.commit(readded).unwrap();
+        assert_ne!(map.session_id(DisplayId::new(100)), Some(removed_session));
+        assert_eq!(map.session_id(DisplayId::new(200)), Some(retained_session));
+    }
+
+    #[test]
+    fn invalid_or_stale_candidate_never_partially_mutates_active_map() {
+        let mut map = LocalDisplayMap::default();
+        let initial = map.prepare_reconcile(&[snapshot(1)]).unwrap().unwrap();
+        map.commit(initial).unwrap();
+        let before = map.clone();
+        let mut invalid = snapshot(2);
+        invalid.pixel_width = 0;
+        assert!(matches!(
+            map.prepare_reconcile(&[snapshot(1), invalid]),
+            Err(TopologyRuntimeError::InvalidNativeSnapshot)
+        ));
+        assert_eq!(map.mappings, before.mappings);
+        assert_eq!(map.next_session_id, before.next_session_id);
+        assert_eq!(map.revision, before.revision);
+        assert_eq!(map.topology, before.topology);
+
+        let stale = map
+            .prepare_reconcile(&[snapshot(1), snapshot(2)])
+            .unwrap()
+            .unwrap();
+        let newer = map
+            .prepare_reconcile(&[snapshot(1), snapshot(3)])
+            .unwrap()
+            .unwrap();
+        map.commit(newer).unwrap();
+        assert_eq!(
+            map.commit(stale),
+            Err(TopologyRuntimeError::RevisionMismatch)
+        );
     }
 
     #[test]
@@ -598,7 +716,11 @@ mod tests {
     #[test]
     fn incoming_session_token_resolves_only_through_local_map() {
         let mut state = PeerTopologyState::with_routes(vec![route()]);
-        let _ = state.reconcile_local(&[snapshot(777)]).unwrap();
+        let candidate = state
+            .prepare_local_candidate(&[snapshot(777)])
+            .unwrap()
+            .unwrap();
+        let _ = state.commit_local_candidate(candidate).unwrap();
         let incoming = InputEvent::PointerMotion {
             position: NormalizedPosition::new(
                 DisplayId::new(1),
@@ -641,7 +763,11 @@ mod tests {
     #[test]
     fn manual_focus_without_routes_preserves_remote_cursor() {
         let mut state = PeerTopologyState::with_routes(Vec::new());
-        let _ = state.reconcile_local(&[snapshot(777)]).unwrap();
+        let candidate = state
+            .prepare_local_candidate(&[snapshot(777)])
+            .unwrap()
+            .unwrap();
+        let _ = state.commit_local_candidate(candidate).unwrap();
         state.remote = Some(topology(1).unwrap());
         assert_eq!(state.prepare_manual_focus(), Ok(()));
         assert_eq!(state.take_pending_target(), None);

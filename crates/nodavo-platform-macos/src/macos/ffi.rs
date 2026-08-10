@@ -4,6 +4,9 @@ use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Mutex, OnceLock};
 
 use core_foundation::base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType, ToVoid};
 use core_foundation::boolean::CFBoolean;
@@ -20,6 +23,11 @@ use security_framework_sys::item::{
 };
 use security_framework_sys::keychain_item::{
     SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
+};
+
+use core_graphics::display::{
+    CGDirectDisplayID, CGDisplayRegisterReconfigurationCallback,
+    CGDisplayRemoveReconfigurationCallback, CGGetActiveDisplayList,
 };
 
 use crate::clipboard::{
@@ -832,6 +840,309 @@ fn map_status(status: i32) -> KeychainError {
     }
 }
 
+pub(crate) const DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
+pub(crate) const DISPLAY_IDENTITY_CHANGE_FLAGS: u32 =
+    (1 << 4) | (1 << 5) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeDisplayListError {
+    CoreGraphics,
+    TooMany,
+}
+
+#[derive(Default)]
+struct DisplayRegistration {
+    handles: usize,
+    registered: bool,
+    poisoned: bool,
+}
+
+impl DisplayRegistration {
+    fn reserve(&mut self) -> Result<bool, ()> {
+        if self.poisoned || (self.handles != 0 && !self.registered) {
+            return Err(());
+        }
+        let register = self.handles == 0;
+        self.handles = self.handles.checked_add(1).ok_or(())?;
+        Ok(register)
+    }
+
+    fn rollback_reservation(&mut self) {
+        self.handles = self.handles.saturating_sub(1);
+    }
+
+    fn release(&mut self) -> Result<bool, ()> {
+        if self.handles == 0 || !self.registered {
+            self.poisoned = true;
+            return Err(());
+        }
+        self.handles -= 1;
+        Ok(self.handles == 0)
+    }
+}
+
+struct DisplayCallbackState {
+    accepting: AtomicBool,
+    configuring: AtomicBool,
+    dirty: AtomicBool,
+    generation_exhausted: AtomicBool,
+    generation: AtomicU64,
+    summary_flags: AtomicU32,
+    notification: SyncSender<()>,
+    notification_receiver: Mutex<Receiver<()>>,
+    registration: Mutex<DisplayRegistration>,
+}
+
+impl DisplayCallbackState {
+    fn new() -> Self {
+        let (notification, notification_receiver) = sync_channel(1);
+        Self {
+            accepting: AtomicBool::new(false),
+            configuring: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
+            generation_exhausted: AtomicBool::new(false),
+            generation: AtomicU64::new(1),
+            summary_flags: AtomicU32::new(0),
+            notification,
+            notification_receiver: Mutex::new(notification_receiver),
+            registration: Mutex::new(DisplayRegistration::default()),
+        }
+    }
+
+    fn mark_changed(&self, flags: u32) {
+        if !self.accepting.load(Ordering::Acquire) {
+            return;
+        }
+        if flags & DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
+            self.configuring.store(true, Ordering::Release);
+        } else {
+            self.configuring.store(false, Ordering::Release);
+        }
+        self.summary_flags.fetch_or(flags, Ordering::AcqRel);
+        if self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            self.generation_exhausted.store(true, Ordering::Release);
+        }
+        self.dirty.store(true, Ordering::Release);
+        match self.notification.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(()) | TrySendError::Disconnected(())) => {}
+        }
+    }
+
+    fn force_dirty(&self, flags: u32) {
+        self.summary_flags.fetch_or(flags, Ordering::AcqRel);
+        if self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .is_err()
+        {
+            self.generation_exhausted.store(true, Ordering::Release);
+        }
+        self.dirty.store(true, Ordering::Release);
+        match self.notification.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(()) | TrySendError::Disconnected(())) => {}
+        }
+    }
+
+    fn drain_notification(&self) {
+        let Ok(receiver) = self.notification_receiver.lock() else {
+            self.dirty.store(true, Ordering::Release);
+            return;
+        };
+        loop {
+            match receiver.try_recv() {
+                Ok(()) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+}
+
+fn display_callback_state() -> &'static DisplayCallbackState {
+    static STATE: OnceLock<DisplayCallbackState> = OnceLock::new();
+    STATE.get_or_init(DisplayCallbackState::new)
+}
+
+unsafe extern "C" fn display_reconfiguration_callback(
+    _display: CGDirectDisplayID,
+    flags: u32,
+    _user_info: *const c_void,
+) {
+    // The callback context is process-lifetime static state. CoreGraphics may
+    // invoke this function on its event thread or synchronously inside a
+    // reconfiguration call, so this path performs atomics plus one nonblocking
+    // capacity-one notification only. It never enumerates, locks, allocates,
+    // invokes caller code, or attempts to reconfigure a display.
+    display_callback_state().mark_changed(flags);
+}
+
+pub(crate) struct NativeDisplayMonitor {
+    active: bool,
+}
+
+impl NativeDisplayMonitor {
+    pub(crate) fn start() -> Result<Self, ()> {
+        let state = display_callback_state();
+        let mut registration = state.registration.lock().map_err(|_| ())?;
+        let should_register = registration.reserve()?;
+        if should_register {
+            state.accepting.store(true, Ordering::Release);
+            // SAFETY: The callback and its null user-info value are stable for
+            // the process lifetime. The trampoline touches only process-static
+            // atomics and a nonblocking bounded sender.
+            let status = unsafe {
+                CGDisplayRegisterReconfigurationCallback(
+                    display_reconfiguration_callback,
+                    ptr::null(),
+                )
+            };
+            if status != 0 {
+                state.accepting.store(false, Ordering::Release);
+                registration.rollback_reservation();
+                return Err(());
+            }
+            registration.registered = true;
+        }
+        Ok(Self { active: true })
+    }
+
+    pub(crate) fn stop(&mut self) -> Result<(), ()> {
+        if !self.active {
+            return Ok(());
+        }
+        let state = display_callback_state();
+        let mut registration = state.registration.lock().map_err(|_| ())?;
+        self.active = false;
+        let should_remove = registration.release()?;
+        if !should_remove {
+            return Ok(());
+        }
+
+        // Stop accepting first. The callback context remains process-lifetime,
+        // so even a callback already in flight during removal cannot observe
+        // freed Rust memory or reenter user teardown.
+        state.accepting.store(false, Ordering::Release);
+        // SAFETY: This exactly matches the callback and null user-info used by
+        // registration. Process-static callback state outlives this call and
+        // any callback that was already in flight.
+        let status = unsafe {
+            CGDisplayRemoveReconfigurationCallback(display_reconfiguration_callback, ptr::null())
+        };
+        registration.registered = false;
+        state.configuring.store(false, Ordering::Release);
+        state.force_dirty(DISPLAY_IDENTITY_CHANGE_FLAGS);
+        if status != 0 {
+            registration.poisoned = true;
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for NativeDisplayMonitor {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+pub(crate) fn display_change_pending() -> bool {
+    let state = display_callback_state();
+    state.generation_exhausted.load(Ordering::Acquire)
+        || state.configuring.load(Ordering::Acquire)
+        || state.dirty.load(Ordering::Acquire)
+}
+
+pub(crate) fn display_monitor_active() -> bool {
+    display_callback_state()
+        .registration
+        .lock()
+        .is_ok_and(|registration| registration.handles != 0 && !registration.poisoned)
+}
+
+pub(crate) fn display_configuration_in_progress() -> bool {
+    let state = display_callback_state();
+    state.generation_exhausted.load(Ordering::Acquire) || state.configuring.load(Ordering::Acquire)
+}
+
+pub(crate) fn display_change_generation() -> u64 {
+    display_callback_state().generation.load(Ordering::Acquire)
+}
+
+pub(crate) fn take_display_change_flags(generation: u64) -> Option<u32> {
+    let state = display_callback_state();
+    if state.generation_exhausted.load(Ordering::Acquire)
+        || state.configuring.load(Ordering::Acquire)
+        || state.generation.load(Ordering::Acquire) != generation
+    {
+        return None;
+    }
+    let flags = state.summary_flags.swap(0, Ordering::AcqRel);
+    if state.generation_exhausted.load(Ordering::Acquire)
+        || state.configuring.load(Ordering::Acquire)
+        || state.generation.load(Ordering::Acquire) != generation
+    {
+        state.summary_flags.fetch_or(flags, Ordering::AcqRel);
+        None
+    } else {
+        Some(flags)
+    }
+}
+
+pub(crate) fn mark_display_change_clean(generation: u64) -> bool {
+    let state = display_callback_state();
+    if state.generation_exhausted.load(Ordering::Acquire)
+        || state.configuring.load(Ordering::Acquire)
+        || state.generation.load(Ordering::Acquire) != generation
+    {
+        return false;
+    }
+    state.dirty.store(false, Ordering::Release);
+    if state.generation_exhausted.load(Ordering::Acquire)
+        || state.configuring.load(Ordering::Acquire)
+        || state.generation.load(Ordering::Acquire) != generation
+    {
+        state.dirty.store(true, Ordering::Release);
+        return false;
+    }
+    state.drain_notification();
+    true
+}
+
+pub(crate) fn force_display_change(flags: u32) {
+    display_callback_state().force_dirty(flags);
+}
+
+pub(crate) fn active_display_ids_bounded(
+    maximum_displays: usize,
+) -> Result<Vec<CGDirectDisplayID>, NativeDisplayListError> {
+    let capacity = maximum_displays
+        .checked_add(1)
+        .and_then(|capacity| u32::try_from(capacity).ok())
+        .ok_or(NativeDisplayListError::TooMany)?;
+    let mut identifiers = vec![0; capacity as usize];
+    let mut count = 0_u32;
+    // SAFETY: `identifiers` is initialized for exactly `capacity` values and
+    // remains exclusively borrowed. CoreGraphics writes no more than capacity
+    // IDs and one scalar count.
+    let status =
+        unsafe { CGGetActiveDisplayList(capacity, identifiers.as_mut_ptr(), &raw mut count) };
+    if status != 0 {
+        return Err(NativeDisplayListError::CoreGraphics);
+    }
+    if count as usize > maximum_displays {
+        return Err(NativeDisplayListError::TooMany);
+    }
+    identifiers.truncate(count as usize);
+    Ok(identifiers)
+}
+
 const INPUT_KEYBOARD: u32 = 1;
 const INPUT_CONSUMER: u32 = 2;
 const INPUT_POINTER_MOTION: u32 = 3;
@@ -1105,6 +1416,76 @@ fn decode_pressed(value: i64) -> Option<bool> {
         0 => Some(false),
         1 => Some(true),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn callback_signal_is_atomic_coalesced_and_never_runs_registration_work() {
+        let state = DisplayCallbackState::new();
+        let initial = state.generation.load(Ordering::Acquire);
+        state.accepting.store(true, Ordering::Release);
+
+        state.mark_changed(DISPLAY_BEGIN_CONFIGURATION_FLAG);
+        state.mark_changed(DISPLAY_BEGIN_CONFIGURATION_FLAG);
+        assert!(state.configuring.load(Ordering::Acquire));
+        assert!(state.dirty.load(Ordering::Acquire));
+        assert_eq!(state.generation.load(Ordering::Acquire), initial + 2);
+
+        let receiver = state.notification_receiver.lock().unwrap();
+        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        drop(receiver);
+
+        state.mark_changed(1 << 4);
+        assert!(!state.configuring.load(Ordering::Acquire));
+        assert_eq!(
+            state.summary_flags.load(Ordering::Acquire) & DISPLAY_BEGIN_CONFIGURATION_FLAG,
+            DISPLAY_BEGIN_CONFIGURATION_FLAG
+        );
+        assert_eq!(
+            state.summary_flags.load(Ordering::Acquire) & (1 << 4),
+            1 << 4
+        );
+    }
+
+    #[test]
+    fn stopped_callback_state_ignores_late_native_delivery() {
+        let state = DisplayCallbackState::new();
+        let initial = state.generation.load(Ordering::Acquire);
+        state.mark_changed(DISPLAY_BEGIN_CONFIGURATION_FLAG);
+        assert_eq!(state.generation.load(Ordering::Acquire), initial);
+        assert!(!state.dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn exhausted_callback_generation_stays_fail_closed() {
+        let state = DisplayCallbackState::new();
+        state.accepting.store(true, Ordering::Release);
+        state.generation.store(u64::MAX, Ordering::Release);
+        state.mark_changed(1 << 1);
+        assert!(state.generation_exhausted.load(Ordering::Acquire));
+        assert!(state.dirty.load(Ordering::Acquire));
+        assert_eq!(state.generation.load(Ordering::Acquire), u64::MAX);
+    }
+
+    #[test]
+    fn registration_reducer_is_restartable_and_rejects_unbalanced_teardown() {
+        let mut registration = DisplayRegistration::default();
+        assert_eq!(registration.reserve(), Ok(true));
+        registration.registered = true;
+        assert_eq!(registration.reserve(), Ok(false));
+        assert_eq!(registration.release(), Ok(false));
+        assert_eq!(registration.release(), Ok(true));
+        registration.registered = false;
+        assert_eq!(registration.reserve(), Ok(true));
+        registration.rollback_reservation();
+        assert_eq!(registration.handles, 0);
+        assert_eq!(registration.release(), Err(()));
+        assert!(registration.poisoned);
     }
 }
 

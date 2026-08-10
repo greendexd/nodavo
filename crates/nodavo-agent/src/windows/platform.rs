@@ -1,26 +1,33 @@
 //! Windows native input adapter owned by one authenticated peer session.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nodavo_input::InputEvent;
 use nodavo_platform_windows::{
-    WindowsInputCapture, WindowsInputCaptureEvent, WindowsInputInjector,
+    WindowsDisplayMonitor, WindowsInputCapture, WindowsInputCaptureEvent, WindowsInputInjector,
     WindowsInputLifecycleEvent, WindowsPlatformError, probe_environment,
 };
-use nodavo_protocol::DisplayRotation;
 
 use crate::native_bridge::{NativeInputSender, PlatformSafetyEvent, PlatformSafetySender};
-use crate::platform_port::{PlatformPort, PlatformPortError};
+use crate::platform_port::{
+    PlatformPort, PlatformPortError, absolute_pointer_transition_is_retryable,
+    acknowledge_inject_result, finish_worker_before_deadline, injector_worker_start_allowed,
+    receive_worker_stop_before_deadline, submit_worker_command_before_deadline,
+};
 use crate::topology_runtime::NativeDisplaySnapshot;
 
 const NATIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+static WINDOWS_INJECTOR_POISONED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) struct WindowsPlatformPort {
     // Capture drops first, so suppression is cleared before injector teardown.
     capture: WindowsInputCapture,
+    display_monitor: Option<WindowsDisplayMonitor>,
     injector: Option<WindowsInjectorWorker>,
+    input_admission: NativeInputSender,
 }
 
 enum WindowsInjectorCommand {
@@ -39,6 +46,9 @@ struct WindowsInjectorWorker {
 
 impl WindowsInjectorWorker {
     fn start() -> Result<Self, PlatformPortError> {
+        if !injector_worker_start_allowed(&WINDOWS_INJECTOR_POISONED) {
+            return Err(PlatformPortError::Native);
+        }
         let (commands, receiver) = std_mpsc::sync_channel(1);
         let (ready, started) = std_mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -54,54 +64,93 @@ impl WindowsInjectorWorker {
                 while let Ok(command) = receiver.recv() {
                     match command {
                         WindowsInjectorCommand::Inject(event, acknowledgement) => {
-                            let _ = acknowledgement.send(injector.inject(event));
+                            let result = injector.inject(event);
+                            let retryable_transition = absolute_pointer_transition_is_retryable(
+                                event,
+                                matches!(&result, Err(WindowsPlatformError::DisplayUnavailable)),
+                            );
+                            acknowledge_inject_result(
+                                result,
+                                &acknowledgement,
+                                &WINDOWS_INJECTOR_POISONED,
+                                retryable_transition,
+                            );
                         }
                         WindowsInjectorCommand::Release(acknowledgement) => {
                             let result = injector.force_release_all().map(|_| ());
-                            let _ = acknowledgement.send(result);
+                            if result.is_err() {
+                                WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                            }
+                            if acknowledgement.send(result).is_err() {
+                                WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                            }
                         }
                         WindowsInjectorCommand::Stop(acknowledgement) => {
                             let result = injector.force_release_all().map(|_| ());
-                            let _ = acknowledgement.send(result);
-                            break;
+                            let release_failed = result.is_err();
+                            let acknowledgement_failed = acknowledgement.send(result).is_err();
+                            if release_failed || acknowledgement_failed {
+                                WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                            }
+                            return;
                         }
                     }
                 }
                 // A disconnected command owner still gets a best-effort release.
-                let _ = injector.force_release_all();
+                if injector.force_release_all().is_err() {
+                    WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                }
             })
             .map_err(|_| PlatformPortError::Native)?;
-        if let Ok(true) = started.recv_timeout(NATIVE_ACK_TIMEOUT) {
-            Ok(Self {
+        match started.recv_timeout(NATIVE_ACK_TIMEOUT) {
+            Ok(true) => Ok(Self {
                 commands,
                 worker: Some(worker),
-            })
-        } else {
-            let _ = worker.join();
-            Err(PlatformPortError::Native)
+            }),
+            outcome => {
+                let mut worker = Some(worker);
+                if matches!(outcome, Err(std_mpsc::RecvTimeoutError::Timeout)) {
+                    WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                    drop(worker.take());
+                } else {
+                    let _ = finish_worker_before_deadline(
+                        &mut worker,
+                        &WINDOWS_INJECTOR_POISONED,
+                        Instant::now() + NATIVE_ACK_TIMEOUT,
+                    );
+                }
+                Err(PlatformPortError::Native)
+            }
         }
     }
 
     fn inject(&self, event: InputEvent) -> Result<(), PlatformPortError> {
         let (acknowledgement, received) = std_mpsc::sync_channel(1);
-        self.commands
-            .send(WindowsInjectorCommand::Inject(event, acknowledgement))
-            .map_err(|_| PlatformPortError::Native)?;
-        received
-            .recv_timeout(NATIVE_ACK_TIMEOUT)
-            .map_err(|_| PlatformPortError::Native)?
-            .map_err(|_| PlatformPortError::Native)
+        submit_worker_command_before_deadline(
+            &self.commands,
+            WindowsInjectorCommand::Inject(event, acknowledgement),
+            &received,
+            &WINDOWS_INJECTOR_POISONED,
+            Instant::now() + NATIVE_ACK_TIMEOUT,
+        )
+        .map_err(|()| PlatformPortError::Native)?
+        .map_err(|error| match error {
+            WindowsPlatformError::DisplayUnavailable => PlatformPortError::DisplaySnapshotPending,
+            _ => PlatformPortError::Native,
+        })
     }
 
     fn force_release_all(&self) -> Result<(), PlatformPortError> {
         let (acknowledgement, received) = std_mpsc::sync_channel(1);
-        self.commands
-            .send(WindowsInjectorCommand::Release(acknowledgement))
-            .map_err(|_| PlatformPortError::Native)?;
-        received
-            .recv_timeout(NATIVE_ACK_TIMEOUT)
-            .map_err(|_| PlatformPortError::Native)?
-            .map_err(|_| PlatformPortError::Native)
+        submit_worker_command_before_deadline(
+            &self.commands,
+            WindowsInjectorCommand::Release(acknowledgement),
+            &received,
+            &WINDOWS_INJECTOR_POISONED,
+            Instant::now() + NATIVE_ACK_TIMEOUT,
+        )
+        .map_err(|()| PlatformPortError::Native)?
+        .map_err(|_| PlatformPortError::Native)
     }
 
     fn is_running(&self) -> bool {
@@ -112,18 +161,39 @@ impl WindowsInjectorWorker {
 
     fn stop(&mut self) {
         let (acknowledgement, received) = std_mpsc::sync_channel(1);
-        if self
-            .commands
-            .send(WindowsInjectorCommand::Stop(acknowledgement))
-            .is_ok()
-        {
-            let _ = received.recv_timeout(NATIVE_ACK_TIMEOUT);
-        }
-        if let Some(worker) = self.worker.take() {
-            if worker.is_finished() {
-                let _ = worker.join();
+        let deadline = Instant::now() + NATIVE_ACK_TIMEOUT;
+        let mut command = WindowsInjectorCommand::Stop(acknowledgement);
+        let mut submitted = false;
+        loop {
+            match self.commands.try_send(command) {
+                Ok(()) => {
+                    submitted = true;
+                    break;
+                }
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                    break;
+                }
+                Err(std_mpsc::TrySendError::Full(returned)) => {
+                    command = returned;
+                    if Instant::now() >= deadline {
+                        WINDOWS_INJECTOR_POISONED.store(true, Ordering::Release);
+                        drop(self.worker.take());
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
+        if submitted {
+            let _ = receive_worker_stop_before_deadline(
+                &received,
+                &WINDOWS_INJECTOR_POISONED,
+                deadline,
+            );
+        }
+        let _ =
+            finish_worker_before_deadline(&mut self.worker, &WINDOWS_INJECTOR_POISONED, deadline);
     }
 }
 
@@ -135,6 +205,7 @@ impl Drop for WindowsInjectorWorker {
 
 impl WindowsPlatformPort {
     pub(crate) fn new(input: NativeInputSender, safety: &PlatformSafetySender) -> Self {
+        let input_admission = input.clone();
         let callback_safety = safety.clone();
         let capture = WindowsInputCapture::new_routed_fallible(move |event| match event {
             WindowsInputCaptureEvent::Input(event) => input.send(event).map_err(|_| {
@@ -150,7 +221,9 @@ impl WindowsPlatformPort {
         });
         Self {
             capture,
+            display_monitor: None,
             injector: None,
+            input_admission,
         }
     }
 
@@ -181,36 +254,61 @@ const fn safety_event_for_lifecycle(
 
 impl PlatformPort for WindowsPlatformPort {
     fn display_snapshot(&self) -> Result<Vec<NativeDisplaySnapshot>, PlatformPortError> {
-        nodavo_platform_windows::active_displays()
-            .map_err(|_| PlatformPortError::Native)?
-            .into_iter()
+        self.display_monitor
+            .as_ref()
+            .ok_or(PlatformPortError::Native)?
+            .snapshot()
+            .map_err(|error| match error {
+                WindowsPlatformError::DisplayUnavailable => {
+                    PlatformPortError::DisplaySnapshotPending
+                }
+                _ => PlatformPortError::Native,
+            })?
+            .displays()
+            .iter()
             .map(|display| {
-                let origin_x_milli = logical_origin_milli(display.left, display.dpi_x)?;
-                let origin_y_milli = logical_origin_milli(display.top, display.dpi_y)?;
-                let scale_x_milli = scale_milli(display.dpi_x)?;
-                let scale_y_milli = scale_milli(display.dpi_y)?;
                 Ok(NativeDisplaySnapshot {
                     native_id: display.id,
-                    origin_x_milli,
-                    origin_y_milli,
+                    origin_x_milli: logical_origin_milli(display.left, display.dpi_x)?,
+                    origin_y_milli: logical_origin_milli(display.top, display.dpi_y)?,
                     pixel_width: display.width_pixels,
                     pixel_height: display.height_pixels,
-                    scale_x_milli,
-                    scale_y_milli,
-                    rotation: DisplayRotation::Degrees0,
+                    scale_x_milli: scale_milli(display.dpi_x)?,
+                    scale_y_milli: scale_milli(display.dpi_y)?,
+                    rotation: display.rotation,
                 })
             })
             .collect()
     }
 
+    fn display_change_pending(&mut self) -> Result<bool, PlatformPortError> {
+        self.display_monitor
+            .as_ref()
+            .map(WindowsDisplayMonitor::display_change_pending)
+            .ok_or(PlatformPortError::Native)
+    }
+
+    fn pause_input_admission(&mut self) -> Result<(), PlatformPortError> {
+        self.input_admission
+            .pause_admission()
+            .map_err(|_| PlatformPortError::Native)
+    }
+
+    fn resume_input_admission(&mut self) {
+        self.input_admission.resume_admission();
+    }
+
     fn start_capture(&mut self) -> Result<(), PlatformPortError> {
-        if self.injector.is_some() {
+        if self.injector.is_some() || self.display_monitor.is_some() {
             return Err(PlatformPortError::Native);
         }
+        let display_monitor =
+            WindowsDisplayMonitor::start().map_err(|_| PlatformPortError::Native)?;
         let injector = WindowsInjectorWorker::start()?;
         self.capture
             .start()
             .map_err(|_| PlatformPortError::Native)?;
+        self.display_monitor = Some(display_monitor);
         self.injector = Some(injector);
         Ok(())
     }
@@ -253,6 +351,10 @@ impl PlatformPort for WindowsPlatformPort {
                 .injector
                 .as_ref()
                 .is_some_and(WindowsInjectorWorker::is_running)
+            && self
+                .display_monitor
+                .as_ref()
+                .is_some_and(WindowsDisplayMonitor::is_running)
             && probe_environment().is_ok()
         {
             Ok(())

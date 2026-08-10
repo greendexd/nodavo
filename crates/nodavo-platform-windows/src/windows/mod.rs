@@ -4,35 +4,46 @@ mod ffi;
 
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use nodavo_input::{
     ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, PointerDelta,
     PressedState, ScrollUnit,
 };
 
+use crate::display_runtime::{DisplayTracker, DisplayTrackerUpdate, DisplayWorkerLifecycle};
 use crate::input_runtime::{
-    CaptureTranslator, ForceReleaseAcknowledgement, NativeInputEvent,
-    lifecycle_requires_local_recovery,
+    CaptureTranslator, ForceReleaseAcknowledgement, NativeInputEvent, NativeRoutingObservation,
+    RoutingAdmission, lifecycle_requires_local_recovery,
 };
 use crate::windows_ipc_policy::{
     ObservedWindowsUi, WindowsUiPolicy, authorizes_windows_ui, compiled_windows_ui_identity,
     compiled_windows_ui_policy,
 };
 use crate::{
-    ClipboardFormat, ClipboardMetadata, DisplayGeometry, EnvironmentCapabilities, MAX_DISPLAYS,
-    MAX_PROTECTED_SECRET_BLOB_BYTES, MAX_PROTECTED_SECRET_BYTES, ProtectedSecretBlob,
-    WindowsInputCaptureEvent, WindowsInputLifecycleEvent, WindowsInputReadiness,
-    WindowsPlatformError, WindowsReadinessProbe,
+    ClipboardFormat, ClipboardMetadata, DisplayGeometry, DisplaySnapshot, DisplaySnapshotState,
+    EnvironmentCapabilities, MAX_PROTECTED_SECRET_BLOB_BYTES, MAX_PROTECTED_SECRET_BYTES,
+    ProtectedSecretBlob, WindowsInputCaptureEvent, WindowsInputLifecycleEvent,
+    WindowsInputReadiness, WindowsPlatformError, WindowsReadinessProbe,
 };
 
 pub use crate::windows_ipc_policy::compiled_windows_ui_auth_mode;
 
 const MAX_PIPE_NAME_UNITS: usize = 240;
 const REQUIRED_PIPE_PREFIX: &str = r"\\.\pipe\nodavo-";
+const INITIAL_DISPLAY_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(not(test))]
+const DISPLAY_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const DISPLAY_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Returns the private agent pipe name expected by the Windows shell.
 ///
@@ -240,7 +251,664 @@ const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 ///
 /// Fails closed when the process session or default input desktop is unavailable.
 pub fn probe_environment() -> Result<EnvironmentCapabilities, WindowsPlatformError> {
+    ffi::ensure_process_dpi_awareness()?;
     ffi::probe_environment()
+}
+
+struct SharedDisplayState {
+    snapshot: RwLock<DisplaySnapshotState>,
+    routing_flags: Mutex<Vec<Weak<RoutingAdmission>>>,
+    active_generation: AtomicU64,
+    worker_running: AtomicBool,
+    changed: Condvar,
+    wait_state: Mutex<bool>,
+}
+
+impl Default for SharedDisplayState {
+    fn default() -> Self {
+        Self {
+            snapshot: RwLock::new(DisplaySnapshotState::Pending),
+            routing_flags: Mutex::new(Vec::new()),
+            active_generation: AtomicU64::new(0),
+            worker_running: AtomicBool::new(false),
+            changed: Condvar::new(),
+            wait_state: Mutex::new(false),
+        }
+    }
+}
+
+impl SharedDisplayState {
+    fn snapshot_state(&self) -> DisplaySnapshotState {
+        self.snapshot
+            .read()
+            .map_or(DisplaySnapshotState::Unavailable, |state| state.clone())
+    }
+
+    fn snapshot(&self) -> Result<DisplaySnapshot, WindowsPlatformError> {
+        match self.snapshot_state() {
+            DisplaySnapshotState::Available(snapshot) => Ok(snapshot),
+            DisplaySnapshotState::Pending | DisplaySnapshotState::Unavailable => {
+                Err(WindowsPlatformError::DisplayUnavailable)
+            }
+        }
+    }
+
+    fn consume_snapshot(
+        &self,
+        observed_revision: &AtomicU64,
+    ) -> Result<DisplaySnapshot, WindowsPlatformError> {
+        let state = self
+            .snapshot
+            .read()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        let DisplaySnapshotState::Available(snapshot) = &*state else {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        };
+        observed_revision.store(snapshot.revision(), Ordering::Release);
+        Ok(snapshot.clone())
+    }
+
+    fn pending_for(&self, observed_revision: &AtomicU64) -> bool {
+        let Ok(state) = self.snapshot.read() else {
+            return true;
+        };
+        match &*state {
+            DisplaySnapshotState::Available(snapshot) => {
+                snapshot.revision() != observed_revision.load(Ordering::Acquire)
+            }
+            DisplaySnapshotState::Pending | DisplaySnapshotState::Unavailable => true,
+        }
+    }
+
+    fn revision_is_current(&self, revision: u64) -> bool {
+        matches!(
+            self.snapshot_state(),
+            DisplaySnapshotState::Available(snapshot) if snapshot.revision() == revision
+        )
+    }
+
+    fn with_available_snapshot<T>(
+        &self,
+        operation: impl FnOnce(&DisplaySnapshot) -> Result<T, WindowsPlatformError>,
+    ) -> Result<T, WindowsPlatformError> {
+        let state = self
+            .snapshot
+            .read()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        let DisplaySnapshotState::Available(snapshot) = &*state else {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        };
+        if !self.worker_running.load(Ordering::Acquire) {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        operation(snapshot)
+    }
+
+    fn enable_routing(&self, routing: &RoutingAdmission) -> Result<(), WindowsPlatformError> {
+        self.enable_routing_after(routing, || {})
+    }
+
+    fn enable_routing_after(
+        &self,
+        routing: &RoutingAdmission,
+        before_enable: impl FnOnce(),
+    ) -> Result<(), WindowsPlatformError> {
+        let result = self.with_available_snapshot(|_| {
+            // The display worker must acquire the snapshot write lock before it
+            // can publish Pending/Unavailable and clear routing. Keeping the
+            // read lock through enable makes those operations one ordered
+            // authority transition instead of a check-then-enable race.
+            before_enable();
+            routing.enable()
+        });
+        if matches!(result, Err(WindowsPlatformError::DisplayUnavailable)) {
+            routing.disable_fail_closed();
+        }
+        result
+    }
+
+    fn register_routing_flag(
+        &self,
+        routing: &Arc<RoutingAdmission>,
+    ) -> Result<(), WindowsPlatformError> {
+        let Ok(mut flags) = self.routing_flags.lock() else {
+            routing.disable_fail_closed();
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        };
+        flags.retain(|flag| flag.strong_count() > 0);
+        let routing = Arc::downgrade(routing);
+        if !flags.iter().any(|registered| registered.ptr_eq(&routing)) {
+            flags.push(routing);
+        }
+        Ok(())
+    }
+
+    fn clear_routing(&self) {
+        if let Ok(mut flags) = self.routing_flags.lock() {
+            flags.retain(|flag| {
+                let Some(flag) = flag.upgrade() else {
+                    return false;
+                };
+                flag.disable_fail_closed();
+                true
+            });
+        }
+    }
+
+    #[cfg(test)]
+    fn apply(&self, update: DisplayTrackerUpdate) {
+        let next = match update {
+            DisplayTrackerUpdate::Unchanged => return,
+            DisplayTrackerUpdate::Pending => DisplaySnapshotState::Pending,
+            DisplayTrackerUpdate::Available(snapshot) => DisplaySnapshotState::Available(snapshot),
+            DisplayTrackerUpdate::Unavailable => DisplaySnapshotState::Unavailable,
+        };
+        if !matches!(next, DisplaySnapshotState::Available(_)) {
+            self.clear_routing();
+        }
+        if let Ok(mut snapshot) = self.snapshot.write() {
+            *snapshot = next;
+        } else {
+            self.clear_routing();
+        }
+        self.notify_waiters();
+    }
+
+    fn begin_worker(&self, generation: u64) -> Result<(), WindowsPlatformError> {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        self.active_generation.store(generation, Ordering::Release);
+        self.worker_running.store(false, Ordering::Release);
+        *snapshot = DisplaySnapshotState::Pending;
+        drop(snapshot);
+        self.clear_routing();
+        self.notify_waiters();
+        Ok(())
+    }
+
+    fn apply_worker(&self, generation: u64, update: DisplayTrackerUpdate) {
+        if matches!(update, DisplayTrackerUpdate::Unchanged) {
+            return;
+        }
+        let Ok(mut snapshot) = self.snapshot.write() else {
+            self.clear_routing();
+            return;
+        };
+        if self.active_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let next = match update {
+            DisplayTrackerUpdate::Unchanged => return,
+            DisplayTrackerUpdate::Pending => DisplaySnapshotState::Pending,
+            DisplayTrackerUpdate::Available(snapshot) => DisplaySnapshotState::Available(snapshot),
+            DisplayTrackerUpdate::Unavailable => DisplaySnapshotState::Unavailable,
+        };
+        if !matches!(next, DisplaySnapshotState::Available(_)) {
+            self.clear_routing();
+        }
+        *snapshot = next;
+        drop(snapshot);
+        self.notify_waiters();
+    }
+
+    fn set_worker_running(&self, generation: u64, running: bool) {
+        let Ok(snapshot) = self.snapshot.write() else {
+            self.clear_routing();
+            return;
+        };
+        if self.active_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.worker_running.store(running, Ordering::Release);
+        drop(snapshot);
+        self.notify_waiters();
+    }
+
+    fn finish_worker(&self, generation: u64) {
+        let Ok(mut snapshot) = self.snapshot.write() else {
+            self.clear_routing();
+            return;
+        };
+        if self.active_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.worker_running.store(false, Ordering::Release);
+        *snapshot = DisplaySnapshotState::Unavailable;
+        drop(snapshot);
+        self.clear_routing();
+        self.notify_waiters();
+    }
+
+    fn retire_worker(&self, generation: u64) {
+        let Ok(mut snapshot) = self.snapshot.write() else {
+            self.clear_routing();
+            return;
+        };
+        if self.active_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.active_generation.store(0, Ordering::Release);
+        self.worker_running.store(false, Ordering::Release);
+        *snapshot = DisplaySnapshotState::Unavailable;
+        drop(snapshot);
+        self.clear_routing();
+        self.notify_waiters();
+    }
+
+    fn notify_waiters(&self) {
+        if let Ok(mut changed) = self.wait_state.lock() {
+            *changed = !*changed;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait_for_snapshot(
+        &self,
+        timeout: Duration,
+    ) -> Result<DisplaySnapshot, WindowsPlatformError> {
+        let deadline = Instant::now() + timeout;
+        let mut wait_state = self
+            .wait_state
+            .lock()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        loop {
+            if let Ok(snapshot) = self.snapshot() {
+                return Ok(snapshot);
+            }
+            if !self.worker_running.load(Ordering::Acquire) {
+                return Err(WindowsPlatformError::DisplayUnavailable);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WindowsPlatformError::DisplayUnavailable);
+            }
+            let duration = deadline.saturating_duration_since(now);
+            let observed = *wait_state;
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout_while(wait_state, duration, |state| *state == observed)
+                .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+            wait_state = next;
+            if timed_out.timed_out() && self.snapshot().is_err() {
+                return Err(WindowsPlatformError::DisplayUnavailable);
+            }
+        }
+    }
+}
+
+struct DisplayWorker {
+    generation: u64,
+    stop: ffi::NativeDisplayMonitorStopHandle,
+    worker: JoinHandle<Result<(), WindowsPlatformError>>,
+}
+
+struct DisplayService {
+    state: Arc<SharedDisplayState>,
+    runtime: Mutex<Option<DisplayWorker>>,
+    process: Arc<DisplayProcessState>,
+}
+
+fn process_display_tracker() -> Arc<Mutex<DisplayTracker>> {
+    static TRACKER: OnceLock<Arc<Mutex<DisplayTracker>>> = OnceLock::new();
+    Arc::clone(TRACKER.get_or_init(|| Arc::new(Mutex::new(DisplayTracker::default()))))
+}
+
+struct DisplayProcessState {
+    lifecycle: DisplayWorkerLifecycle,
+    status: Mutex<DisplayProcessStatus>,
+}
+
+#[derive(Default)]
+struct DisplayProcessStatus {
+    active: bool,
+    poisoned: bool,
+}
+
+impl Default for DisplayProcessState {
+    fn default() -> Self {
+        Self {
+            lifecycle: DisplayWorkerLifecycle::default(),
+            status: Mutex::new(DisplayProcessStatus::default()),
+        }
+    }
+}
+
+impl DisplayProcessState {
+    fn reserve(&self) -> Result<(), WindowsPlatformError> {
+        let mut status = self
+            .status
+            .lock()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        if status.active || status.poisoned {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        status.active = true;
+        Ok(())
+    }
+
+    fn release(&self) {
+        if let Ok(mut status) = self.status.lock() {
+            status.active = false;
+        }
+    }
+
+    fn poison(&self) {
+        if let Ok(mut status) = self.status.lock() {
+            status.active = false;
+            status.poisoned = true;
+        }
+    }
+
+    fn unavailable(&self) -> bool {
+        let Ok(status) = self.status.lock() else {
+            return true;
+        };
+        status.poisoned
+    }
+}
+
+fn process_display_state() -> Arc<DisplayProcessState> {
+    static PROCESS: OnceLock<Arc<DisplayProcessState>> = OnceLock::new();
+    Arc::clone(PROCESS.get_or_init(|| Arc::new(DisplayProcessState::default())))
+}
+
+fn join_display_worker_bounded(
+    worker: JoinHandle<Result<(), WindowsPlatformError>>,
+    process: &DisplayProcessState,
+) -> Result<(), WindowsPlatformError> {
+    let deadline = Instant::now() + DISPLAY_JOIN_TIMEOUT;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            process.poison();
+            drop(worker);
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => Err(WindowsPlatformError::DisplayUnavailable),
+    }
+}
+
+impl DisplayService {
+    fn start() -> Result<Arc<Self>, WindowsPlatformError> {
+        Self::start_with_process_state(process_display_state())
+    }
+
+    #[cfg(test)]
+    fn start_with_test_process(
+        process: Arc<DisplayProcessState>,
+    ) -> Result<Arc<Self>, WindowsPlatformError> {
+        Self::start_with_process_state(process)
+    }
+
+    fn start_with_process_state(
+        process: Arc<DisplayProcessState>,
+    ) -> Result<Arc<Self>, WindowsPlatformError> {
+        if process.unavailable() {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        ffi::ensure_process_dpi_awareness()?;
+        let service = Arc::new(Self {
+            state: Arc::new(SharedDisplayState::default()),
+            runtime: Mutex::new(None),
+            process,
+        });
+        {
+            let _lifecycle = service.process.lifecycle.lock()?;
+            service.start_worker_locked()?;
+        }
+        Ok(service)
+    }
+
+    fn start_worker_locked(&self) -> Result<(), WindowsPlatformError> {
+        self.process.reserve()?;
+        let result = self.start_reserved_worker_locked();
+        if result.is_err() {
+            self.process.release();
+        }
+        result
+    }
+
+    fn start_reserved_worker_locked(&self) -> Result<(), WindowsPlatformError> {
+        let mut runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+        if runtime.is_some() {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        let generation = self.process.lifecycle.next_generation()?;
+        self.state.begin_worker(generation)?;
+        let worker_state = Arc::clone(&self.state);
+        let worker_tracker = process_display_tracker();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("nodavo-windows-displays".into())
+            .spawn(move || {
+                let mut native = match ffi::NativeDisplayMonitor::new() {
+                    Ok(native) => native,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        if let Ok(mut tracker) = worker_tracker.lock() {
+                            let _ = tracker.observe(Err(error));
+                        }
+                        worker_state.finish_worker(generation);
+                        return Err(error);
+                    }
+                };
+                let stop = native.stop_handle();
+                worker_state.set_worker_running(generation, true);
+                if ready_tx.send(Ok(stop)).is_err() {
+                    worker_state.finish_worker(generation);
+                    return Err(WindowsPlatformError::DisplayUnavailable);
+                }
+                let result = native.run(|native_available| {
+                    let observation = if native_available {
+                        probe_environment().and_then(|_| ffi::enumerate_displays())
+                    } else {
+                        Err(WindowsPlatformError::SessionUnavailable)
+                    };
+                    let update = worker_tracker
+                        .lock()
+                        .map_or(DisplayTrackerUpdate::Unavailable, |mut tracker| {
+                            tracker.observe(observation)
+                        });
+                    worker_state.apply_worker(generation, update);
+                });
+                if let Ok(mut tracker) = worker_tracker.lock() {
+                    let _ = tracker.observe(Err(WindowsPlatformError::DisplayUnavailable));
+                }
+                worker_state.finish_worker(generation);
+                result
+            })
+            .map_err(|_| {
+                self.state.finish_worker(generation);
+                WindowsPlatformError::DisplayUnavailable
+            })?;
+        let stop = match ready_rx.recv() {
+            Ok(Ok(stop)) => stop,
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = worker.join();
+                return Err(WindowsPlatformError::DisplayUnavailable);
+            }
+        };
+        *runtime = Some(DisplayWorker {
+            generation,
+            stop,
+            worker,
+        });
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        !self.process.unavailable()
+            && self.state.worker_running.load(Ordering::Acquire)
+            && self.runtime.lock().is_ok_and(|runtime| {
+                runtime
+                    .as_ref()
+                    .is_some_and(|runtime| !runtime.worker.is_finished())
+            })
+    }
+
+    fn stop_locked(&self) -> Result<(), WindowsPlatformError> {
+        let Some(runtime) = self
+            .runtime
+            .lock()
+            .map_err(|_| WindowsPlatformError::DisplayUnavailable)?
+            .take()
+        else {
+            return Ok(());
+        };
+        self.state.retire_worker(runtime.generation);
+        let stop_result = if runtime.worker.is_finished() {
+            Ok(())
+        } else {
+            runtime.stop.stop()
+        };
+        let join_result = join_display_worker_bounded(runtime.worker, &self.process);
+        self.process.release();
+        stop_result?;
+        join_result
+    }
+
+    fn stop(&self) -> Result<(), WindowsPlatformError> {
+        let _lifecycle = self.process.lifecycle.lock()?;
+        self.stop_locked()
+    }
+
+    fn restart(&self) -> Result<(), WindowsPlatformError> {
+        let _lifecycle = self.process.lifecycle.lock()?;
+        if self.process.unavailable() {
+            return Err(WindowsPlatformError::DisplayUnavailable);
+        }
+        self.stop_locked()?;
+        self.start_worker_locked()
+    }
+}
+
+impl Drop for DisplayService {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn shared_display_service() -> Result<Arc<DisplayService>, WindowsPlatformError> {
+    static SERVICE: OnceLock<Mutex<Weak<DisplayService>>> = OnceLock::new();
+    let slot = SERVICE.get_or_init(|| Mutex::new(Weak::new()));
+    let mut service = slot
+        .lock()
+        .map_err(|_| WindowsPlatformError::DisplayUnavailable)?;
+    if let Some(current) = service.upgrade() {
+        if !current.is_running() {
+            current.restart()?;
+        }
+        return Ok(current);
+    }
+    let current = DisplayService::start()?;
+    *service = Arc::downgrade(&current);
+    Ok(current)
+}
+
+/// Lease over the process-local authoritative Windows display worker.
+///
+/// The worker polls a full graph every second on its owned thread. Its hidden
+/// top-level window only shortens reaction time for `WM_DISPLAYCHANGE`; it is
+/// never the authority for snapshot contents.
+pub struct WindowsDisplayMonitor {
+    service: Arc<DisplayService>,
+    observed_revision: AtomicU64,
+}
+
+impl fmt::Debug for WindowsDisplayMonitor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WindowsDisplayMonitor")
+            .field("running", &self.service.is_running())
+            .field("state", &self.snapshot_state())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WindowsDisplayMonitor {
+    /// Starts or shares the process-local display worker.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `PMv2` DPI awareness or the worker window cannot be established.
+    pub fn start() -> Result<Self, WindowsPlatformError> {
+        let service = shared_display_service()?;
+        let initial = service
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)?;
+        Ok(Self {
+            service,
+            observed_revision: AtomicU64::new(initial.revision()),
+        })
+    }
+
+    /// Returns true unless a complete, twice-confirmed graph is available.
+    ///
+    /// Callers must restore local ownership before consuming the later stable
+    /// snapshot. `Unavailable` is intentionally treated as pending work.
+    #[must_use]
+    pub fn display_change_pending(&self) -> bool {
+        self.service.state.pending_for(&self.observed_revision)
+    }
+
+    /// Returns whether the owned display worker is alive.
+    ///
+    /// Snapshot `Pending` or `Unavailable` does not by itself make the worker
+    /// unhealthy; callers may continue their bounded refresh deadline.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.service.is_running()
+    }
+
+    /// Returns the current full-snapshot availability without blocking.
+    ///
+    /// This diagnostic read does not consume an unseen stable revision; only
+    /// [`Self::snapshot`] acknowledges it for this monitor handle.
+    #[must_use]
+    pub fn snapshot_state(&self) -> DisplaySnapshotState {
+        self.service.state.snapshot_state()
+    }
+
+    /// Returns the current stable full snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WindowsPlatformError::DisplayUnavailable`] while an initial or
+    /// changed graph is awaiting its second identical sample.
+    pub fn snapshot(&self) -> Result<DisplaySnapshot, WindowsPlatformError> {
+        self.service.state.consume_snapshot(&self.observed_revision)
+    }
+
+    /// Stops and joins the shared worker, invalidating all outstanding leases.
+    ///
+    /// # Errors
+    ///
+    /// Returns a native post, lock, or worker-join failure.
+    pub fn stop(&mut self) -> Result<(), WindowsPlatformError> {
+        self.service.stop()
+    }
+
+    /// Restarts the worker in the same shared service so existing input users
+    /// observe the fresh snapshot instead of retaining a stopped source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stop or startup failure.
+    pub fn restart(&mut self) -> Result<(), WindowsPlatformError> {
+        self.service.restart()
+    }
 }
 
 /// Enumerates a bounded, mixed-DPI virtual display graph.
@@ -249,12 +917,12 @@ pub fn probe_environment() -> Result<EnvironmentCapabilities, WindowsPlatformErr
 ///
 /// Fails closed on session, desktop, enumeration, DPI, or geometry errors.
 pub fn active_displays() -> Result<Vec<DisplayGeometry>, WindowsPlatformError> {
-    probe_environment()?;
-    let displays = ffi::enumerate_displays()?;
-    if displays.is_empty() || displays.len() > MAX_DISPLAYS {
-        return Err(WindowsPlatformError::InvalidDisplay);
-    }
-    Ok(displays)
+    let service = shared_display_service()?;
+    Ok(service
+        .state
+        .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)?
+        .displays()
+        .to_vec())
 }
 
 /// Probes current-user input prerequisites without registering Raw Input,
@@ -277,11 +945,21 @@ pub fn probe_readiness() -> WindowsReadinessProbe {
             };
         }
     };
-    let local_topology_available = active_displays().is_ok_and(|displays| !displays.is_empty());
+    let display_service = shared_display_service().ok();
+    let local_topology_available = display_service.as_ref().is_some_and(|service| {
+        service
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)
+            .is_ok_and(|snapshot| !snapshot.displays().is_empty())
+    });
     let input = if environment.send_input && environment.raw_input_capture {
         // Construction validates the default desktop and display graph but
         // never calls SendInput or registers a process-wide capture runtime.
-        match WindowsInputInjector::new() {
+        match display_service
+            .clone()
+            .ok_or(WindowsPlatformError::DisplayUnavailable)
+            .and_then(WindowsInputInjector::with_display_service)
+        {
             Ok(_injector) => WindowsInputReadiness::Ready,
             Err(WindowsPlatformError::SecureDesktop) => WindowsInputReadiness::BlockedByDesktop,
             Err(_) => WindowsInputReadiness::Unavailable,
@@ -297,7 +975,7 @@ pub fn probe_readiness() -> WindowsReadinessProbe {
 
 /// Unprivileged `SendInput` adapter with pressed-state recovery.
 pub struct WindowsInputInjector {
-    displays: Vec<DisplayGeometry>,
+    display_service: Arc<DisplayService>,
     pressed: PressedState,
 }
 
@@ -308,8 +986,18 @@ impl WindowsInputInjector {
     ///
     /// Fails closed when session/desktop probing or display enumeration fails.
     pub fn new() -> Result<Self, WindowsPlatformError> {
+        let display_service = shared_display_service()?;
+        Self::with_display_service(display_service)
+    }
+
+    fn with_display_service(
+        display_service: Arc<DisplayService>,
+    ) -> Result<Self, WindowsPlatformError> {
+        display_service
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)?;
         Ok(Self {
-            displays: active_displays()?,
+            display_service,
             pressed: PressedState::default(),
         })
     }
@@ -320,13 +1008,19 @@ impl WindowsInputInjector {
     ///
     /// Fails closed if Windows reports an invalid or inaccessible display set.
     pub fn refresh_displays(&mut self) -> Result<(), WindowsPlatformError> {
-        self.displays = active_displays()?;
+        self.display_service
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)?;
         Ok(())
     }
 
-    #[must_use]
-    pub fn displays(&self) -> &[DisplayGeometry] {
-        &self.displays
+    /// Returns one atomically published full display snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Fails while a topology change is unconfirmed or the desktop is unavailable.
+    pub fn display_snapshot(&self) -> Result<DisplaySnapshot, WindowsPlatformError> {
+        self.display_service.state.snapshot()
     }
 
     /// Injects one semantic event after re-checking the interactive desktop.
@@ -337,7 +1031,7 @@ impl WindowsInputInjector {
     /// transitions, and partial or blocked `SendInput` calls.
     pub fn inject(&mut self, event: InputEvent) -> Result<(), WindowsPlatformError> {
         probe_environment()?;
-        self.send_event(event)?;
+        send_with_display_authority(&self.display_service.state, event, Self::send_event)?;
         self.pressed.apply(&event);
         Ok(())
     }
@@ -360,7 +1054,7 @@ impl WindowsInputInjector {
         let mut released_keys = 0_usize;
         let mut released_buttons = 0_usize;
         for release in releases {
-            if self.send_event(release).is_err() {
+            if Self::send_event(release, &[]).is_err() {
                 failed.apply(&pressed_equivalent(release));
             } else {
                 match release {
@@ -388,18 +1082,20 @@ impl WindowsInputInjector {
         self.pressed.is_empty()
     }
 
-    fn send_event(&self, event: InputEvent) -> Result<(), WindowsPlatformError> {
+    fn send_event(
+        event: InputEvent,
+        displays: &[DisplayGeometry],
+    ) -> Result<(), WindowsPlatformError> {
         let native = match event {
             InputEvent::Key { usage, state, .. } => keyboard_input(usage, state)?,
             InputEvent::PointerMotion { position } => {
-                let display = self
-                    .displays
+                let display = displays
                     .iter()
                     .copied()
                     .find(|display| display.id == position.display())
                     .ok_or(WindowsPlatformError::UnknownDisplay)?;
                 let (x, y) = display.map_position(position)?;
-                let bounds = virtual_desktop_bounds(&self.displays)?;
+                let bounds = virtual_desktop_bounds(displays)?;
                 let absolute_x = normalize_virtual_axis(x, bounds.0, bounds.2)?;
                 let absolute_y = normalize_virtual_axis(y, bounds.1, bounds.3)?;
                 ffi::NativeInput::AbsoluteMotion {
@@ -435,12 +1131,275 @@ impl WindowsInputInjector {
     }
 }
 
+fn send_with_display_authority(
+    displays: &SharedDisplayState,
+    event: InputEvent,
+    send: impl FnOnce(InputEvent, &[DisplayGeometry]) -> Result<(), WindowsPlatformError>,
+) -> Result<(), WindowsPlatformError> {
+    if matches!(event, InputEvent::PointerMotion { .. }) {
+        displays.with_available_snapshot(|snapshot| send(event, snapshot.displays()))
+    } else {
+        // Keys, buttons, scroll, and relative pointer input do not consume
+        // topology. In particular, releases remain possible after a graph was
+        // invalidated.
+        send(event, &[])
+    }
+}
+
 type CaptureCallback =
     dyn Fn(WindowsInputCaptureEvent) -> Result<(), WindowsPlatformError> + Send + Sync + 'static;
+
+fn translate_native_capture(
+    translator: &mut CaptureTranslator,
+    displays: &SharedDisplayState,
+    routing: &RoutingAdmission,
+    native: NativeInputEvent,
+    observation: Option<NativeRoutingObservation>,
+) -> Result<Option<WindowsInputCaptureEvent>, WindowsPlatformError> {
+    let lifecycle = matches!(native, NativeInputEvent::Lifecycle(_));
+    if !lifecycle {
+        let Some(observation) = observation else {
+            return Err(WindowsPlatformError::RawInputUnavailable);
+        };
+        if !observation.reliable_suppressed && !routing.epoch_is_current(observation.epoch) {
+            return Ok(None);
+        }
+    }
+    let relative_pointer = observation
+        .is_some_and(|observation| observation.routed_at_hook && observation.hook_suppressed);
+    let needs_snapshot =
+        matches!(native, NativeInputEvent::PointerMotion { .. }) && !relative_pointer;
+    let snapshot = if lifecycle || !needs_snapshot {
+        None
+    } else {
+        let Ok(snapshot) = displays.snapshot() else {
+            routing.disable()?;
+            return Ok(None);
+        };
+        Some(snapshot)
+    };
+    if relative_pointer
+        && let NativeInputEvent::PointerMotion {
+            delta_x, delta_y, ..
+        } = native
+        && (delta_x != 0 || delta_y != 0)
+        && PointerDelta::new(delta_x, delta_y).is_err()
+    {
+        return Err(WindowsPlatformError::RawInputUnavailable);
+    }
+    let Some(event) = translator.convert(
+        native,
+        snapshot.as_ref().map_or(&[], DisplaySnapshot::displays),
+        relative_pointer,
+    ) else {
+        return Ok(None);
+    };
+    if let Some(snapshot) = &snapshot
+        && !displays.revision_is_current(snapshot.revision())
+    {
+        routing.disable()?;
+        return Ok(None);
+    }
+    Ok(Some(event))
+}
 
 struct CaptureRuntime {
     stop: ffi::NativeInputCaptureStopHandle,
     worker: JoinHandle<Result<(), WindowsPlatformError>>,
+    display_service: Arc<DisplayService>,
+}
+
+struct CaptureRoutingLifecycle {
+    state: Mutex<CaptureRoutingLifecycleState>,
+    process: Arc<CaptureProcessState>,
+}
+
+#[derive(Default)]
+struct CaptureRoutingLifecycleState {
+    active: bool,
+}
+
+#[derive(Default)]
+struct CaptureProcessState {
+    state: Mutex<CaptureProcessStatus>,
+}
+
+#[derive(Default)]
+struct CaptureProcessStatus {
+    active: bool,
+    poisoned: bool,
+}
+
+fn process_capture_state() -> Arc<CaptureProcessState> {
+    static PROCESS: OnceLock<Arc<CaptureProcessState>> = OnceLock::new();
+    Arc::clone(PROCESS.get_or_init(|| Arc::new(CaptureProcessState::default())))
+}
+
+impl Default for CaptureRoutingLifecycle {
+    fn default() -> Self {
+        Self::with_process_state(process_capture_state())
+    }
+}
+
+impl CaptureRoutingLifecycle {
+    fn with_process_state(process: Arc<CaptureProcessState>) -> Self {
+        Self {
+            state: Mutex::new(CaptureRoutingLifecycleState::default()),
+            process,
+        }
+    }
+
+    fn activate(
+        self: &Arc<Self>,
+        routing: Arc<RoutingAdmission>,
+    ) -> Result<CaptureRoutingLease, WindowsPlatformError> {
+        let mut process = self
+            .process
+            .state
+            .lock()
+            .map_err(|_| WindowsPlatformError::CaptureThread)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| WindowsPlatformError::CaptureThread)?;
+        if process.poisoned {
+            routing.close_admission();
+            return Err(WindowsPlatformError::CaptureThread);
+        }
+        if state.active || process.active {
+            return Err(WindowsPlatformError::CaptureAlreadyRunning);
+        }
+        process.active = true;
+        state.active = true;
+        drop(state);
+        Ok(CaptureRoutingLease {
+            lifecycle: Arc::clone(self),
+            routing,
+            active: true,
+        })
+    }
+
+    fn with_active<T>(
+        &self,
+        routing: &RoutingAdmission,
+        operation: impl FnOnce() -> Result<T, WindowsPlatformError>,
+    ) -> Result<T, WindowsPlatformError> {
+        let Ok(process) = self.process.state.lock() else {
+            routing.close_admission();
+            return Err(WindowsPlatformError::CaptureThread);
+        };
+        let Ok(state) = self.state.lock() else {
+            routing.close_admission();
+            return Err(WindowsPlatformError::CaptureThread);
+        };
+        if process.poisoned {
+            routing.close_admission();
+            return Err(WindowsPlatformError::CaptureThread);
+        }
+        if !state.active {
+            routing.close_admission();
+            return Err(WindowsPlatformError::CaptureNotRunning);
+        }
+        operation()
+    }
+
+    fn deactivate(&self, routing: &RoutingAdmission) -> Result<(), WindowsPlatformError> {
+        let Ok(mut process) = self.process.state.lock() else {
+            routing.close_admission();
+            routing.disable()?;
+            return Err(WindowsPlatformError::CaptureThread);
+        };
+        let Ok(mut state) = self.state.lock() else {
+            routing.close_admission();
+            routing.disable()?;
+            return Err(WindowsPlatformError::CaptureThread);
+        };
+        state.active = false;
+        process.active = false;
+        routing.disable()
+    }
+
+    fn close_for_stop(&self, routing: &RoutingAdmission) -> Result<(), WindowsPlatformError> {
+        let Ok(mut state) = self.state.lock() else {
+            routing.close_admission();
+            routing.disable()?;
+            return Err(WindowsPlatformError::CaptureThread);
+        };
+        state.active = false;
+        routing.disable()
+    }
+
+    fn is_active(&self) -> bool {
+        let Ok(process) = self.process.state.lock() else {
+            return false;
+        };
+        self.state
+            .lock()
+            .is_ok_and(|state| state.active && process.active && !process.poisoned)
+    }
+
+    fn is_poisoned(&self) -> bool {
+        let Ok(process) = self.process.state.lock() else {
+            return true;
+        };
+        process.poisoned
+    }
+
+    fn poison(&self, routing: &RoutingAdmission) {
+        if let Ok(mut process) = self.process.state.lock() {
+            process.active = false;
+            process.poisoned = true;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.active = false;
+        }
+        routing.close_admission();
+    }
+}
+
+struct CaptureRoutingLease {
+    lifecycle: Arc<CaptureRoutingLifecycle>,
+    routing: Arc<RoutingAdmission>,
+    active: bool,
+}
+
+impl CaptureRoutingLease {
+    fn finish(&mut self) -> Result<(), WindowsPlatformError> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        self.lifecycle.deactivate(&self.routing)
+    }
+}
+
+impl Drop for CaptureRoutingLease {
+    fn drop(&mut self) {
+        if self.active {
+            self.active = false;
+            let _ = self.lifecycle.deactivate(&self.routing);
+        }
+    }
+}
+
+fn join_capture_worker_bounded(
+    worker: JoinHandle<Result<(), WindowsPlatformError>>,
+    before_detach: impl FnOnce(),
+) -> (Result<(), WindowsPlatformError>, bool) {
+    let deadline = Instant::now() + CAPTURE_JOIN_TIMEOUT;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            before_detach();
+            drop(worker);
+            return (Err(WindowsPlatformError::CaptureThread), true);
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let result = match worker.join() {
+        Ok(result) => result,
+        Err(_) => Err(WindowsPlatformError::CaptureThread),
+    };
+    (result, false)
 }
 
 /// Owned, restartable Raw Input runtime for the current interactive session.
@@ -452,7 +1411,8 @@ struct CaptureRuntime {
 /// cleared on stop, lock, disconnect, suspend, or default-desktop loss.
 pub struct WindowsInputCapture {
     callback: Arc<CaptureCallback>,
-    routing_to_peer: Arc<AtomicBool>,
+    routing_to_peer: Arc<RoutingAdmission>,
+    routing_lifecycle: Arc<CaptureRoutingLifecycle>,
     runtime: Option<CaptureRuntime>,
 }
 
@@ -489,7 +1449,8 @@ impl WindowsInputCapture {
     ) -> Self {
         Self {
             callback: Arc::new(callback),
-            routing_to_peer: Arc::new(AtomicBool::new(false)),
+            routing_to_peer: Arc::new(RoutingAdmission::default()),
+            routing_lifecycle: Arc::new(CaptureRoutingLifecycle::default()),
             runtime: None,
         }
     }
@@ -500,43 +1461,57 @@ impl WindowsInputCapture {
     ///
     /// Fails closed outside the default interactive desktop, when a window,
     /// registration, hook, or worker cannot be created, or when already running.
+    #[allow(clippy::too_many_lines)]
     pub fn start(&mut self) -> Result<(), WindowsPlatformError> {
         if self.runtime.is_some() {
             return Err(WindowsPlatformError::CaptureAlreadyRunning);
         }
+        if self.routing_lifecycle.is_poisoned() {
+            return Err(WindowsPlatformError::CaptureThread);
+        }
         probe_environment()?;
-        let displays = active_displays()?;
+        let display_service = shared_display_service()?;
+        display_service
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)?;
         let callback = Arc::clone(&self.callback);
         let routing_to_peer = Arc::clone(&self.routing_to_peer);
-        routing_to_peer.store(false, Ordering::Release);
+        let routing_lifecycle = Arc::clone(&self.routing_lifecycle);
+        display_service
+            .state
+            .register_routing_flag(&routing_to_peer)?;
+        let runtime_display_service = Arc::clone(&display_service);
+        routing_to_peer.disable()?;
+        let routing_lease = self
+            .routing_lifecycle
+            .activate(Arc::clone(&routing_to_peer))?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("nodavo-windows-input".into())
             .spawn(move || {
+                let mut routing_lease = routing_lease;
                 let event_callback = Arc::clone(&callback);
                 let event_routing = Arc::clone(&routing_to_peer);
+                let event_displays = Arc::clone(&display_service);
                 let mut translator = CaptureTranslator::new(ffi::current_modifier_state());
                 let capture = ffi::NativeInputCapture::new(
                     Arc::clone(&routing_to_peer),
-                    move |native: NativeInputEvent| {
-                        let relative_pointer = event_routing.load(Ordering::Acquire);
-                        if relative_pointer
-                            && let NativeInputEvent::PointerMotion {
-                                delta_x, delta_y, ..
-                            } = native
-                            && (delta_x != 0 || delta_y != 0)
-                            && PointerDelta::new(delta_x, delta_y).is_err()
-                        {
-                            return Err(WindowsPlatformError::RawInputUnavailable);
-                        }
-                        let Some(event) = translator.convert(native, &displays, relative_pointer)
+                    move |native: NativeInputEvent,
+                          observation: Option<NativeRoutingObservation>| {
+                        let Some(event) = translate_native_capture(
+                            &mut translator,
+                            &event_displays.state,
+                            &event_routing,
+                            native,
+                            observation,
+                        )?
                         else {
                             return Ok(());
                         };
                         if let WindowsInputCaptureEvent::Lifecycle(lifecycle) = event
                             && lifecycle_requires_local_recovery(lifecycle)
                         {
-                            event_routing.store(false, Ordering::Release);
+                            event_routing.disable()?;
                         }
                         event_callback(event)
                     },
@@ -550,27 +1525,49 @@ impl WindowsInputCapture {
                 };
                 let stop = capture.stop_handle();
                 if ready_tx.send(Ok(stop)).is_err() {
+                    let _ = routing_lifecycle.close_for_stop(&routing_to_peer);
+                    drop(capture);
+                    let _ = routing_lease.finish();
                     return Err(WindowsPlatformError::CaptureThread);
                 }
-                emit_callback(
+                let result = emit_callback(
                     callback.as_ref(),
                     WindowsInputLifecycleEvent::CaptureStarted,
-                )?;
-                let result = capture.run();
-                routing_to_peer.store(false, Ordering::Release);
-                if result.is_ok() {
-                    emit_callback(
-                        callback.as_ref(),
-                        WindowsInputLifecycleEvent::CaptureStopped,
-                    )?;
+                )
+                .and_then(|()| {
+                    let result = capture.run();
+                    if result.is_ok() {
+                        emit_callback(
+                            callback.as_ref(),
+                            WindowsInputLifecycleEvent::CaptureStopped,
+                        )?;
+                    }
+                    result
+                });
+                if matches!(result, Err(WindowsPlatformError::CaptureBarrierTimeout)) {
+                    routing_lifecycle.poison(&routing_to_peer);
                 }
+                let close_result = routing_lifecycle.close_for_stop(&routing_to_peer);
+                drop(capture);
+                routing_lease.finish()?;
+                close_result?;
                 result
             })
             .map_err(|_| WindowsPlatformError::CaptureThread)?;
 
         match ready_rx.recv() {
             Ok(Ok(stop)) => {
-                self.runtime = Some(CaptureRuntime { stop, worker });
+                if !self.routing_lifecycle.is_active() {
+                    return worker
+                        .join()
+                        .map_err(|_| WindowsPlatformError::CaptureThread)?
+                        .and(Err(WindowsPlatformError::CaptureThread));
+                }
+                self.runtime = Some(CaptureRuntime {
+                    stop,
+                    worker,
+                    display_service: runtime_display_service,
+                });
                 Ok(())
             }
             Ok(Err(error)) => {
@@ -589,28 +1586,45 @@ impl WindowsInputCapture {
     /// # Errors
     ///
     /// Enabling is refused without a live capture or outside the current default
-    /// interactive desktop. Disabling is always allowed and immediate.
+    /// interactive desktop. Disabling closes admission immediately, then waits
+    /// up to two seconds for old hook admissions and suppressed reliable
+    /// key/button/scroll observations to reach the bridge. A timeout remains
+    /// fail-closed and prevents re-enable until both counts drain.
     pub fn set_routing_to_peer(&self, enabled: bool) -> Result<(), WindowsPlatformError> {
         if enabled {
             if !self.is_running() {
                 return Err(WindowsPlatformError::CaptureNotRunning);
             }
             probe_environment()?;
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or(WindowsPlatformError::CaptureNotRunning)?;
+            self.routing_lifecycle
+                .with_active(&self.routing_to_peer, || {
+                    runtime
+                        .display_service
+                        .state
+                        .enable_routing(&self.routing_to_peer)
+                })?;
+        } else {
+            self.routing_to_peer.disable()?;
         }
-        self.routing_to_peer.store(enabled, Ordering::Release);
         Ok(())
     }
 
     #[must_use]
     pub fn routing_to_peer(&self) -> bool {
-        self.routing_to_peer.load(Ordering::Acquire)
+        self.routing_to_peer.is_enabled()
     }
 
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.runtime
-            .as_ref()
-            .is_some_and(|runtime| !runtime.worker.is_finished())
+        self.routing_lifecycle.is_active()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.worker.is_finished())
     }
 
     /// Stops the capture thread and waits for terminal acknowledgement.
@@ -619,17 +1633,21 @@ impl WindowsInputCapture {
     ///
     /// Returns the terminal capture/callback failure or a worker panic.
     pub fn stop(&mut self) -> Result<(), WindowsPlatformError> {
-        self.routing_to_peer.store(false, Ordering::Release);
+        let barrier = self.routing_lifecycle.close_for_stop(&self.routing_to_peer);
         let Some(runtime) = self.runtime.take() else {
-            return Ok(());
+            return barrier;
         };
-        if !runtime.worker.is_finished() {
-            runtime.stop.stop()?;
-        }
-        runtime
-            .worker
-            .join()
-            .map_err(|_| WindowsPlatformError::CaptureThread)?
+        let stop_result = if runtime.worker.is_finished() {
+            Ok(())
+        } else {
+            runtime.stop.stop()
+        };
+        let (join_result, _detached) = join_capture_worker_bounded(runtime.worker, || {
+            self.routing_lifecycle.poison(&self.routing_to_peer);
+        });
+        barrier?;
+        stop_result?;
+        join_result
     }
 
     /// Stops any owned runtime and starts a fresh capture boundary.
@@ -1086,9 +2104,500 @@ impl WindowsClipboard {
 
 #[cfg(test)]
 mod tests {
+    use nodavo_input::{DisplayId, NormalizedAxis, NormalizedPosition};
     use tokio::net::windows::named_pipe::ClientOptions;
 
     use super::*;
+    use crate::display_runtime::{NativeDisplayGeometry, NativeDisplayKey};
+
+    fn observed_display(key: u16, dpi: u32) -> NativeDisplayGeometry {
+        NativeDisplayGeometry {
+            key: NativeDisplayKey::new(&[key, 0]).unwrap(),
+            left: 0,
+            top: 0,
+            width_pixels: 1_920,
+            height_pixels: 1_080,
+            dpi_x: dpi,
+            dpi_y: dpi,
+            rotation: nodavo_protocol::DisplayRotation::Degrees0,
+            primary: true,
+        }
+    }
+
+    #[test]
+    fn shared_snapshot_change_clears_every_routing_lease_and_recovers() {
+        let state = SharedDisplayState::default();
+        let first_route = Arc::new(RoutingAdmission::default());
+        let second_route = Arc::new(RoutingAdmission::default());
+        first_route.enable().unwrap();
+        second_route.enable().unwrap();
+        state.register_routing_flag(&first_route).unwrap();
+        state.register_routing_flag(&second_route).unwrap();
+
+        let mut tracker = DisplayTracker::default();
+        let first = vec![observed_display(1, 96)];
+        state.apply(tracker.observe(Ok(first.clone())));
+        assert!(!first_route.is_enabled());
+        assert!(!second_route.is_enabled());
+        state.apply(tracker.observe(Ok(first)));
+        let revision = state.snapshot().unwrap().revision();
+
+        first_route.enable().unwrap();
+        second_route.enable().unwrap();
+        let changed = vec![observed_display(1, 144)];
+        state.apply(tracker.observe(Ok(changed.clone())));
+        assert_eq!(
+            state.snapshot(),
+            Err(WindowsPlatformError::DisplayUnavailable)
+        );
+        assert!(!first_route.is_enabled());
+        assert!(!second_route.is_enabled());
+        state.apply(tracker.observe(Ok(changed)));
+        assert!(state.snapshot().unwrap().revision() > revision);
+    }
+
+    #[test]
+    fn repeated_routing_registration_keeps_one_bounded_invalidation_barrier() {
+        let state = SharedDisplayState::default();
+        let routing = Arc::new(RoutingAdmission::default());
+        for _ in 0..8 {
+            state.register_routing_flag(&routing).unwrap();
+        }
+        assert_eq!(state.routing_flags.lock().unwrap().len(), 1);
+
+        routing.enable().unwrap();
+        let hook = routing.begin();
+        hook.commit_reliable_suppression().unwrap();
+        drop(hook);
+        let started = Instant::now();
+        state.clear_routing();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(!routing.is_enabled());
+        assert!(routing.complete_reliable_suppressions(1));
+    }
+
+    #[test]
+    fn stable_revision_remains_pending_until_that_monitor_consumes_it() {
+        let state = Arc::new(SharedDisplayState::default());
+        let mut tracker = DisplayTracker::default();
+        let first = vec![observed_display(1, 96)];
+        state.apply(tracker.observe(Ok(first.clone())));
+        state.apply(tracker.observe(Ok(first)));
+        let initial_revision = state.snapshot().unwrap().revision();
+        let service = Arc::new(DisplayService {
+            state: Arc::clone(&state),
+            runtime: Mutex::new(None),
+            process: Arc::new(DisplayProcessState::default()),
+        });
+        let monitor = WindowsDisplayMonitor {
+            service,
+            observed_revision: AtomicU64::new(initial_revision),
+        };
+        assert!(!monitor.display_change_pending());
+
+        let changed = vec![observed_display(1, 144)];
+        state.apply(tracker.observe(Ok(changed.clone())));
+        state.apply(tracker.observe(Ok(changed)));
+
+        // The entire unavailable-to-available transition happened without a
+        // consumer poll, but the unseen stable revision retains the edge.
+        assert!(monitor.display_change_pending());
+        let consumed = monitor.snapshot().unwrap();
+        assert!(consumed.revision() > initial_revision);
+        assert!(!monitor.display_change_pending());
+    }
+
+    #[test]
+    fn hook_suppressed_release_survives_unavailable_display_snapshot() {
+        let displays = SharedDisplayState::default();
+        assert_eq!(
+            displays.snapshot(),
+            Err(WindowsPlatformError::DisplayUnavailable)
+        );
+        let routing = RoutingAdmission::default();
+        routing.enable().unwrap();
+        let admission = routing.begin();
+        assert!(admission.enabled());
+        let epoch = admission.epoch();
+        drop(admission);
+        routing.disable().unwrap();
+
+        let mut translator =
+            CaptureTranslator::new(crate::input_runtime::NativeModifierState::default());
+        let event = translate_native_capture(
+            &mut translator,
+            &displays,
+            &routing,
+            NativeInputEvent::Keyboard {
+                scan_code: 0x1e,
+                virtual_key: 0x41,
+                extended: false,
+                e1: false,
+                pressed: false,
+            },
+            Some(NativeRoutingObservation {
+                hook_suppressed: true,
+                routed_at_hook: true,
+                reliable_suppressed: true,
+                epoch,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            Some(WindowsInputCaptureEvent::Input(InputEvent::Key {
+                usage,
+                state: KeyState::Released,
+                ..
+            })) if usage == HidUsage::new(KEYBOARD_PAGE, 0x04)
+        ));
+    }
+
+    #[test]
+    fn delayed_pre_enable_motion_cannot_cross_routing_epoch() {
+        let displays = SharedDisplayState::default();
+        let routing = RoutingAdmission::default();
+        let pre_enable = routing.begin();
+        assert!(!pre_enable.enabled());
+        let old_epoch = pre_enable.epoch();
+        drop(pre_enable);
+        routing.enable().unwrap();
+        assert!(!routing.epoch_is_current(old_epoch));
+
+        let mut translator =
+            CaptureTranslator::new(crate::input_runtime::NativeModifierState::default());
+        let event = translate_native_capture(
+            &mut translator,
+            &displays,
+            &routing,
+            NativeInputEvent::PointerMotion {
+                x: 100,
+                y: 100,
+                delta_x: 5,
+                delta_y: 5,
+            },
+            Some(NativeRoutingObservation {
+                hook_suppressed: false,
+                routed_at_hook: false,
+                reliable_suppressed: false,
+                epoch: old_epoch,
+            }),
+        )
+        .unwrap();
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn capture_final_close_rejects_reenable_before_worker_thread_exits() {
+        let process = Arc::new(CaptureProcessState::default());
+        let lifecycle = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let replacement = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let routing = Arc::new(RoutingAdmission::default());
+        let mut lease = lifecycle.activate(Arc::clone(&routing)).unwrap();
+        routing.enable().unwrap();
+
+        let (closed, close_observed) = std::sync::mpsc::sync_channel(1);
+        let (native_dropped, may_drop_native) = std::sync::mpsc::sync_channel(1);
+        let worker_lifecycle = Arc::clone(&lifecycle);
+        let worker_routing = Arc::clone(&routing);
+        let worker = std::thread::spawn(move || {
+            worker_lifecycle.close_for_stop(&worker_routing).unwrap();
+            closed.send(()).unwrap();
+            may_drop_native.recv().unwrap();
+            lease.finish().unwrap();
+        });
+        close_observed.recv().unwrap();
+
+        assert_eq!(
+            lifecycle.with_active(&routing, || routing.enable()),
+            Err(WindowsPlatformError::CaptureNotRunning)
+        );
+        assert!(!routing.is_enabled());
+        assert!(matches!(
+            replacement.activate(Arc::new(RoutingAdmission::default())),
+            Err(WindowsPlatformError::CaptureAlreadyRunning)
+        ));
+        native_dropped.send(()).unwrap();
+        worker.join().unwrap();
+        assert!(
+            replacement
+                .activate(Arc::new(RoutingAdmission::default()))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn process_capture_owner_rejects_a_second_fresh_handle() {
+        let process = Arc::new(CaptureProcessState::default());
+        let first = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let second = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let first_routing = Arc::new(RoutingAdmission::default());
+        let second_routing = Arc::new(RoutingAdmission::default());
+        let mut lease = first.activate(first_routing).unwrap();
+
+        assert!(matches!(
+            second.activate(Arc::clone(&second_routing)),
+            Err(WindowsPlatformError::CaptureAlreadyRunning)
+        ));
+        lease.finish().unwrap();
+        assert!(second.activate(second_routing).is_ok());
+    }
+
+    #[test]
+    fn stalled_capture_join_is_bounded_and_permanently_poisoned() {
+        let process = Arc::new(CaptureProcessState::default());
+        let lifecycle = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let routing = Arc::new(RoutingAdmission::default());
+        let mut lease = lifecycle.activate(Arc::clone(&routing)).unwrap();
+        routing.enable().unwrap();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let (exited, exit_observed) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            lease.finish()?;
+            exited.send(()).unwrap();
+            Ok(())
+        });
+
+        lifecycle.close_for_stop(&routing).unwrap();
+        let started = Instant::now();
+        let poison_lifecycle = Arc::clone(&lifecycle);
+        let poison_routing = Arc::clone(&routing);
+        let (join_result, detached) = join_capture_worker_bounded(worker, move || {
+            poison_lifecycle.poison(&poison_routing);
+        });
+        assert_eq!(join_result, Err(WindowsPlatformError::CaptureThread));
+        assert!(detached);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(process.state.lock().unwrap().poisoned);
+        assert!(matches!(
+            lifecycle.activate(Arc::clone(&routing)),
+            Err(WindowsPlatformError::CaptureThread)
+        ));
+        let fresh_lifecycle = Arc::new(CaptureRoutingLifecycle::with_process_state(Arc::clone(
+            &process,
+        )));
+        let fresh_routing = Arc::new(RoutingAdmission::default());
+        assert!(matches!(
+            fresh_lifecycle.activate(fresh_routing),
+            Err(WindowsPlatformError::CaptureThread)
+        ));
+        assert!(!routing.is_enabled());
+
+        release.send(()).unwrap();
+        exit_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn stalled_display_join_poison_blocks_every_fresh_service() {
+        let process = Arc::new(DisplayProcessState::default());
+        process.reserve().unwrap();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
+        let (exited, exit_observed) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            blocked.recv().unwrap();
+            exited.send(()).unwrap();
+            Ok(())
+        });
+
+        let started = Instant::now();
+        assert_eq!(
+            join_display_worker_bounded(worker, &process),
+            Err(WindowsPlatformError::DisplayUnavailable)
+        );
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(process.status.lock().unwrap().poisoned);
+        assert!(matches!(
+            DisplayService::start_with_test_process(Arc::clone(&process)),
+            Err(WindowsPlatformError::DisplayUnavailable)
+        ));
+
+        release.send(()).unwrap();
+        exit_observed.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn display_process_owner_fences_last_lease_drop_from_new_start() {
+        let process = Arc::new(DisplayProcessState::default());
+        process.reserve().unwrap();
+
+        // A replacement that reaches the process gate before old Drop starts
+        // must fail rather than overlap the still-owned worker.
+        {
+            let _gate = process.lifecycle.lock().unwrap();
+            assert_eq!(
+                process.reserve(),
+                Err(WindowsPlatformError::DisplayUnavailable)
+            );
+        }
+
+        let (dropping, drop_entered) = std::sync::mpsc::sync_channel(1);
+        let (finish_drop, may_finish_drop) = std::sync::mpsc::sync_channel(1);
+        let dropping_process = Arc::clone(&process);
+        let old_drop = std::thread::spawn(move || {
+            let _gate = dropping_process.lifecycle.lock().unwrap();
+            dropping.send(()).unwrap();
+            may_finish_drop.recv().unwrap();
+            dropping_process.release();
+        });
+        drop_entered.recv().unwrap();
+
+        let (started, start_result) = std::sync::mpsc::sync_channel(1);
+        let starting_process = Arc::clone(&process);
+        let replacement = std::thread::spawn(move || {
+            let _gate = starting_process.lifecycle.lock().unwrap();
+            started.send(starting_process.reserve()).unwrap();
+        });
+        assert!(matches!(
+            start_result.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        finish_drop.send(()).unwrap();
+        old_drop.join().unwrap();
+        assert_eq!(start_result.recv().unwrap(), Ok(()));
+        replacement.join().unwrap();
+        process.release();
+    }
+
+    #[test]
+    fn display_invalidation_cannot_leave_routing_enabled_against_pending() {
+        let state = Arc::new(SharedDisplayState::default());
+        let routing = Arc::new(RoutingAdmission::default());
+        state.register_routing_flag(&routing).unwrap();
+
+        let mut tracker = DisplayTracker::default();
+        state.begin_worker(1).unwrap();
+        state.set_worker_running(1, true);
+        let display = vec![observed_display(1, 96)];
+        state.apply_worker(1, tracker.observe(Ok(display.clone())));
+        state.apply_worker(1, tracker.observe(Ok(display)));
+
+        let (entered, enable_entered) = std::sync::mpsc::sync_channel(1);
+        let (resume, enable_resumed) = std::sync::mpsc::sync_channel(1);
+        let enabling_state = Arc::clone(&state);
+        let enabling_routing = Arc::clone(&routing);
+        let enabling = std::thread::spawn(move || {
+            enabling_state.enable_routing_after(&enabling_routing, || {
+                entered.send(()).unwrap();
+                enable_resumed.recv().unwrap();
+            })
+        });
+        enable_entered.recv().unwrap();
+
+        let (attempting, invalidation_attempted) = std::sync::mpsc::sync_channel(1);
+        let (invalidated, invalidation_done) = std::sync::mpsc::sync_channel(1);
+        let invalidating_state = Arc::clone(&state);
+        let invalidating = std::thread::spawn(move || {
+            attempting.send(()).unwrap();
+            invalidating_state.apply_worker(1, DisplayTrackerUpdate::Pending);
+            invalidated.send(()).unwrap();
+        });
+        invalidation_attempted.recv().unwrap();
+        assert!(matches!(
+            invalidation_done.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        resume.send(()).unwrap();
+        assert_eq!(enabling.join().unwrap(), Ok(()));
+        invalidating.join().unwrap();
+        invalidation_done.recv().unwrap();
+
+        assert_eq!(state.snapshot_state(), DisplaySnapshotState::Pending);
+        assert!(!routing.is_enabled());
+    }
+
+    #[test]
+    fn absolute_send_holds_display_authority_until_send_returns() {
+        let state = Arc::new(SharedDisplayState::default());
+        let mut tracker = DisplayTracker::default();
+        state.begin_worker(1).unwrap();
+        state.set_worker_running(1, true);
+        let display = vec![observed_display(1, 96)];
+        state.apply_worker(1, tracker.observe(Ok(display.clone())));
+        state.apply_worker(1, tracker.observe(Ok(display)));
+
+        let event = InputEvent::PointerMotion {
+            position: NormalizedPosition::new(
+                DisplayId::new(1),
+                NormalizedAxis::MIN,
+                NormalizedAxis::MIN,
+            ),
+        };
+        let (entered, send_entered) = std::sync::mpsc::sync_channel(1);
+        let (resume, send_resumed) = std::sync::mpsc::sync_channel(1);
+        let sending_state = Arc::clone(&state);
+        let sending = std::thread::spawn(move || {
+            send_with_display_authority(&sending_state, event, |sent, displays| {
+                assert_eq!(sent, event);
+                assert_eq!(displays.len(), 1);
+                entered.send(()).unwrap();
+                send_resumed.recv().unwrap();
+                Ok(())
+            })
+        });
+        send_entered.recv().unwrap();
+
+        let (attempting, invalidation_attempted) = std::sync::mpsc::sync_channel(1);
+        let (invalidated, invalidation_done) = std::sync::mpsc::sync_channel(1);
+        let invalidating_state = Arc::clone(&state);
+        let invalidating = std::thread::spawn(move || {
+            attempting.send(()).unwrap();
+            invalidating_state.apply_worker(1, DisplayTrackerUpdate::Pending);
+            invalidated.send(()).unwrap();
+        });
+        invalidation_attempted.recv().unwrap();
+        assert!(matches!(
+            invalidation_done.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        resume.send(()).unwrap();
+        assert_eq!(sending.join().unwrap(), Ok(()));
+        invalidating.join().unwrap();
+        invalidation_done.recv().unwrap();
+        assert_eq!(state.snapshot_state(), DisplaySnapshotState::Pending);
+    }
+
+    #[test]
+    fn retired_worker_teardown_cannot_overwrite_new_generation() {
+        let state = SharedDisplayState::default();
+        let mut tracker = DisplayTracker::default();
+
+        state.begin_worker(1).unwrap();
+        state.set_worker_running(1, true);
+        let first = vec![observed_display(1, 96)];
+        state.apply_worker(1, tracker.observe(Ok(first.clone())));
+        state.apply_worker(1, tracker.observe(Ok(first)));
+        state.retire_worker(1);
+        let _ = tracker.observe(Err(WindowsPlatformError::DisplayUnavailable));
+
+        state.begin_worker(2).unwrap();
+        state.set_worker_running(2, true);
+        let second = vec![observed_display(2, 144)];
+        state.apply_worker(2, tracker.observe(Ok(second.clone())));
+        state.apply_worker(2, tracker.observe(Ok(second)));
+        let revision = state.snapshot().unwrap().revision();
+
+        state.finish_worker(1);
+        state.apply_worker(1, DisplayTrackerUpdate::Unavailable);
+        state.set_worker_running(1, false);
+
+        assert_eq!(state.snapshot().unwrap().revision(), revision);
+        assert!(state.worker_running.load(Ordering::Acquire));
+        assert_eq!(state.active_generation.load(Ordering::Acquire), 2);
+    }
 
     #[tokio::test]
     async fn private_pipe_rejects_an_unpackaged_current_process() {
@@ -1100,6 +2609,24 @@ mod tests {
             authorize_named_pipe_client(&server).unwrap_err(),
             WindowsPlatformError::UnauthorizedLocalIpc
         );
+    }
+
+    #[test]
+    #[ignore = "requires a real interactive Windows default desktop"]
+    fn display_monitor_restart_preserves_shared_consumers() {
+        let mut monitor = WindowsDisplayMonitor::start().unwrap();
+        let shared = Arc::clone(&monitor.service);
+        shared
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)
+            .unwrap();
+        monitor.restart().unwrap();
+        assert!(Arc::ptr_eq(&monitor.service, &shared));
+        shared
+            .state
+            .wait_for_snapshot(INITIAL_DISPLAY_SNAPSHOT_TIMEOUT)
+            .unwrap();
+        monitor.stop().unwrap();
     }
 
     #[test]

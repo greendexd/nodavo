@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 9 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 10 -->
 
 # Архитектура
 
@@ -77,6 +77,10 @@ Platform и transport boundaries используют dependency injection, чт
 - Capture suppression по умолчанию выключен и включается только при forwarding под этой lease. Обычный возврат focus сохраняет authenticated connection готовым для управления в обратную сторону.
 
 При disconnect, timeout, lock, sleep, crash или emergency stop обе стороны освобождают tracked keys/buttons и возвращают локальный cursor ownership.
+
+Display hot-plug является session transaction, а не изменением geometry на месте. Platform callbacks только помечают coalesced dirty generation. Владелец session закрывает routing admission, дренирует уже принятый input под старой lease, возвращает focus локально, проверяет стабильный ограниченный полный graph со свежими process-local identities, заменяет active-only native/session map и публикует новую topology revision. Новый focus недоступен до acknowledgement точной revision. Повторные изменения сохраняют только последнюю candidate и не продлевают фиксированный refresh deadline; safety, revoke и disconnect остаются более приоритетными transitions.
+
+Capture и injection macOS используют один immutable process snapshot из CoreGraphics. Capture и injection Windows используют один process-singleton display service с per-monitor-v2 awareness, DisplayConfig identities, ранним broadcast wake и authoritative polling. Обе платформы связывают suppression с callback/admission barrier, поэтому input нельзя принять удалённо после его возврата локальной OS. Native owners после timeout poison’ят restart в этом process вместо допуска пересекающихся capture, hooks или injectors.
 
 ## Discovery и pairing
 

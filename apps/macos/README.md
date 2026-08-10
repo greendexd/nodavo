@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: en; revision: 13 -->
+<!-- doc-id: macos-app; lang: en; revision: 14 -->
 
 # Nodavo for macOS
 
@@ -25,6 +25,8 @@ The UI shows current transfers and terminal transfers first observed during this
 ## Readiness and Accessibility
 
 Readiness is a strict public enum snapshot, not a diagnostic dump. The shell rejects missing, unknown, or malformed readiness values. Behind a finite deadline and short cache, the agent checks Accessibility trust, local display discovery, and a non-posting injector prerequisite; it never constructs a second capture runtime, suppresses, or injects input. **Ready** therefore describes current local prerequisites, not live capture proof. A connected session reports peer topology as ready only after the authenticated topology exchange and matching local revision acknowledgement.
+
+The macOS platform source now observes CoreGraphics display reconfiguration through a callback that only marks a coalesced dirty generation. Capture and injection share a stable bounded full snapshot with non-reused opaque identities. The agent closes routing admission, drains already admitted input, releases the old focus lease, and waits for the exact replacement-topology acknowledgement before reporting the session ready again. Focused/inert tests cover callback interleavings, teardown, stale identities, deadlines, and safety latching; a real signed Mac attached to a Windows peer has not yet passed physical hot-plug qualification.
 
 **Allow Accessibility** asks macOS from the agent process that needs the permission and then performs a fresh probe. The prompt API's return value is not treated as authorization, so cancelling the prompt or leaving System Settings unchanged remains **Action required**. This source behavior and focused prerequisite tests are implemented; a signed, provisioned, notarized Nodavo build has not yet proved the complete TCC flow on a clean Mac.
 

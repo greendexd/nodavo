@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 13 -->
+<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 14 -->
 
 # История изменений
 
@@ -24,6 +24,7 @@
 - Ограниченное FIFO-планирование transfers с детерминированными эффектами pause/resume/cancel, а также приватный файловый staging с durable-журналом, возобновлением после перезапуска с точного offset, обрезанием torn tail, BLAKE3, удалением сохранённого состояния и завершением без перезаписи.
 - Компиляционные проверки репозитория для двуязычной документации, форматирования и сборки Rust на macOS/Windows, x64-проекта WinUI 3 и Swift-пакетов macOS.
 - Authenticated session-scoped display topology, mixed-DPI edge policy, relative pointer deltas и reliable pointer-entry acknowledgement gate до suppression.
+- Транзакционный display hot-plug refresh для macOS и Windows: coalesced наблюдение native changes, дважды подтверждённые ограниченные полные snapshots, непереиспользуемые opaque identities, callback/admission barriers, drain input старой lease и forced release, фиксированные deadlines snapshot/ACK и точный topology acknowledgement до возобновления focus. Source, virtual, macOS-inert и Windows cross-target проверки проходят; физическая cross-platform квалификация hot-plug остаётся открытой.
 - Сквозные bounded clipboard channels: text/HTML/PNG/clear в macOS и Windows, а также строгий canonical BMP/DIB subset в Windows.
 - Production-default macOS Keychain storage с явным insecure-development file fallback, universal development app/DMG и fail-closed packaging path Developer ID/notarization.
 - Capability-rooted outbound file scanning/streaming с no-follow traversal, deterministic manifests, BLAKE3, mutation detection, resume evidence и безопасным receiver staging.

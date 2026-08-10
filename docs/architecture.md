@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 9 -->
+<!-- doc-id: architecture; lang: en; revision: 10 -->
 
 # Architecture
 
@@ -77,6 +77,10 @@ When QUIC datagrams are unavailable, pointer motion falls back to a short-lived 
 - Capture suppression is off by default and can turn on only while forwarding under that lease. Ordinary focus return keeps the authenticated connection ready for reverse-direction control.
 
 On disconnect, timeout, lock, sleep, crash, or emergency stop, both sides release all tracked keys/buttons and restore local cursor ownership.
+
+Display hot-plug is a session transaction rather than an in-place geometry edit. Platform callbacks only mark a coalesced dirty generation. The session owner closes routing admission, drains already admitted input under the old lease, returns focus locally, validates a stable bounded full graph with fresh process-local identities, replaces the active-only native/session map, and publishes a new topology revision. New focus is unavailable until the exact revision is acknowledged. Repeated changes retain only the latest candidate and cannot extend the fixed refresh deadline; safety, revoke, and disconnect remain higher-priority transitions.
+
+macOS capture and injection share one immutable process snapshot sourced from CoreGraphics. Windows capture and injection share one process-singleton display service with per-monitor-v2 awareness, DisplayConfig identities, an early broadcast wake, and authoritative polling. Both platforms bind suppression to a callback/admission barrier so an input cannot be accepted remotely after being returned to the local OS. Timed-out native owners poison restart within that process instead of permitting overlapping capture, hooks, or injectors.
 
 ## Discovery and pairing
 

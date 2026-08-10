@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 13 -->
+<!-- doc-id: changelog; lang: en; revision: 14 -->
 
 # Changelog
 
@@ -24,6 +24,7 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 - Bounded FIFO transfer scheduling with deterministic pause/resume/cancel effects, plus filesystem-backed private staging with durable progress journals, exact-offset restart resume, torn-tail truncation, per-file BLAKE3 verification, persisted-state discard, and no-overwrite finalization.
 - Compile-only repository checks for bilingual documentation, Rust formatting and macOS/Windows builds, the WinUI 3 x64 project, and macOS Swift packages.
 - Authenticated session-scoped display topology, mixed-DPI edge policy, relative pointer deltas, and a reliable pointer-entry acknowledgement gate before suppression.
+- Transactional display hot-plug refresh on macOS and Windows: coalesced native change observation, twice-confirmed bounded full snapshots, non-reused opaque identities, callback/admission barriers, old-lease input draining and forced release, fixed snapshot/ACK deadlines, and exact topology acknowledgement before focus resumes. Source, virtual, macOS-inert, and Windows cross-target checks pass; physical cross-platform hot-plug qualification remains open.
 - End-to-end bounded clipboard channels: text/HTML/PNG/clear on macOS and Windows, plus a strict canonical BMP/DIB subset on Windows.
 - Production-default macOS Keychain storage with an explicit insecure-development file fallback, and a universal development app/DMG plus fail-closed Developer ID/notarization packaging path.
 - Capability-rooted outbound file scanning and streaming with no-follow traversal, deterministic manifests, BLAKE3, mutation detection, resume evidence, and safe receiver staging.

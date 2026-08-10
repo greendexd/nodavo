@@ -1,10 +1,11 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
-use core_graphics::display::CGDisplay;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField, KeyCode,
     ScrollEventUnit,
@@ -15,13 +16,14 @@ use macos_accessibility_client::accessibility::{
     application_is_trusted, application_is_trusted_with_prompt,
 };
 use nodavo_input::{
-    ButtonState, CONSUMER_PAGE, DisplayId, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState,
-    Modifiers, NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, PressedState,
-    ScrollUnit,
+    ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, Modifiers,
+    NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, PressedState, ScrollUnit,
 };
 
 use super::{DisplayGeometry, MacPlatformError, MacReadinessProbe, NODAVO_SYNTHETIC_EVENT_TAG};
 
+#[path = "macos/display.rs"]
+mod display;
 #[path = "macos/ffi.rs"]
 mod ffi;
 #[path = "macos/ipc_auth.rs"]
@@ -29,6 +31,7 @@ mod ipc_auth;
 #[path = "macos/xpc_ipc.rs"]
 mod xpc_ipc;
 
+pub use display::{MacDisplayMonitor, MacDisplaySnapshot};
 pub use ipc_auth::{MacIpcAuthError, MacIpcPeerGuard};
 pub use xpc_ipc::{
     MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES, MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS,
@@ -54,33 +57,34 @@ pub fn request_accessibility() -> bool {
     application_is_trusted_with_prompt()
 }
 
-/// Returns geometry for every active display.
+/// Returns one stable geometry snapshot for every active display.
+///
+/// Without an active [`MacDisplayMonitor`], identifiers are scoped to this
+/// snapshot and every identifier from an earlier standalone call is retired.
 ///
 /// # Errors
 ///
-/// Returns [`MacPlatformError::CoreGraphics`] when display enumeration fails,
-/// or [`MacPlatformError::InvalidNativeEvent`] for invalid native geometry.
+/// Fails closed when enumeration fails or the graph is changing, oversized,
+/// empty, or invalid.
 pub fn active_displays() -> Result<Vec<DisplayGeometry>, MacPlatformError> {
-    CGDisplay::active_displays()
-        .map_err(|_| MacPlatformError::CoreGraphics)?
-        .into_iter()
-        .map(|id| {
-            let display = CGDisplay::new(id);
-            let bounds = display.bounds();
-            if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
-                return Err(MacPlatformError::InvalidNativeEvent);
-            }
-            Ok(DisplayGeometry {
-                id: DisplayId::new(u64::from(id)),
-                origin_x: bounds.origin.x,
-                origin_y: bounds.origin.y,
-                width_points: bounds.size.width,
-                height_points: bounds.size.height,
-                width_pixels: display.pixels_wide(),
-                height_pixels: display.pixels_high(),
-            })
-        })
-        .collect()
+    Ok(refresh_display_snapshot()?.displays().to_vec())
+}
+
+/// Publishes and returns one stable process-global display snapshot.
+///
+/// This is the explicit refresh point for an async bridge after
+/// [`MacDisplayMonitor::display_change_pending`] becomes true. Capture and
+/// injection hot paths never call it implicitly.
+///
+/// Without any active [`MacDisplayMonitor`], the returned geometry is a
+/// standalone snapshot: all previously issued opaque display identifiers are
+/// retired because native identifier reuse could not have been observed.
+///
+/// # Errors
+///
+/// Fails closed for a changing, oversized, empty, or invalid display graph.
+pub fn refresh_display_snapshot() -> Result<Arc<MacDisplaySnapshot>, MacPlatformError> {
+    display::current_process_snapshot()
 }
 
 /// Probes current-user prerequisites without registering capture, routing,
@@ -88,7 +92,8 @@ pub fn active_displays() -> Result<Vec<DisplayGeometry>, MacPlatformError> {
 #[must_use]
 pub fn probe_readiness() -> MacReadinessProbe {
     let initially_trusted = accessibility_trusted();
-    let local_topology_available = active_displays().is_ok_and(|displays| !displays.is_empty());
+    let local_topology_available =
+        display::passive_process_snapshot().is_ok_and(|snapshot| !snapshot.displays().is_empty());
     // Construction creates an event source and validates displays but never
     // posts an event or installs a process-wide event tap.
     let input_prerequisites_available = initially_trusted && MacInputInjector::new().is_ok();
@@ -105,7 +110,6 @@ pub fn probe_readiness() -> MacReadinessProbe {
 
 pub struct MacInputInjector {
     source: CGEventSource,
-    displays: Vec<DisplayGeometry>,
     pressed: PressedState,
 }
 
@@ -120,10 +124,10 @@ impl MacInputInjector {
         if !accessibility_trusted() {
             return Err(MacPlatformError::AccessibilityDenied);
         }
+        display::passive_process_snapshot()?;
         Ok(Self {
             source: CGEventSource::new(CGEventSourceStateID::Private)
                 .map_err(|()| MacPlatformError::CoreGraphics)?,
-            displays: active_displays()?,
             pressed: PressedState::default(),
         })
     }
@@ -134,7 +138,7 @@ impl MacInputInjector {
     ///
     /// Returns an error when CoreGraphics cannot enumerate valid displays.
     pub fn refresh_displays(&mut self) -> Result<(), MacPlatformError> {
-        self.displays = active_displays()?;
+        display::current_process_snapshot()?;
         Ok(())
     }
 
@@ -143,12 +147,14 @@ impl MacInputInjector {
     /// # Errors
     ///
     /// Returns an error for unsupported keys, unknown displays, or a rejected
-    /// CoreGraphics event operation.
+    /// CoreGraphics event operation. Absolute pointer motion also fails while
+    /// display geometry is dirty; semantic topology-independent events do not.
     pub fn inject(&mut self, input: InputEvent) -> Result<(), MacPlatformError> {
         if !accessibility_trusted() {
             return Err(MacPlatformError::AccessibilityDenied);
         }
-        self.send_event(input)?;
+        let topology = topology_snapshot_for_input(&input, display::clean_process_snapshot)?;
+        self.send_event(input, topology.as_deref())?;
         self.pressed.apply(&input);
         Ok(())
     }
@@ -172,7 +178,7 @@ impl MacInputInjector {
         let mut released_keys = 0_usize;
         let mut released_buttons = 0_usize;
         for release in releases {
-            if self.send_event(release).is_err() {
+            if self.send_event(release, None).is_err() {
                 failed.apply(&pressed_equivalent(release));
             } else {
                 match release {
@@ -200,19 +206,33 @@ impl MacInputInjector {
         self.pressed.is_empty()
     }
 
-    #[must_use]
-    pub fn displays(&self) -> &[DisplayGeometry] {
-        &self.displays
+    /// Returns the exact clean display snapshot currently shared with capture.
+    ///
+    /// # Errors
+    ///
+    /// Fails while display reconfiguration is pending or if monitor state is
+    /// unavailable.
+    pub fn display_snapshot(&self) -> Result<Arc<MacDisplaySnapshot>, MacPlatformError> {
+        display::clean_process_snapshot()
     }
 
-    fn send_event(&self, input: InputEvent) -> Result<(), MacPlatformError> {
+    fn send_event(
+        &self,
+        input: InputEvent,
+        topology: Option<&MacDisplaySnapshot>,
+    ) -> Result<(), MacPlatformError> {
         match input {
             InputEvent::Key {
                 usage,
                 state,
                 modifiers,
             } => self.inject_key(usage, state, modifiers),
-            InputEvent::PointerMotion { position } => self.inject_motion(position),
+            InputEvent::PointerMotion { position } => self.inject_motion(
+                position,
+                topology
+                    .ok_or(MacPlatformError::DisplayConfigurationChanged)?
+                    .displays(),
+            ),
             InputEvent::PointerDelta { delta } => self.inject_delta(delta),
             InputEvent::PointerButton { button, state } => self.inject_button(button, state),
             InputEvent::Scroll {
@@ -246,16 +266,12 @@ impl MacInputInjector {
         Ok(())
     }
 
-    fn inject_motion(&self, position: NormalizedPosition) -> Result<(), MacPlatformError> {
-        let display = self
-            .displays
-            .iter()
-            .find(|display| display.id == position.display())
-            .ok_or(MacPlatformError::UnknownDisplay)?;
-        let point = CGPoint::new(
-            display.origin_x + position.x().to_unit_f64() * display.width_points,
-            display.origin_y + position.y().to_unit_f64() * display.height_points,
-        );
+    fn inject_motion(
+        &self,
+        position: NormalizedPosition,
+        displays: &[DisplayGeometry],
+    ) -> Result<(), MacPlatformError> {
+        let point = point_for_position(position, displays)?;
         let event = CGEvent::new_mouse_event(
             self.source.clone(),
             CGEventType::MouseMoved,
@@ -329,6 +345,19 @@ impl MacInputInjector {
     }
 }
 
+fn topology_snapshot_for_input<T, E>(
+    input: &InputEvent,
+    clean_snapshot: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match input {
+        InputEvent::PointerMotion { .. } => clean_snapshot().map(Some),
+        InputEvent::Key { .. }
+        | InputEvent::PointerDelta { .. }
+        | InputEvent::PointerButton { .. }
+        | InputEvent::Scroll { .. } => Ok(None),
+    }
+}
+
 fn post_tagged(event: &CGEvent) {
     event.set_integer_value_field(
         EventField::EVENT_SOURCE_USER_DATA,
@@ -389,8 +418,205 @@ type CaptureCallback =
     dyn Fn(MacInputCaptureEvent) -> Result<(), MacPlatformError> + Send + Sync + 'static;
 
 struct CaptureRuntime {
-    stop: ffi::NativeInputCaptureStopHandle,
+    stop: Arc<ffi::NativeInputCaptureStopHandle>,
     worker: JoinHandle<Result<(), MacPlatformError>>,
+}
+
+const ROUTING_DISABLE_DEADLINE: Duration = Duration::from_secs(2);
+const CAPTURE_OWNERSHIP_DEADLINE: Duration = Duration::from_secs(2);
+const CAPTURE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+static MAC_INPUT_CAPTURE_POISONED: AtomicBool = AtomicBool::new(false);
+
+fn ensure_capture_process_available(poison: &AtomicBool) -> Result<(), MacPlatformError> {
+    if poison.load(Ordering::Acquire) {
+        Err(MacPlatformError::CaptureProcessPoisoned)
+    } else {
+        Ok(())
+    }
+}
+
+fn finish_capture_worker_before_deadline(
+    worker: JoinHandle<Result<(), MacPlatformError>>,
+    poison: &AtomicBool,
+    deadline: Instant,
+) -> Result<(), MacPlatformError> {
+    while !worker.is_finished() {
+        let now = Instant::now();
+        if now >= deadline {
+            poison.store(true, Ordering::Release);
+            // Detaching is safe only because process-global poison permanently
+            // prevents a replacement capture from starting in this process.
+            drop(worker);
+            return Err(MacPlatformError::CaptureProcessPoisoned);
+        }
+        thread::sleep(CAPTURE_WORKER_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+    worker.join().map_err(|_| MacPlatformError::CaptureThread)?
+}
+
+fn request_startup_stop(startup_stop: &Mutex<Option<Arc<ffi::NativeInputCaptureStopHandle>>>) {
+    let stop = startup_stop
+        .try_lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone));
+    if let Some(stop) = stop {
+        stop.stop();
+    }
+}
+
+struct RoutingGate {
+    enabled: AtomicBool,
+    display_generation: AtomicU64,
+    active_callbacks: AtomicUsize,
+    drain_lock: Mutex<()>,
+    drained: Condvar,
+}
+
+impl Default for RoutingGate {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            display_generation: AtomicU64::new(0),
+            active_callbacks: AtomicUsize::new(0),
+            drain_lock: Mutex::new(()),
+            drained: Condvar::new(),
+        }
+    }
+}
+
+impl RoutingGate {
+    fn enable(&self, display_generation: u64) -> Result<(), MacPlatformError> {
+        if display_generation == 0 || self.active_callbacks.load(Ordering::SeqCst) != 0 {
+            self.invalidate();
+            return Err(MacPlatformError::CaptureCallbackDrainTimedOut);
+        }
+        self.display_generation
+            .store(display_generation, Ordering::SeqCst);
+        self.enabled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn invalidate(&self) {
+        self.enabled.store(false, Ordering::SeqCst);
+        self.display_generation.store(0, Ordering::SeqCst);
+    }
+
+    fn disable_and_drain(&self, timeout: Duration) -> Result<(), MacPlatformError> {
+        self.invalidate();
+        let deadline = Instant::now() + timeout;
+        let mut lock = self
+            .drain_lock
+            .lock()
+            .map_err(|_| MacPlatformError::CaptureCallbackDrainTimedOut)?;
+        while self.active_callbacks.load(Ordering::SeqCst) != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(MacPlatformError::CaptureCallbackDrainTimedOut);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let (next, wait) = self
+                .drained
+                .wait_timeout(lock, remaining)
+                .map_err(|_| MacPlatformError::CaptureCallbackDrainTimedOut)?;
+            lock = next;
+            if wait.timed_out() && self.active_callbacks.load(Ordering::SeqCst) != 0 {
+                return Err(MacPlatformError::CaptureCallbackDrainTimedOut);
+            }
+        }
+        Ok(())
+    }
+
+    fn enter_if(
+        &self,
+        generation_is_current: impl FnOnce(u64) -> bool,
+    ) -> Option<RoutedCallback<'_>> {
+        if !self.enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self
+            .active_callbacks
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                active.checked_add(1)
+            })
+            .is_err()
+        {
+            self.invalidate();
+            return None;
+        }
+        if !self.enabled.load(Ordering::SeqCst) {
+            self.leave_callback();
+            return None;
+        }
+        let generation = self.display_generation.load(Ordering::SeqCst);
+        if generation == 0 || !generation_is_current(generation) {
+            self.invalidate();
+            self.leave_callback();
+            return None;
+        }
+        Some(RoutedCallback {
+            gate: self,
+            display_generation: generation,
+        })
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+            && display::display_generation_is_current(
+                self.display_generation.load(Ordering::SeqCst),
+            )
+    }
+
+    fn leave_callback(&self) {
+        let previous = self.active_callbacks.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(previous != 0, "routed callback accounting underflow");
+        if previous == 1 {
+            if let Ok(_lock) = self.drain_lock.lock() {
+                self.drained.notify_all();
+            } else {
+                self.invalidate();
+            }
+        }
+    }
+}
+
+struct RoutedCallback<'a> {
+    gate: &'a RoutingGate,
+    display_generation: u64,
+}
+
+impl RoutedCallback<'_> {
+    fn remains_current(&self) -> bool {
+        self.remains_current_with(display::display_generation_is_current)
+    }
+
+    fn remains_current_with(&self, generation_is_current: impl FnOnce(u64) -> bool) -> bool {
+        self.gate.enabled.load(Ordering::SeqCst)
+            && self.gate.display_generation.load(Ordering::SeqCst) == self.display_generation
+            && generation_is_current(self.display_generation)
+    }
+}
+
+impl Drop for RoutedCallback<'_> {
+    fn drop(&mut self) {
+        self.gate.leave_callback();
+    }
+}
+
+const fn committed_input_disposition(
+    routed: bool,
+    enqueue_succeeded: bool,
+) -> ffi::NativeCaptureDisposition {
+    if !enqueue_succeeded {
+        ffi::NativeCaptureDisposition::Abort
+    } else if routed {
+        // Routed delivery is transactional at this boundary. Once the
+        // reliable bridge accepted an event while its admission guard is
+        // active, the same physical event must not fall through locally even
+        // if display/routing state becomes dirty before this callback returns.
+        ffi::NativeCaptureDisposition::Suppress
+    } else {
+        ffi::NativeCaptureDisposition::Keep
+    }
 }
 
 /// Owned, restartable current-session `CGEventTap` runtime.
@@ -401,7 +627,7 @@ struct CaptureRuntime {
 /// or callback failure.
 pub struct MacInputCapture {
     callback: Arc<CaptureCallback>,
-    routing_to_peer: Arc<AtomicBool>,
+    routing: Arc<RoutingGate>,
     delivery: CaptureDelivery,
     runtime: Option<CaptureRuntime>,
 }
@@ -472,7 +698,7 @@ impl MacInputCapture {
     ) -> Self {
         Self {
             callback: Arc::new(callback),
-            routing_to_peer: Arc::new(AtomicBool::new(false)),
+            routing: Arc::new(RoutingGate::default()),
             delivery,
             runtime: None,
         }
@@ -483,41 +709,70 @@ impl MacInputCapture {
     /// # Errors
     ///
     /// Fails closed when Accessibility is absent, display discovery fails, a
-    /// tap cannot be installed/enabled, or this handle already owns a runtime.
+    /// tap cannot be installed/enabled, this handle already owns a runtime, or
+    /// any earlier capture could not relinquish process ownership by deadline.
     #[allow(clippy::too_many_lines)]
     pub fn start(&mut self) -> Result<(), MacPlatformError> {
         if self.runtime.is_some() {
             return Err(MacPlatformError::CaptureAlreadyRunning);
         }
+        ensure_capture_process_available(&MAC_INPUT_CAPTURE_POISONED)?;
         if !accessibility_trusted() {
             return Err(MacPlatformError::AccessibilityDenied);
         }
-        let displays = active_displays()?;
+        let deadline = Instant::now() + CAPTURE_OWNERSHIP_DEADLINE;
         let callback = Arc::clone(&self.callback);
-        let routing_to_peer = Arc::clone(&self.routing_to_peer);
+        let routing = Arc::clone(&self.routing);
         let delivery = self.delivery;
-        routing_to_peer.store(false, Ordering::Release);
+        routing.invalidate();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (ownership_tx, ownership_rx) = mpsc::sync_channel(1);
+        let startup_cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&startup_cancelled);
+        let startup_stop = Arc::new(Mutex::new(None));
+        let worker_startup_stop = Arc::clone(&startup_stop);
         let worker = thread::Builder::new()
             .name("nodavo-macos-input".into())
             .spawn(move || {
+                if worker_cancelled.load(Ordering::Acquire)
+                    || ensure_capture_process_available(&MAC_INPUT_CAPTURE_POISONED).is_err()
+                {
+                    let error = MacPlatformError::CaptureProcessPoisoned;
+                    let _ = ready_tx.send(Err(error.clone()));
+                    return Err(error);
+                }
+                let mut display_monitor = match MacDisplayMonitor::start() {
+                    Ok(monitor) => monitor,
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                };
                 let event_callback = Arc::clone(&callback);
-                let event_routing = Arc::clone(&routing_to_peer);
+                let event_routing = Arc::clone(&routing);
                 let Ok(capture) = ffi::NativeInputCapture::new(move |native| match native {
                     ffi::NativeInputEvent::Lifecycle(native) => {
                         let lifecycle = lifecycle_event(native);
+                        if matches!(
+                            lifecycle,
+                            MacInputLifecycleEvent::SystemDidWake
+                                | MacInputLifecycleEvent::ScreensDidWake
+                        ) {
+                            display::mark_wake_dirty();
+                        }
                         if lifecycle_requires_local_recovery(lifecycle) {
-                            event_routing.store(false, Ordering::Release);
+                            event_routing.invalidate();
                         }
                         if event_callback(MacInputCaptureEvent::Lifecycle(lifecycle)).is_err() {
-                            event_routing.store(false, Ordering::Release);
+                            event_routing.invalidate();
                             ffi::NativeCaptureDisposition::Abort
                         } else {
                             ffi::NativeCaptureDisposition::Keep
                         }
                     }
                     native => {
-                        let routing = event_routing.load(Ordering::Acquire);
+                        let routed = event_routing.enter_if(display::display_generation_is_current);
+                        let routing = routed.is_some();
                         let deliver = match delivery {
                             CaptureDelivery::AllAbsolute => true,
                             CaptureDelivery::RoutedRelative => routing,
@@ -540,22 +795,42 @@ impl MacInputCapture {
                                 return ffi::NativeCaptureDisposition::Suppress;
                             }
                             if PointerDelta::new(delta_x, delta_y).is_err() {
-                                event_routing.store(false, Ordering::Release);
+                                event_routing.invalidate();
                                 return ffi::NativeCaptureDisposition::Abort;
                             }
                         }
-                        let Some(input) = convert_native_input(native, &displays, relative_pointer)
-                        else {
+                        let snapshot = if !relative_pointer
+                            && matches!(native, ffi::NativeInputEvent::PointerMotion { .. })
+                        {
+                            let Ok(snapshot) = display::clean_process_snapshot() else {
+                                return ffi::NativeCaptureDisposition::Keep;
+                            };
+                            Some(snapshot)
+                        } else {
+                            None
+                        };
+                        let Some(input) = convert_native_input(
+                            native,
+                            snapshot
+                                .as_deref()
+                                .map_or(&[], MacDisplaySnapshot::displays),
+                            relative_pointer,
+                        ) else {
                             return ffi::NativeCaptureDisposition::Keep;
                         };
-                        if event_callback(MacInputCaptureEvent::Input(input)).is_err() {
-                            event_routing.store(false, Ordering::Release);
-                            ffi::NativeCaptureDisposition::Abort
-                        } else if event_routing.load(Ordering::Acquire) {
-                            ffi::NativeCaptureDisposition::Suppress
-                        } else {
-                            ffi::NativeCaptureDisposition::Keep
+                        if routed
+                            .as_ref()
+                            .is_some_and(|admission| !admission.remains_current())
+                        {
+                            event_routing.invalidate();
+                            return ffi::NativeCaptureDisposition::Keep;
                         }
+                        let enqueue_succeeded =
+                            event_callback(MacInputCaptureEvent::Input(input)).is_ok();
+                        if !enqueue_succeeded {
+                            event_routing.invalidate();
+                        }
+                        committed_input_disposition(routing, enqueue_succeeded)
                     }
                 }) else {
                     let error = if accessibility_trusted() {
@@ -566,17 +841,67 @@ impl MacInputCapture {
                     let _ = ready_tx.send(Err(error.clone()));
                     return Err(error);
                 };
-                let stop = capture
-                    .stop_handle()
-                    .map_err(|()| MacPlatformError::EventTapUnavailable)?;
+                let stop = if let Ok(stop) = capture.stop_handle() {
+                    Arc::new(stop)
+                } else {
+                    let error = MacPlatformError::EventTapUnavailable;
+                    let _ = ready_tx.send(Err(error.clone()));
+                    return Err(error);
+                };
+                let startup_slot_ready = worker_startup_stop
+                    .lock()
+                    .map(|mut slot| *slot = Some(Arc::clone(&stop)))
+                    .is_ok();
+                if !startup_slot_ready {
+                    stop.stop();
+                    let error = MacPlatformError::CaptureThread;
+                    let _ = ready_tx.send(Err(error.clone()));
+                    return Err(error);
+                }
+                if worker_cancelled.load(Ordering::Acquire)
+                    || ensure_capture_process_available(&MAC_INPUT_CAPTURE_POISONED).is_err()
+                {
+                    stop.stop();
+                    return Err(MacPlatformError::CaptureProcessPoisoned);
+                }
                 if let Err(error) =
                     emit_callback(callback.as_ref(), MacInputLifecycleEvent::CaptureStarted)
                 {
                     let _ = ready_tx.send(Err(error.clone()));
                     return Err(error);
                 }
-                if ready_tx.send(Ok(stop)).is_err() {
+                if worker_cancelled.load(Ordering::Acquire)
+                    || ensure_capture_process_available(&MAC_INPUT_CAPTURE_POISONED).is_err()
+                {
+                    stop.stop();
+                    return Err(MacPlatformError::CaptureProcessPoisoned);
+                }
+                if ready_tx.send(Ok(Arc::clone(&stop))).is_err() {
+                    stop.stop();
                     return Err(MacPlatformError::CaptureThread);
+                }
+                if ownership_rx
+                    .recv_timeout(CAPTURE_OWNERSHIP_DEADLINE)
+                    .is_err()
+                {
+                    stop.stop();
+                    return Err(if MAC_INPUT_CAPTURE_POISONED.load(Ordering::Acquire) {
+                        MacPlatformError::CaptureProcessPoisoned
+                    } else {
+                        MacPlatformError::CaptureThread
+                    });
+                }
+                if let Ok(mut slot) = worker_startup_stop.lock() {
+                    slot.take();
+                } else {
+                    stop.stop();
+                    return Err(MacPlatformError::CaptureThread);
+                }
+                if worker_cancelled.load(Ordering::Acquire)
+                    || ensure_capture_process_available(&MAC_INPUT_CAPTURE_POISONED).is_err()
+                {
+                    stop.stop();
+                    return Err(MacPlatformError::CaptureProcessPoisoned);
                 }
                 let result = match capture.run() {
                     ffi::NativeCaptureExit::StopRequested => Ok(()),
@@ -593,31 +918,92 @@ impl MacInputCapture {
                         Err(MacPlatformError::EventTapUnavailable)
                     }
                 };
-                routing_to_peer.store(false, Ordering::Release);
+                routing.invalidate();
                 if result.is_ok() {
                     emit_callback(callback.as_ref(), MacInputLifecycleEvent::CaptureStopped)?;
                 }
-                result
+                drop(capture);
+                let monitor_result = display_monitor.stop();
+                result.and(monitor_result)
             })
             .map_err(|_| MacPlatformError::CaptureThread)?;
 
-        match ready_rx.recv() {
-            Ok(Ok(stop)) => {
+        let ready = ready_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        match ready {
+            Ok(Ok(stop)) if !MAC_INPUT_CAPTURE_POISONED.load(Ordering::Acquire) => {
+                if ownership_tx.send(()).is_err() {
+                    startup_cancelled.store(true, Ordering::Release);
+                    stop.stop();
+                    let stopped = finish_capture_worker_before_deadline(
+                        worker,
+                        &MAC_INPUT_CAPTURE_POISONED,
+                        deadline,
+                    );
+                    return match stopped {
+                        Err(MacPlatformError::CaptureProcessPoisoned) => stopped,
+                        _ => Err(MacPlatformError::CaptureThread),
+                    };
+                }
                 self.runtime = Some(CaptureRuntime { stop, worker });
                 Ok(())
             }
-            Ok(Err(error)) => {
-                let _ = worker.join();
-                Err(error)
+            Ok(Ok(stop)) => {
+                drop(ownership_tx);
+                startup_cancelled.store(true, Ordering::Release);
+                stop.stop();
+                let _ = finish_capture_worker_before_deadline(
+                    worker,
+                    &MAC_INPUT_CAPTURE_POISONED,
+                    deadline,
+                );
+                Err(MacPlatformError::CaptureProcessPoisoned)
             }
-            Err(_) => {
-                let _ = worker.join();
-                Err(MacPlatformError::CaptureThread)
+            Ok(Err(error)) => {
+                drop(ownership_tx);
+                startup_cancelled.store(true, Ordering::Release);
+                request_startup_stop(&startup_stop);
+                match finish_capture_worker_before_deadline(
+                    worker,
+                    &MAC_INPUT_CAPTURE_POISONED,
+                    deadline,
+                ) {
+                    Err(MacPlatformError::CaptureProcessPoisoned) => {
+                        Err(MacPlatformError::CaptureProcessPoisoned)
+                    }
+                    Err(MacPlatformError::CaptureThread) => Err(MacPlatformError::CaptureThread),
+                    Ok(()) | Err(_) => Err(error),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(ownership_tx);
+                startup_cancelled.store(true, Ordering::Release);
+                request_startup_stop(&startup_stop);
+                match finish_capture_worker_before_deadline(
+                    worker,
+                    &MAC_INPUT_CAPTURE_POISONED,
+                    deadline,
+                ) {
+                    Ok(()) => Err(MacPlatformError::CaptureThread),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(ownership_tx);
+                startup_cancelled.store(true, Ordering::Release);
+                MAC_INPUT_CAPTURE_POISONED.store(true, Ordering::Release);
+                request_startup_stop(&startup_stop);
+                drop(worker);
+                Err(MacPlatformError::CaptureProcessPoisoned)
             }
         }
     }
 
     /// Enables or disables suppression for successfully decoded local input.
+    ///
+    /// Disabling first closes routed admission, then waits for every callback
+    /// which could have observed the prior enabled state to finish its
+    /// enqueue/suppression decision. The wait is bounded and remains fail
+    /// closed if an in-flight callback does not drain before the deadline.
     ///
     /// # Errors
     ///
@@ -630,14 +1016,21 @@ impl MacInputCapture {
             if !accessibility_trusted() {
                 return Err(MacPlatformError::AccessibilityDenied);
             }
+            display::clean_process_snapshot()?;
+            let generation = display::clean_display_generation()?;
+            self.routing.enable(generation)?;
+            if !display::display_generation_is_current(generation) {
+                self.routing.invalidate();
+                return Err(MacPlatformError::DisplayConfigurationChanged);
+            }
+            return Ok(());
         }
-        self.routing_to_peer.store(enabled, Ordering::Release);
-        Ok(())
+        self.routing.disable_and_drain(ROUTING_DISABLE_DEADLINE)
     }
 
     #[must_use]
     pub fn routing_to_peer(&self) -> bool {
-        self.routing_to_peer.load(Ordering::Acquire)
+        self.routing.is_enabled()
     }
 
     #[must_use]
@@ -647,22 +1040,33 @@ impl MacInputCapture {
             .is_some_and(|runtime| !runtime.worker.is_finished())
     }
 
-    /// Stops the native run loop and waits for its terminal acknowledgement.
+    /// Stops the native run loop and waits up to two seconds for its terminal
+    /// acknowledgement, including routed-callback drain time.
     ///
     /// # Errors
     ///
     /// Returns the terminal tap/callback failure if the runtime had already
-    /// failed, or a thread error if the worker panicked.
+    /// failed, or permanently poisons capture startup for this process if the
+    /// worker cannot relinquish ownership by the deadline.
     pub fn stop(&mut self) -> Result<(), MacPlatformError> {
-        self.routing_to_peer.store(false, Ordering::Release);
+        let deadline = Instant::now() + CAPTURE_OWNERSHIP_DEADLINE;
+        let routing = self
+            .routing
+            .disable_and_drain(deadline.saturating_duration_since(Instant::now()));
         let Some(runtime) = self.runtime.take() else {
-            return Ok(());
+            return routing;
         };
         runtime.stop.stop();
-        runtime
-            .worker
-            .join()
-            .map_err(|_| MacPlatformError::CaptureThread)?
+        let stopped = finish_capture_worker_before_deadline(
+            runtime.worker,
+            &MAC_INPUT_CAPTURE_POISONED,
+            deadline,
+        );
+        if matches!(stopped, Err(MacPlatformError::CaptureProcessPoisoned)) {
+            stopped
+        } else {
+            routing.and(stopped)
+        }
     }
 
     /// Stops any owned runtime and installs a fresh event tap.
@@ -688,6 +1092,10 @@ impl MacInputCapture {
     }
 
     /// Waits for a naturally terminating runtime without requesting stop.
+    ///
+    /// Unlike [`Self::stop`], this is an explicitly unbounded wait. Callers
+    /// choose it only when they intend to remain blocked until the native tap
+    /// or callback exits naturally.
     ///
     /// # Errors
     ///
@@ -859,6 +1267,20 @@ fn normalize_position(point: CGPoint, displays: &[DisplayGeometry]) -> Option<No
     ))
 }
 
+fn point_for_position(
+    position: NormalizedPosition,
+    displays: &[DisplayGeometry],
+) -> Result<CGPoint, MacPlatformError> {
+    let display = displays
+        .iter()
+        .find(|display| display.id == position.display())
+        .ok_or(MacPlatformError::UnknownDisplay)?;
+    Ok(CGPoint::new(
+        display.origin_x + position.x().to_unit_f64() * display.width_points,
+        display.origin_y + position.y().to_unit_f64() * display.height_points,
+    ))
+}
+
 fn modifiers_to_flags(modifiers: Modifiers) -> CGEventFlags {
     let mut flags = CGEventFlags::empty();
     if modifiers.intersects(Modifiers::LEFT_SHIFT | Modifiers::RIGHT_SHIFT) {
@@ -1019,6 +1441,7 @@ fn keycode_to_hid(keycode: u16) -> Option<HidUsage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nodavo_input::DisplayId;
 
     fn display() -> DisplayGeometry {
         DisplayGeometry {
@@ -1029,6 +1452,7 @@ mod tests {
             height_points: 1_080.0,
             width_pixels: 3_840,
             height_pixels: 2_160,
+            rotation: nodavo_protocol::DisplayRotation::Degrees0,
         }
     }
 
@@ -1140,6 +1564,67 @@ mod tests {
     }
 
     #[test]
+    fn stale_display_identity_never_targets_current_geometry() {
+        let current = display();
+        let stale = NormalizedPosition::new(
+            DisplayId::new(current.id.get() + 1),
+            NormalizedAxis::MIN,
+            NormalizedAxis::MIN,
+        );
+        assert!(matches!(
+            point_for_position(stale, &[current]),
+            Err(MacPlatformError::UnknownDisplay)
+        ));
+    }
+
+    #[test]
+    fn dirty_topology_blocks_only_absolute_pointer_in_pure_admission() {
+        let absolute = InputEvent::PointerMotion {
+            position: NormalizedPosition::new(
+                display().id,
+                NormalizedAxis::MIN,
+                NormalizedAxis::MIN,
+            ),
+        };
+        let blocked: Result<Option<()>, MacPlatformError> =
+            topology_snapshot_for_input(&absolute, || {
+                Err(MacPlatformError::DisplayConfigurationChanged)
+            });
+        assert_eq!(blocked, Err(MacPlatformError::DisplayConfigurationChanged));
+        assert_eq!(
+            topology_snapshot_for_input(&absolute, || Ok::<_, MacPlatformError>(())),
+            Ok(Some(()))
+        );
+
+        let independent = [
+            InputEvent::Key {
+                usage: HidUsage::new(KEYBOARD_PAGE, 0x04),
+                state: KeyState::Pressed,
+                modifiers: Modifiers::empty(),
+            },
+            InputEvent::PointerDelta {
+                delta: PointerDelta::new(1, -1).unwrap(),
+            },
+            InputEvent::PointerButton {
+                button: PointerButton::new(1).unwrap(),
+                state: ButtonState::Pressed,
+            },
+            InputEvent::Scroll {
+                horizontal: 1,
+                vertical: -1,
+                unit: ScrollUnit::Lines,
+            },
+        ];
+        for input in independent {
+            let accepted: Result<Option<()>, MacPlatformError> =
+                topology_snapshot_for_input(&input, || {
+                    Err(MacPlatformError::DisplayConfigurationChanged)
+                });
+            assert_eq!(accepted, Ok(None));
+        }
+    }
+
+    #[test]
     fn only_terminal_lifecycle_events_require_local_recovery() {
         for event in [
             MacInputLifecycleEvent::SystemWillSleep,
@@ -1170,5 +1655,170 @@ mod tests {
             Err(MacPlatformError::CaptureNotRunning)
         );
         assert!(!capture.routing_to_peer());
+    }
+
+    #[test]
+    fn routing_disable_waits_for_in_flight_callback_and_closes_future_admission() {
+        use std::sync::mpsc::TryRecvError;
+
+        let gate = Arc::new(RoutingGate::default());
+        gate.enable(7).unwrap();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let callback_gate = Arc::clone(&gate);
+        let callback = thread::spawn(move || {
+            let admission = callback_gate
+                .enter_if(|generation| generation == 7)
+                .expect("routing was enabled");
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(admission);
+        });
+        entered_rx.recv().unwrap();
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (disabled_tx, disabled_rx) = mpsc::sync_channel(1);
+        let disable_gate = Arc::clone(&gate);
+        let disable = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = disable_gate.disable_and_drain(Duration::from_secs(1));
+            disabled_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while gate.enabled.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(!gate.enabled.load(Ordering::SeqCst));
+        assert_eq!(disabled_rx.try_recv(), Err(TryRecvError::Empty));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(disabled_rx.recv().unwrap(), Ok(()));
+        callback.join().unwrap();
+        disable.join().unwrap();
+        assert!(gate.enter_if(|_| true).is_none());
+    }
+
+    #[test]
+    fn routing_disable_timeout_is_bounded_and_stays_closed() {
+        let gate = RoutingGate::default();
+        gate.enable(7).unwrap();
+        let admission = gate
+            .enter_if(|generation| generation == 7)
+            .expect("routing was enabled");
+
+        assert_eq!(
+            gate.disable_and_drain(Duration::ZERO),
+            Err(MacPlatformError::CaptureCallbackDrainTimedOut)
+        );
+        assert!(!gate.enabled.load(Ordering::SeqCst));
+        assert!(gate.enter_if(|_| true).is_none());
+
+        drop(admission);
+        assert_eq!(gate.disable_and_drain(Duration::from_secs(1)), Ok(()));
+        assert_eq!(gate.enable(7), Ok(()));
+    }
+
+    #[test]
+    fn routing_cannot_reenable_while_timed_out_callback_is_still_active() {
+        let gate = RoutingGate::default();
+        gate.enable(7).unwrap();
+        let admission = gate
+            .enter_if(|generation| generation == 7)
+            .expect("routing was enabled");
+        assert_eq!(
+            gate.disable_and_drain(Duration::ZERO),
+            Err(MacPlatformError::CaptureCallbackDrainTimedOut)
+        );
+        assert_eq!(
+            gate.enable(7),
+            Err(MacPlatformError::CaptureCallbackDrainTimedOut)
+        );
+        assert!(!gate.enabled.load(Ordering::SeqCst));
+        drop(admission);
+    }
+
+    #[test]
+    fn routed_enqueue_commits_one_destination_across_generation_change() {
+        let gate = RoutingGate::default();
+        let generation = AtomicU64::new(7);
+        gate.enable(7).unwrap();
+        let admission = gate
+            .enter_if(|expected| generation.load(Ordering::SeqCst) == expected)
+            .expect("routing was current at admission");
+
+        let reliable_queue = vec!["physical-key-down"];
+        assert_eq!(gate.active_callbacks.load(Ordering::SeqCst), 1);
+        generation.store(8, Ordering::SeqCst);
+        assert!(
+            !admission
+                .remains_current_with(|expected| { generation.load(Ordering::SeqCst) == expected })
+        );
+
+        let disposition = committed_input_disposition(true, true);
+        assert_eq!(disposition, ffi::NativeCaptureDisposition::Suppress);
+        assert_eq!(reliable_queue, ["physical-key-down"]);
+        let local_delivery_count = usize::from(disposition == ffi::NativeCaptureDisposition::Keep);
+        assert_eq!(reliable_queue.len() + local_delivery_count, 1);
+        drop(admission);
+        assert_eq!(gate.active_callbacks.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn routed_enqueue_failure_aborts_without_suppression() {
+        assert_eq!(
+            committed_input_disposition(true, false),
+            ffi::NativeCaptureDisposition::Abort
+        );
+    }
+
+    #[test]
+    fn bounded_capture_finish_joins_clean_worker_without_poison() {
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        release_tx.send(()).unwrap();
+        let poison = AtomicBool::new(false);
+
+        assert_eq!(
+            finish_capture_worker_before_deadline(
+                worker,
+                &poison,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(())
+        );
+        assert!(!poison.load(Ordering::Acquire));
+        assert_eq!(ensure_capture_process_available(&poison), Ok(()));
+    }
+
+    #[test]
+    fn bounded_capture_finish_poisons_before_detaching_stuck_worker() {
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            release_rx.recv().unwrap();
+            Ok(())
+        });
+        let poison = AtomicBool::new(false);
+
+        assert_eq!(
+            finish_capture_worker_before_deadline(
+                worker,
+                &poison,
+                Instant::now() + Duration::from_millis(10),
+            ),
+            Err(MacPlatformError::CaptureProcessPoisoned)
+        );
+        assert!(poison.load(Ordering::Acquire));
+        assert_eq!(
+            ensure_capture_process_available(&poison),
+            Err(MacPlatformError::CaptureProcessPoisoned)
+        );
+
+        // Let the deliberately detached fixture exit. Production poison is
+        // permanent, so a timed-out callback cannot overlap a replacement.
+        release_tx.send(()).unwrap();
     }
 }

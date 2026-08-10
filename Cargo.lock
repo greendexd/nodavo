@@ -1146,6 +1146,7 @@ name = "nodavo-platform-windows"
 version = "0.1.0"
 dependencies = [
  "nodavo-input",
+ "nodavo-protocol",
  "thiserror",
  "tokio",
  "windows",

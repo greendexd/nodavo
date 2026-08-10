@@ -35,6 +35,18 @@ pub enum MacPlatformError {
     UnsupportedKey,
     #[error("the requested display is not active")]
     UnknownDisplay,
+    #[error("the active display configuration changed")]
+    DisplayConfigurationChanged,
+    #[error("the active display graph did not stabilize")]
+    DisplayTopologyUnstable,
+    #[error("the active display graph exceeds the supported bound")]
+    TooManyDisplays,
+    #[error("the CoreGraphics display observer is unavailable")]
+    DisplayMonitorUnavailable,
+    #[error("the CoreGraphics display observer is already running")]
+    DisplayMonitorAlreadyRunning,
+    #[error("the process-local display identity space is exhausted")]
+    DisplayIdentityExhausted,
     #[error("the native event contains an invalid value")]
     InvalidNativeEvent,
     #[error("the macOS input event tap could not be installed or enabled")]
@@ -49,6 +61,10 @@ pub enum MacPlatformError {
     CaptureNotRunning,
     #[error("the input capture callback failed")]
     CaptureCallbackFailed,
+    #[error("an in-flight routed input callback did not drain before the deadline")]
+    CaptureCallbackDrainTimedOut,
+    #[error("capture runtime ownership is poisoned until process restart")]
+    CaptureProcessPoisoned,
     #[error("the input capture worker could not start or terminated unexpectedly")]
     CaptureThread,
     #[error("one or more tracked keys or buttons could not be released")]
@@ -66,6 +82,7 @@ pub struct DisplayGeometry {
     pub height_points: f64,
     pub width_pixels: u64,
     pub height_pixels: u64,
+    pub rotation: nodavo_protocol::DisplayRotation,
 }
 
 /// Content-free readiness observations for the current agent identity.
@@ -87,12 +104,13 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{
     ForceReleaseAcknowledgement, MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES,
-    MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS, MacInputCapture, MacInputCaptureEvent,
-    MacInputInjector, MacInputLifecycleEvent, MacIpcAuthError, MacIpcPeerGuard,
-    MacLocalIpcAuthMode, MacXpcError, MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply,
-    MacXpcRequest, NODAVO_AGENT_MACH_SERVICE, XPC_REPLY_DEADLINE_MILLISECONDS,
-    accessibility_trusted, active_displays, local_ipc_auth_mode, mac_xpc_peer_requirement,
-    probe_readiness, request_accessibility, run_input_capture,
+    MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS, MacDisplayMonitor, MacDisplaySnapshot,
+    MacInputCapture, MacInputCaptureEvent, MacInputInjector, MacInputLifecycleEvent,
+    MacIpcAuthError, MacIpcPeerGuard, MacLocalIpcAuthMode, MacXpcError, MacXpcEvent,
+    MacXpcListener, MacXpcPeerIdentity, MacXpcReply, MacXpcRequest, NODAVO_AGENT_MACH_SERVICE,
+    XPC_REPLY_DEADLINE_MILLISECONDS, accessibility_trusted, active_displays, local_ipc_auth_mode,
+    mac_xpc_peer_requirement, probe_readiness, refresh_display_snapshot, request_accessibility,
+    run_input_capture,
 };
 
 #[cfg(not(target_os = "macos"))]

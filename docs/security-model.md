@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 15 -->
+<!-- doc-id: security-model; lang: en; revision: 16 -->
 
 # Security model
 
@@ -52,6 +52,7 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Emergency disconnect is processed locally and cannot depend on the peer.
 - Lock, sleep, timeout, and disconnect release all keys/buttons and revoke the active lease.
 - Display snapshots are critical, versioned, bounded to 32 records, session-bound, and replay-checked. Native display identifiers remain local; a peer can name only an opaque token installed for this authenticated session.
+- A native display callback is only a coalesced dirty signal. The platform publishes a replacement only after a bounded complete graph stabilizes; retired native identities are never reused. macOS uses CoreGraphics reconfiguration observation, while Windows combines a broadcast-capable hidden window with authoritative full polling and process-wide per-monitor-v2 DPI awareness.
 - Local and peer capability epochs are directionally separate. Inbound input, topology, clipboard, and file metadata must cite the receiver's current persisted local epoch; outbound metadata cites the epoch authenticated from the peer. Reconnect exchanges both sides' complete grants and epochs.
 - Post-pair capability changes use the existing mutually authenticated TLS control stream. They are not described as separately signed: pinned mTLS peer authentication, strict target/epoch validation, and the local OS-protected trust database are the trust boundary. Every accepted change releases affected input/content state and closes the old connection; reconnect must use the persisted policy and newly negotiated epochs.
 
@@ -62,6 +63,9 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Readiness probes are content-free, bounded, cached briefly, and run off the async command dispatcher. They never construct or register a capture runtime; only permission/default-desktop state, display discovery, API capability, and a non-posting injector prerequisite are checked. `ready` is therefore a prerequisite signal, not live capture proof. A timeout or platform error reports unavailable rather than inferring success.
 - The macOS permission command executes only in the authenticated agent identity. Displaying the system prompt is not authorization: its return value is ignored and the UI receives only the result of a new trust and prerequisite probe. Windows has no corresponding permission command, elevation path, or secure-desktop workaround.
 - Session-topology readiness is independent of local display discovery. It becomes ready only after authenticated topology exchange and the exact revision acknowledgement, and resets on disconnect, recovery, revoke, or failure.
+- A local display change immediately blocks new focus. The agent closes native routing admission, waits for in-flight suppression decisions, drains the bounded admitted-input queue under the old lease, forces releases and restores local ownership, installs only the latest validated map, and publishes one replacement revision. Focus cannot resume until the peer acknowledges that exact revision. Snapshot acquisition, sends, and acknowledgement use fixed deadlines that a hot-plug storm cannot extend.
+- Authenticated input for any non-current lease is inert before sequence advancement or native display resolution. Absolute pointer injection is the only topology-sensitive retry and is retained at capacity one for at most one retry; keys, buttons, scroll, relative deltas, and forced releases do not depend on display geometry.
+- Capture and injector teardown are deadline-bounded. A timed-out or fatally failed native owner permanently poisons that process-local runtime so a detached old worker cannot overlap a new session; failed release or ownership restore latches the shared safety state before any later close or readiness publication.
 - Nodavo injection carries a private process tag where the platform supports one. Capture rejects that tag and every event the OS reports as injected, preventing synthetic feedback loops.
 - Keyboard usages, modifiers, media keys, pointer buttons, normalized motion, and line/precise scrolling are validated before injection. Native codes never cross the peer protocol directly.
 - An edge transition uses a critical reliable pointer-entry message. Native suppression and relative deltas remain gated until the receiver validates the lease/session/grant, resolves the session display token, injects the entry position, and returns an authenticated acknowledgement. This prevents a lost or reordered entry datagram from applying deltas at a stale cursor.
