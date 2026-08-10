@@ -1,0 +1,5 @@
+DEVELOPMENT BUILD - NOT FOR DISTRIBUTION
+
+This MSIX bundle uses an ephemeral self-signed certificate. Trust the included
+.cer only on a disposable test machine, then install the bundle for bounded QA.
+Remove the certificate after testing. This artifact is not a Nodavo release.

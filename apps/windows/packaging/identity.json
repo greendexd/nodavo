@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "release": {
+    "packageIdentityName": "dev.nodavo.Nodavo",
+    "displayName": "Nodavo",
+    "description": "Local-first software KVM for macOS and Windows"
+  },
+  "development": {
+    "packageIdentityName": "dev.nodavo.Nodavo.Development",
+    "publisher": "CN=Nodavo Development Only",
+    "publisherDisplayName": "Nodavo Development",
+    "displayName": "Nodavo (Development)",
+    "description": "DEVELOPMENT BUILD - NOT FOR DISTRIBUTION"
+  }
+}

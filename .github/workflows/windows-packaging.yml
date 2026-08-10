@@ -1,0 +1,67 @@
+name: Windows development packaging
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/windows/**"
+      - "crates/nodavo-agent/**"
+      - "crates/nodavo-platform-windows/**"
+      - "scripts/package-windows.ps1"
+      - ".github/workflows/windows-packaging.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    branches: [main, "codex/**"]
+    paths:
+      - "apps/windows/**"
+      - "crates/nodavo-agent/**"
+      - "crates/nodavo-platform-windows/**"
+      - "scripts/package-windows.ps1"
+      - ".github/workflows/windows-packaging.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  package-development:
+    name: Self-signed x64 and ARM64 MSIX bundle
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install the repository Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install .NET 8
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build and verify the development MSIX bundle
+        shell: pwsh
+        run: |
+          $buildNumber = [int64]$env:GITHUB_RUN_NUMBER % 65535
+          if ($buildNumber -eq 0) { $buildNumber = 1 }
+          ./scripts/package-windows.ps1 `
+            -Development `
+            -Version 0.1.0 `
+            -BuildNumber $buildNumber
+
+      - name: Upload development-only package evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nodavo-windows-development-not-for-distribution
+          path: target/windows-packages/*-development/**
+          if-no-files-found: error
+          retention-days: 7
+
+# This workflow intentionally cannot produce a release. The release path in
+# scripts/package-windows.ps1 is fail-closed and requires an identity-validated
+# Authenticode certificate plus an RFC 3161 timestamp service. Store submission,
+# release signing, and clean-machine qualification are separate 1.0 gates.

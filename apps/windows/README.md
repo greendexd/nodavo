@@ -1,4 +1,4 @@
-<!-- doc-id: windows-app; lang: en; revision: 3 -->
+<!-- doc-id: windows-app; lang: en; revision: 5 -->
 
 # Nodavo for Windows
 
@@ -28,9 +28,42 @@ For an unpackaged development build:
 dotnet build apps/windows/Nodavo.Windows.sln -c Release -p:Platform=x64 -p:NodavoPackageMode=Unpackaged
 ```
 
-Use `ARM64` and `win-arm64` on native Windows ARM64 build hardware. The included publish profiles are development inputs, not signed release definitions.
+Use `ARM64` and `win-arm64` for a direct native Windows ARM64 build. The packaging workflow may cross-build that payload on an x64 Windows runner, but only real ARM64 hardware can qualify its runtime. The included publish profiles are development inputs, not signed release definitions.
 
 An unpackaged build requires the matching Windows App Runtime to be installed. Producing an installable public MSIX requires a real publisher identity and Authenticode certificate; neither is included in the repository.
+
+## x64 and ARM64 MSIX packaging
+
+The packaging script builds self-contained WinUI and Rust agent payloads for x64 and ARM64, creates one MSIX per architecture, combines them into a bundle, checks the manifest and PE architectures, and refuses private-key files in the package. It never installs a service or requests elevation: the Win32 manifests stay `asInvoker`, the package runs at `mediumIL`, installation is per-user, and login/UAC secure-desktop/Session 0 control remains excluded.
+
+For a clearly labeled self-signed development artifact on Windows:
+
+```powershell
+pwsh -NoProfile -File scripts/package-windows.ps1 `
+  -Development -Version 0.1.0 -BuildNumber 1
+```
+
+The result is written below `target/windows-packages/0.1.0.1-development/`. Both the bundle filename and package contents say `DEVELOPMENT-NOT-FOR-DISTRIBUTION`. The script creates a short-lived certificate, verifies the signature while that certificate is temporarily trusted, exports only the public `.cer`, and removes its private key from the certificate store. App Installer requires the test certificate in the local machine `TrustedPeople` store, which needs administrator approval even though MSIX itself installs per-user. Do that only on a disposable test machine and remove the certificate after testing.
+
+Release mode is deliberately fail-closed. It requires all of these environment variables and refuses to build if any is absent or inconsistent:
+
+- `WINDOWS_PACKAGE_PUBLISHER`: exact X.509 subject written to the package manifest.
+- `WINDOWS_PUBLISHER_DISPLAY_NAME`: public publisher name.
+- `WINDOWS_SIGNING_PFX`: identity-validated Authenticode PFX path.
+- `WINDOWS_SIGNING_PFX_PASSWORD`: PFX password. The script copies it into a `SecureString` and deletes the process environment variable before invoking Rust, .NET, or other build tooling; it is never passed on the SignTool command line.
+- `WINDOWS_TIMESTAMP_URL`: HTTPS RFC 3161 timestamp endpoint.
+- `WINDOWS_SIGNING_CHAIN_ALLOWLIST`: comma- or semicolon-separated allowlist of reviewed 40-hex certificate thumbprints. The validated chain's immediate issuing CA or trust root must match one entry; do not list only the signing leaf.
+
+```powershell
+pwsh -NoProfile -File scripts/package-windows.ps1 `
+  -Version 1.0.0 -BuildNumber 1
+```
+
+Release packaging builds and inspects the unsigned bundle before loading the PFX. It then requires exactly one private-key leaf, rejects self-signed and CA certificates, checks the exact subject, validity, and Code Signing EKU, performs online revocation and trusted-chain validation, and requires the immediate issuer or root to match `WINDOWS_SIGNING_CHAIN_ALLOWLIST`. Before importing the PFX, it snapshots `CurrentUser/My`; its `finally` cleanup removes the complete certificate delta even if import, validation, signing, or verification fails. The script signs only the final MSIX bundle, retains SignTool chain/timestamp verification, unpacks it again, and rechecks the identity, display name, x64/ARM64 payloads, exact two-capability multiset, development-marker absence, and secret-file absence. No release certificate or password is stored in the repository or artifact.
+
+The package declares only LAN access (`privateNetworkClientServer`) and the `runFullTrust` capability required by a desktop `mediumIL` package. It does not request broad filesystem, location, camera, microphone, enterprise-authentication, service, UAC, or secure-desktop capability. The included `app.manifest` explicitly requests `asInvoker` with `uiAccess=false`.
+
+The separate Windows packaging workflow proves only that the self-signed development path can assemble and verify an x64/ARM64 bundle on a Windows runner. Its artifact retention is short and its name says that it is not for distribution. The workflow has no release credentials and cannot produce a release.
 
 ## Local IPC contract
 
@@ -38,8 +71,12 @@ The UI connects to `\\.\pipe\nodavo-agent-{current-user-SID}` using .NET's curre
 
 ## Current limitations
 
-This source has not been compiled, linked, or run on Windows from the current macOS development host. XML, resource parity, and source-level invariants can be checked here, but Windows CI and real Windows x64/ARM64 machines are required for build and runtime evidence.
+This source cannot be compiled, linked, or run on the current macOS development host. The x64 WinUI source is compile-checked by Windows CI, while the packaging workflow is the required build evidence for the complete x64/ARM64 development bundle. CI remains compile/package evidence rather than interactive runtime qualification.
 
-The Rust source now includes a same-user/session validated named-pipe server and DPAPI-protected identity/trust storage, and this shell includes the matching pairing flow. They cross-compile or pass source/XML checks from macOS, but have not yet been linked or run together on Windows; runtime success is therefore not claimed. Trusted-device permissions/revocation UI, layout editing, input routing, clipboard, transfers, tray integration, autostart, diagnostics, updates, installers, and signing remain under implementation. `Package.appxmanifest` uses a development publisher and package version and must not be distributed as a stable release.
+The Rust source now includes a same-user/session validated named-pipe server and DPAPI-protected identity/trust storage, and this shell includes the matching pairing flow. They compile or pass source/XML checks, but have not yet been run together on qualified real Windows x64 and ARM64 systems; runtime success is therefore not claimed. The packaged agent lifecycle/autostart UX, trusted-device permissions/revocation UI, layout editing, full input routing, clipboard, transfers, tray integration, diagnostics, updates, and production signing remain under implementation. `Package.appxmanifest` is development-only and uses a separate identity so it cannot be confused with or upgrade over a public release.
+
+Remaining release gates are exact and external: reserve/freeze the final Microsoft Store package identity and publisher in Partner Center; obtain Store approval for `runFullTrust` or use an identity-validated direct-distribution certificate; configure protected signing credentials and a reliable RFC 3161 endpoint; run clean install, upgrade, downgrade rejection, uninstall, certificate-expiry, tamper, rollback, and real x64/ARM64 runtime matrices; publish stable HTTPS artifacts and hashes before authoring a WinGet manifest. No MSI is emitted because Nodavo has not yet justified a second installer technology, tested its per-user upgrade/uninstall semantics, or qualified a WiX/MSI toolchain. MSI and portable ZIP remain optional decisions, not release claims.
+
+Packaging design provenance is limited to Nodavo's own requirements and Microsoft's official documentation for [single-project MSIX automation](https://learn.microsoft.com/windows/apps/windows-app-sdk/single-project-msix), [package identity](https://learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview), [desktop package capabilities](https://learn.microsoft.com/windows/apps/package-and-deploy/app-capability-declarations), and [MSIX signing and timestamping](https://learn.microsoft.com/windows/msix/package/signing-package-overview). No third-party KVM installer source or assets were used.
 
 The UI and IPC code are original clean-room work derived from Nodavo's own architecture and local IPC contract; no third-party KVM source or assets were used.

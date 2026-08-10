@@ -1,4 +1,4 @@
-<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 3 -->
+<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 5 -->
 
 # Nodavo для Windows
 
@@ -28,9 +28,42 @@ dotnet build apps/windows/Nodavo.Windows.sln -c Release -p:Platform=x64
 dotnet build apps/windows/Nodavo.Windows.sln -c Release -p:Platform=x64 -p:NodavoPackageMode=Unpackaged
 ```
 
-Используйте `ARM64` и `win-arm64` на настоящем сборочном компьютере Windows ARM64. Добавленные publish-профили предназначены для разработки, а не для подписанного релиза.
+Используйте `ARM64` и `win-arm64` для прямой нативной сборки на Windows ARM64. Workflow упаковки может cross-build этот payload на x64 Windows runner, но квалифицировать его runtime можно только на настоящем ARM64-устройстве. Добавленные publish-профили предназначены для разработки, а не для подписанного релиза.
 
 Для запуска неупакованной сборки требуется соответствующий Windows App Runtime. Для публичного устанавливаемого MSIX нужны настоящая издательская идентификация и сертификат Authenticode; в репозитории их нет.
+
+## Упаковка MSIX для x64 и ARM64
+
+Скрипт упаковки собирает self-contained WinUI и Rust agent для x64 и ARM64, создаёт MSIX для каждой архитектуры, объединяет их в bundle, проверяет манифест и архитектуры PE и запрещает файлы приватных ключей внутри пакета. Он не устанавливает службу и не запрашивает повышение прав: Win32-манифесты остаются `asInvoker`, пакет работает на `mediumIL`, установка выполняется для текущего пользователя, а управление экраном входа/UAC secure desktop/Session 0 остаётся исключённым.
+
+Для явно помеченного самоподписанного тестового артефакта на Windows:
+
+```powershell
+pwsh -NoProfile -File scripts/package-windows.ps1 `
+  -Development -Version 0.1.0 -BuildNumber 1
+```
+
+Результат появится в `target/windows-packages/0.1.0.1-development/`. И имя bundle, и содержимое пакета содержат пометку `DEVELOPMENT-NOT-FOR-DISTRIBUTION`. Скрипт создаёт краткосрочный сертификат, проверяет подпись с временным доверием к нему, экспортирует только публичный `.cer` и удаляет приватный ключ из хранилища сертификатов. Для App Installer тестовый сертификат требуется в machine-wide хранилище `TrustedPeople`, что запрашивает подтверждение администратора, хотя сам MSIX устанавливается для текущего пользователя. Делайте это только на отдельной тестовой машине и удаляйте сертификат после проверки.
+
+Release-режим намеренно работает fail-closed. Он требует все перечисленные переменные окружения и отказывается собирать пакет, если хотя бы одна отсутствует или не согласована:
+
+- `WINDOWS_PACKAGE_PUBLISHER`: точный X.509 subject, записываемый в манифест пакета.
+- `WINDOWS_PUBLISHER_DISPLAY_NAME`: публичное имя издателя.
+- `WINDOWS_SIGNING_PFX`: путь к identity-validated Authenticode PFX.
+- `WINDOWS_SIGNING_PFX_PASSWORD`: пароль PFX. Скрипт копирует его в `SecureString` и удаляет переменную окружения процесса до запуска Rust, .NET и других инструментов сборки; пароль не передаётся SignTool в командной строке.
+- `WINDOWS_TIMESTAMP_URL`: HTTPS endpoint RFC 3161 timestamp.
+- `WINDOWS_SIGNING_CHAIN_ALLOWLIST`: разделённый запятыми или точками с запятой allowlist проверенных 40-символьных hex-thumbprint сертификатов. Непосредственный issuing CA или корневой сертификат проверенной цепочки должен совпасть с одной записью; одного thumbprint подписывающего leaf недостаточно.
+
+```powershell
+pwsh -NoProfile -File scripts/package-windows.ps1 `
+  -Version 1.0.0 -BuildNumber 1
+```
+
+Release-путь собирает и проверяет неподписанный bundle до загрузки PFX. Затем он требует ровно один leaf с приватным ключом, отклоняет самоподписанные и CA-сертификаты, проверяет точный subject, срок действия и Code Signing EKU, выполняет online-проверку отзыва и доверенной цепочки и требует совпадения непосредственного issuer или root с `WINDOWS_SIGNING_CHAIN_ALLOWLIST`. Перед импортом PFX скрипт сохраняет снимок `CurrentUser/My`; cleanup в `finally` удаляет полную дельту сертификатов даже при сбое импорта, проверки, подписи или верификации. Скрипт подписывает только итоговый MSIX bundle, сохраняет проверку цепочки/timestamp через SignTool, повторно распаковывает результат и проверяет identity, display name, x64/ARM64 payload, точный multiset из двух capabilities, отсутствие development-маркера и секретных файлов. Сертификат и пароль релиза не сохраняются ни в репозитории, ни в артефакте.
+
+Пакет объявляет только доступ к LAN (`privateNetworkClientServer`) и capability `runFullTrust`, необходимую desktop-пакету `mediumIL`. Он не запрашивает broad filesystem, location, camera, microphone, enterprise authentication, службу, UAC или secure desktop. Включённый `app.manifest` явно запрашивает `asInvoker` с `uiAccess=false`.
+
+Отдельный workflow упаковки Windows доказывает только способность self-signed development-пути собрать и проверить x64/ARM64 bundle на Windows runner. Срок хранения такого артефакта короткий, а в имени указано, что он не предназначен для распространения. У workflow нет release credentials, и он не может создать релиз.
 
 ## Контракт локального IPC
 
@@ -38,8 +71,12 @@ dotnet build apps/windows/Nodavo.Windows.sln -c Release -p:Platform=x64 -p:Nodav
 
 ## Текущие ограничения
 
-На текущем macOS-компьютере исходники не компилировались, не линковались и не запускались под Windows. Здесь можно проверить XML, соответствие локализаций и инварианты исходного кода, но подтверждение сборки и runtime требует Windows CI и настоящих компьютеров Windows x64/ARM64.
+На текущем macOS-компьютере исходники нельзя компилировать, линковать или запускать под Windows. WinUI x64 compile-проверяется в Windows CI, а обязательным свидетельством сборки полного development bundle x64/ARM64 служит workflow упаковки. CI остаётся подтверждением компиляции/упаковки, но не интерактивного runtime.
 
-В исходниках Rust уже есть сервер named pipe с проверкой того же пользователя/сеанса и защищённое DPAPI-хранилище идентификаторов/доверия, а в этой оболочке — соответствующий сценарий сопряжения. На macOS они проходят cross-compile или проверки исходников/XML, но ещё не были слинкованы и запущены вместе на Windows, поэтому успешный runtime не заявляется. Интерфейс разрешений/отзыва доверенных устройств, редактирование расположения, маршрутизация ввода, буфер, передачи, трей, автозапуск, диагностика, обновления, установщики и подпись ещё разрабатываются. В `Package.appxmanifest` указаны тестовые издатель и версия пакета; такую сборку нельзя распространять как стабильный релиз.
+В исходниках Rust уже есть сервер named pipe с проверкой того же пользователя/сеанса и защищённое DPAPI-хранилище идентификаторов/доверия, а в этой оболочке — соответствующий сценарий сопряжения. Они компилируются или проходят проверки исходников/XML, но ещё не запускались вместе на квалифицированных настоящих Windows x64 и ARM64, поэтому успешный runtime не заявляется. Управление lifecycle/autostart упакованного agent, интерфейс разрешений/отзыва доверенных устройств, редактирование расположения, полная маршрутизация ввода, буфер, передачи, трей, диагностика, обновления и production signing ещё разрабатываются. `Package.appxmanifest` предназначен только для разработки и использует отдельный identity, поэтому его нельзя перепутать с публичным релизом или обновить им релиз.
+
+Оставшиеся release gates точны и требуют внешней инфраструктуры: зарезервировать и зафиксировать окончательные Store package identity и publisher в Partner Center; получить Store approval для `runFullTrust` либо использовать identity-validated сертификат прямой дистрибуции; настроить защищённые signing credentials и надёжный endpoint RFC 3161; выполнить матрицы чистой установки, обновления, запрета downgrade, удаления, истечения сертификата, tamper, rollback и реального runtime x64/ARM64; опубликовать стабильные HTTPS-артефакты и хэши до создания WinGet manifest. MSI не создаётся, потому что Nodavo ещё не обосновал вторую технологию установки, не проверил её per-user upgrade/uninstall semantics и не квалифицировал WiX/MSI toolchain. MSI и portable ZIP остаются опциональными решениями, а не заявленными релизами.
+
+Происхождение дизайна упаковки ограничено собственными требованиями Nodavo и официальной документацией Microsoft по [автоматизации single-project MSIX](https://learn.microsoft.com/windows/apps/windows-app-sdk/single-project-msix), [package identity](https://learn.microsoft.com/windows/apps/desktop/modernize/package-identity-overview), [capabilities desktop-пакета](https://learn.microsoft.com/windows/apps/package-and-deploy/app-capability-declarations) и [подписи/timestamp MSIX](https://learn.microsoft.com/windows/msix/package/signing-package-overview). Исходники и ресурсы установщиков сторонних KVM-продуктов не использовались.
 
 Интерфейс и IPC-код — оригинальная clean-room разработка на основе собственной архитектуры и контракта локального IPC Nodavo; исходники и ресурсы сторонних KVM-продуктов не использовались.
