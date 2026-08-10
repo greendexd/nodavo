@@ -6,6 +6,7 @@ umask 077
 
 APP_BUNDLE_ID="dev.nodavo.macos"
 AGENT_BUNDLE_ID="dev.nodavo.agent"
+MACH_SERVICE_NAME="dev.nodavo.agent.ipc"
 MINIMUM_MACOS_VERSION="13.0"
 SWIFT_RESOURCE_BUNDLE="NodavoMac_NodavoMac.bundle"
 
@@ -23,11 +24,14 @@ Release mode (default) requires all of:
   MACOS_NOTARY_PROFILE             notarytool Keychain profile name
 
 Release mode signs with the hardened runtime, notarizes both the app and DMG,
-staples their tickets, and fails unless Gatekeeper accepts both artifacts.
+staples their tickets, and fails unless Gatekeeper accepts both artifacts. The
+UI profile does not need the agent's Keychain access group; the helper profile
+must authorize it.
 
---development creates an ad-hoc signed, non-notarized artifact. It has no
-restricted Keychain entitlements, does not register the embedded LaunchAgent,
-and is explicitly labeled NOT FOR DISTRIBUTION.
+--development creates an ad-hoc signed, non-notarized artifact with the
+compile-time same-user UDS IPC verification bypass. It has no restricted Keychain
+entitlements, does not register the embedded LaunchAgent, and is explicitly
+labeled NOT FOR DISTRIBUTION.
 USAGE
 }
 
@@ -48,6 +52,7 @@ render_template() {
         -e "s|@BUILD_NUMBER@|${BUILD_NUMBER}|g" \
         -e "s|@DISPLAY_NAME@|${DISPLAY_NAME}|g" \
         -e "s|@DEVELOPMENT_BOOL@|${DEVELOPMENT_BOOL}|g" \
+        -e "s|@MACH_SERVICE_BOOL@|${MACH_SERVICE_BOOL}|g" \
         -e "s|@TEAM_ID@|${TEAM_ID}|g" \
         -e "s|@KEYCHAIN_ACCESS_GROUP@|${KEYCHAIN_ACCESS_GROUP}|g" \
         "$source" >"$destination"
@@ -57,6 +62,7 @@ validate_profile() {
     local profile=$1
     local expected_identifier=$2
     local decoded=$3
+    local require_keychain_group=$4
 
     security cms -D -i "$profile" >"$decoded" 2>/dev/null \
         || fail "could not decode provisioning profile: $profile"
@@ -74,9 +80,11 @@ validate_profile() {
     [[ "$profile_identifier" == "${TEAM_ID}.${expected_identifier}" ]] \
         || fail "provisioning profile does not authorize ${expected_identifier}"
 
-    /usr/libexec/PlistBuddy -c "Print :Entitlements:keychain-access-groups" "$decoded" 2>/dev/null \
-        | grep -F -x -q "    ${KEYCHAIN_ACCESS_GROUP}" \
-        || fail "provisioning profile does not authorize ${KEYCHAIN_ACCESS_GROUP}"
+    if [[ "$require_keychain_group" == "true" ]]; then
+        /usr/libexec/PlistBuddy -c "Print :Entitlements:keychain-access-groups" "$decoded" 2>/dev/null \
+            | grep -F -x -q "    ${KEYCHAIN_ACCESS_GROUP}" \
+            || fail "provisioning profile does not authorize ${KEYCHAIN_ACCESS_GROUP}"
+    fi
 
     python3 - "$decoded" <<'PY'
 import datetime
@@ -219,15 +227,17 @@ if [[ "$MODE" == "release" ]]; then
     KEYCHAIN_ACCESS_GROUP="${TEAM_ID}.${AGENT_BUNDLE_ID}"
     DISPLAY_NAME="Nodavo"
     DEVELOPMENT_BOOL="false"
+    MACH_SERVICE_BOOL="true"
     validate_profile "$MACOS_APP_PROVISIONING_PROFILE" "$APP_BUNDLE_ID" \
-        "${BUILD_ROOT}/app-profile.plist"
+        "${BUILD_ROOT}/app-profile.plist" false
     validate_profile "$MACOS_AGENT_PROVISIONING_PROFILE" "$AGENT_BUNDLE_ID" \
-        "${BUILD_ROOT}/agent-profile.plist"
+        "${BUILD_ROOT}/agent-profile.plist" true
 else
     TEAM_ID="DEVELOPMENT"
     KEYCHAIN_ACCESS_GROUP="DEVELOPMENT-NOT-ENTITLED.${AGENT_BUNDLE_ID}"
     DISPLAY_NAME="Nodavo Development (Not for Distribution)"
     DEVELOPMENT_BOOL="true"
+    MACH_SERVICE_BOOL="false"
 fi
 
 export COPYFILE_DISABLE=1
@@ -240,12 +250,21 @@ export CARGO_PROFILE_RELEASE_STRIP=none
 
 SWIFT_ARM_SCRATCH="${BUILD_ROOT}/swift-arm64"
 SWIFT_X86_SCRATCH="${BUILD_ROOT}/swift-x86_64"
+SWIFT_BUILD_FLAGS=()
+RUST_AUTH_FEATURES=(--no-default-features)
+if [[ "$MODE" == "release" ]]; then
+    export NODAVO_APPLE_TEAM_ID="$TEAM_ID"
+else
+    unset NODAVO_APPLE_TEAM_ID
+    SWIFT_BUILD_FLAGS=(-Xswiftc -DNODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC)
+    RUST_AUTH_FEATURES+=(--features development-unverified-local-ipc)
+fi
 swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIFT_ARM_SCRATCH" \
     --configuration release --triple "arm64-apple-macosx${MINIMUM_MACOS_VERSION}" \
-    --product Nodavo --disable-index-store
+    --product Nodavo --disable-index-store "${SWIFT_BUILD_FLAGS[@]}"
 swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIFT_X86_SCRATCH" \
     --configuration release --triple "x86_64-apple-macosx${MINIMUM_MACOS_VERSION}" \
-    --product Nodavo --disable-index-store
+    --product Nodavo --disable-index-store "${SWIFT_BUILD_FLAGS[@]}"
 SWIFT_ARM_BIN=$(swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIFT_ARM_SCRATCH" \
     --configuration release --triple "arm64-apple-macosx${MINIMUM_MACOS_VERSION}" --show-bin-path)
 SWIFT_X86_BIN=$(swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIFT_X86_SCRATCH" \
@@ -253,8 +272,10 @@ SWIFT_X86_BIN=$(swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIF
 
 RUST_TARGET_DIRECTORY="${BUILD_ROOT}/rust"
 CARGO_TARGET_DIR="$RUST_TARGET_DIRECTORY" cargo build --locked --release -p nodavo-agent \
+    "${RUST_AUTH_FEATURES[@]}" \
     --target aarch64-apple-darwin
 CARGO_TARGET_DIR="$RUST_TARGET_DIRECTORY" cargo build --locked --release -p nodavo-agent \
+    "${RUST_AUTH_FEATURES[@]}" \
     --target x86_64-apple-darwin
 
 UNIVERSAL_DIRECTORY="${BUILD_ROOT}/universal"
@@ -270,6 +291,31 @@ verify_universal "${UNIVERSAL_DIRECTORY}/Nodavo"
 verify_universal "${UNIVERSAL_DIRECTORY}/nodavo-agent"
 verify_system_dependencies "${UNIVERSAL_DIRECTORY}/Nodavo"
 verify_system_dependencies "${UNIVERSAL_DIRECTORY}/nodavo-agent"
+
+AGENT_SELF_CHECK=$(python3 - "${UNIVERSAL_DIRECTORY}/nodavo-agent" <<'PY'
+import subprocess
+import sys
+
+try:
+    result = subprocess.run(
+        [sys.argv[1], "--self-check"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+except (subprocess.SubprocessError, OSError):
+    raise SystemExit(1)
+print(result.stdout.strip())
+PY
+) || fail "agent local IPC policy self-check failed"
+if [[ "$MODE" == "release" ]]; then
+    [[ "$AGENT_SELF_CHECK" == "nodavo-agent: xpc-signed-mutual-local-ipc" ]] \
+        || fail "release agent does not select signed mutual XPC local IPC"
+else
+    [[ "$AGENT_SELF_CHECK" == "nodavo-agent: development-unverified-uds-local-ipc" ]] \
+        || fail "development agent does not contain the explicit UDS IPC bypass"
+fi
 
 APP_PATH="${BUILD_ROOT}/Nodavo.app"
 HELPER_APP="${APP_PATH}/Contents/Library/Helpers/NodavoAgent.app"
@@ -311,7 +357,8 @@ else
     AGENT_ENTITLEMENTS="${PACKAGING_SOURCE}/Development.entitlements"
     cat >"${APP_PATH}/Contents/Resources/DEVELOPMENT-NOT-FOR-DISTRIBUTION.txt" <<'NOTICE'
 This is an ad-hoc signed development build. It is not notarized, has no
-provisioned Keychain access, and must not be distributed as a release.
+provisioned Keychain access, includes an unsafe same-user UDS IPC bypass,
+and must not be distributed as a release.
 NOTICE
 fi
 
@@ -327,6 +374,25 @@ find "$APP_PATH" -name '*.plist' -print0 | while IFS= read -r -d '' plist; do
 done
 plutil -lint "${APP_PATH}/Contents/Resources/en.lproj/InfoPlist.strings" >/dev/null
 plutil -lint "${APP_PATH}/Contents/Resources/ru.lproj/InfoPlist.strings" >/dev/null
+python3 - \
+    "${APP_PATH}/Contents/Info.plist" \
+    "${APP_PATH}/Contents/Library/LaunchAgents/dev.nodavo.agent.plist" \
+    "$MODE" "$TEAM_ID" "$MACH_SERVICE_NAME" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    app = plistlib.load(source)
+with open(sys.argv[2], "rb") as source:
+    launch_agent = plistlib.load(source)
+mode, team_id, service = sys.argv[3:]
+if app.get("NodavoAgentMachService") != service:
+    raise SystemExit("app does not bind the fixed agent Mach service")
+if app.get("NodavoAppleTeamIdentifier") != team_id:
+    raise SystemExit("app does not bind the build Team ID")
+if launch_agent.get("MachServices") != {service: mode == "release"}:
+    raise SystemExit("LaunchAgent MachServices mode does not match packaging mode")
+PY
 
 SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C "$REPOSITORY_ROOT" log -1 --format=%ct)}
 [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]] || fail "SOURCE_DATE_EPOCH must be an integer"
@@ -336,16 +402,77 @@ find "$APP_PATH" -exec touch -h -t "$NORMALIZED_TIME" {} +
 sign_path "${APP_PATH}/Contents/Resources/${SWIFT_RESOURCE_BUNDLE}"
 sign_path "$HELPER_APP" "$AGENT_ENTITLEMENTS" "$AGENT_BUNDLE_ID"
 sign_path "$APP_PATH" "$APP_ENTITLEMENTS" "$APP_BUNDLE_ID"
-codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+codesign --verify --strict --all-architectures --verbose=2 "$HELPER_APP"
+codesign --verify --deep --strict --all-architectures --verbose=2 "$APP_PATH"
 
 [[ $(plutil -extract CFBundleIdentifier raw "${APP_PATH}/Contents/Info.plist") == "$APP_BUNDLE_ID" ]]
 [[ $(plutil -extract CFBundleIdentifier raw "${HELPER_APP}/Contents/Info.plist") == "$AGENT_BUNDLE_ID" ]]
-[[ $(plutil -extract NodavoKeychainAccessGroup raw "${APP_PATH}/Contents/Info.plist") \
+[[ $(plutil -extract NodavoKeychainAccessGroup raw "${HELPER_APP}/Contents/Info.plist") \
     == "$KEYCHAIN_ACCESS_GROUP" ]]
 [[ -f "${APP_PATH}/Contents/Resources/${SWIFT_RESOURCE_BUNDLE}/Contents/Resources/en.lproj/Localizable.strings" ]]
 [[ -f "${APP_PATH}/Contents/Resources/${SWIFT_RESOURCE_BUNDLE}/Contents/Resources/ru.lproj/Localizable.strings" ]]
 
 if [[ "$MODE" == "release" ]]; then
+    UI_REQUIREMENT="anchor apple generic and identifier \"${APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"${TEAM_ID}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and entitlement[\"com.apple.application-identifier\"] = \"${TEAM_ID}.${APP_BUNDLE_ID}\" and entitlement[\"com.apple.developer.team-identifier\"] = \"${TEAM_ID}\" and entitlement[\"com.apple.security.get-task-allow\"] absent"
+    AGENT_REQUIREMENT="anchor apple generic and identifier \"${AGENT_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"${TEAM_ID}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and entitlement[\"com.apple.application-identifier\"] = \"${TEAM_ID}.${AGENT_BUNDLE_ID}\" and entitlement[\"com.apple.developer.team-identifier\"] = \"${TEAM_ID}\" and entitlement[\"com.apple.security.get-task-allow\"] absent"
+    codesign --verify --strict --all-architectures -R="$UI_REQUIREMENT" "$APP_PATH"
+    codesign --verify --strict --all-architectures -R="$AGENT_REQUIREMENT" "$HELPER_APP"
+
+    UI_SIGNING_DETAILS=$(codesign -d --verbose=4 "$APP_PATH" 2>&1)
+    AGENT_SIGNING_DETAILS=$(codesign -d --verbose=4 "$HELPER_APP" 2>&1)
+    grep -F -x -q "Identifier=${APP_BUNDLE_ID}" <<<"$UI_SIGNING_DETAILS" \
+        || fail "signed UI identifier is not ${APP_BUNDLE_ID}"
+    grep -F -x -q "TeamIdentifier=${TEAM_ID}" <<<"$UI_SIGNING_DETAILS" \
+        || fail "signed UI TeamIdentifier does not match APPLE_TEAM_ID"
+    grep -E -q '^CodeDirectory .*flags=.*\(runtime\)' <<<"$UI_SIGNING_DETAILS" \
+        || fail "signed UI does not enable the hardened runtime"
+    grep -F -x -q "Identifier=${AGENT_BUNDLE_ID}" <<<"$AGENT_SIGNING_DETAILS" \
+        || fail "signed agent identifier is not ${AGENT_BUNDLE_ID}"
+    grep -F -x -q "TeamIdentifier=${TEAM_ID}" <<<"$AGENT_SIGNING_DETAILS" \
+        || fail "signed agent TeamIdentifier does not match APPLE_TEAM_ID"
+    grep -E -q '^CodeDirectory .*flags=.*\(runtime\)' <<<"$AGENT_SIGNING_DETAILS" \
+        || fail "signed agent does not enable the hardened runtime"
+
+    UI_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/ui-actual-entitlements.plist"
+    AGENT_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/agent-actual-entitlements.plist"
+    codesign -d --entitlements :- "$APP_PATH" >"$UI_ACTUAL_ENTITLEMENTS" 2>/dev/null
+    codesign -d --entitlements :- "$HELPER_APP" >"$AGENT_ACTUAL_ENTITLEMENTS" 2>/dev/null
+    plutil -lint "$UI_ACTUAL_ENTITLEMENTS" >/dev/null
+    plutil -lint "$AGENT_ACTUAL_ENTITLEMENTS" >/dev/null
+    [[ $(/usr/libexec/PlistBuddy -c "Print :com.apple.application-identifier" \
+        "$UI_ACTUAL_ENTITLEMENTS") == "${TEAM_ID}.${APP_BUNDLE_ID}" ]] \
+        || fail "signed UI application identifier is not secured to the expected Team ID"
+    [[ $(/usr/libexec/PlistBuddy -c "Print :com.apple.developer.team-identifier" \
+        "$UI_ACTUAL_ENTITLEMENTS") == "$TEAM_ID" ]] \
+        || fail "signed UI entitlement Team ID does not match APPLE_TEAM_ID"
+    if /usr/libexec/PlistBuddy -c "Print :com.apple.security.get-task-allow" \
+        "$UI_ACTUAL_ENTITLEMENTS" >/dev/null 2>&1; then
+        fail "signed UI contains the forbidden get-task-allow entitlement"
+    fi
+    if /usr/libexec/PlistBuddy -c "Print :keychain-access-groups" \
+        "$UI_ACTUAL_ENTITLEMENTS" >/dev/null 2>&1; then
+        fail "signed UI must not contain the agent Keychain access group"
+    fi
+    [[ $(/usr/libexec/PlistBuddy -c "Print :com.apple.application-identifier" \
+        "$AGENT_ACTUAL_ENTITLEMENTS") == "${TEAM_ID}.${AGENT_BUNDLE_ID}" ]] \
+        || fail "signed agent application identifier is not secured to the expected Team ID"
+    [[ $(/usr/libexec/PlistBuddy -c "Print :com.apple.developer.team-identifier" \
+        "$AGENT_ACTUAL_ENTITLEMENTS") == "$TEAM_ID" ]] \
+        || fail "signed agent entitlement Team ID does not match APPLE_TEAM_ID"
+    if /usr/libexec/PlistBuddy -c "Print :com.apple.security.get-task-allow" \
+        "$AGENT_ACTUAL_ENTITLEMENTS" >/dev/null 2>&1; then
+        fail "signed agent contains the forbidden get-task-allow entitlement"
+    fi
+    python3 - "$AGENT_ACTUAL_ENTITLEMENTS" "$KEYCHAIN_ACCESS_GROUP" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    entitlements = plistlib.load(source)
+if entitlements.get("keychain-access-groups") != [sys.argv[2]]:
+    raise SystemExit("signed agent does not contain exactly its Keychain access group")
+PY
+
     APP_ARCHIVE="${BUILD_ROOT}/Nodavo-app.zip"
     ditto -c -k --keepParent "$APP_PATH" "$APP_ARCHIVE"
     notarize_archive "$APP_ARCHIVE" "app"

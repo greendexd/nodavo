@@ -24,6 +24,18 @@ use super::{DisplayGeometry, MacPlatformError, NODAVO_SYNTHETIC_EVENT_TAG};
 
 #[path = "macos/ffi.rs"]
 mod ffi;
+#[path = "macos/ipc_auth.rs"]
+mod ipc_auth;
+#[path = "macos/xpc_ipc.rs"]
+mod xpc_ipc;
+
+pub use ipc_auth::{MacIpcAuthError, MacIpcPeerGuard};
+pub use xpc_ipc::{
+    MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES, MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS,
+    MacLocalIpcAuthMode, MacXpcError, MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply,
+    MacXpcRequest, NODAVO_AGENT_MACH_SERVICE, XPC_REPLY_DEADLINE_MILLISECONDS, local_ipc_auth_mode,
+    mac_xpc_peer_requirement,
+};
 
 #[cfg(test)]
 pub(crate) use ffi::clipboard_release_named;

@@ -8,6 +8,14 @@ rust-version.workspace = true
 description = "Per-user Nodavo session agent"
 publish = false
 
+[features]
+default = []
+development-unverified-local-ipc = [
+    "nodavo-platform-macos/development-unverified-local-ipc",
+]
+windows-ui-auth-development = ["nodavo-platform-windows/windows-ui-auth-development"]
+windows-ui-auth-release = ["nodavo-platform-windows/windows-ui-auth-release"]
+
 [dependencies]
 base64.workspace = true
 bytes.workspace = true

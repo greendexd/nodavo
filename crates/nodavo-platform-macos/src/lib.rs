@@ -73,9 +73,13 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    ForceReleaseAcknowledgement, MacInputCapture, MacInputCaptureEvent, MacInputInjector,
-    MacInputLifecycleEvent, accessibility_trusted, active_displays, request_accessibility,
-    run_input_capture,
+    ForceReleaseAcknowledgement, MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES,
+    MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS, MacInputCapture, MacInputCaptureEvent,
+    MacInputInjector, MacInputLifecycleEvent, MacIpcAuthError, MacIpcPeerGuard,
+    MacLocalIpcAuthMode, MacXpcError, MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply,
+    MacXpcRequest, NODAVO_AGENT_MACH_SERVICE, XPC_REPLY_DEADLINE_MILLISECONDS,
+    accessibility_trusted, active_displays, local_ipc_auth_mode, mac_xpc_peer_requirement,
+    request_accessibility, run_input_capture,
 };
 
 #[cfg(not(target_os = "macos"))]

@@ -5,9 +5,9 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt as _;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex};
 use nodavo_input::DisplayId;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows::Win32::Foundation::{
-    CloseHandle, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HLOCAL, LPARAM, LRESULT, LocalFree, POINT,
-    RECT, WPARAM,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME,
+    GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, POINT, RECT,
+    WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
@@ -25,14 +26,31 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::Cryptography::{
-    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    BCRYPT_SHA256_ALGORITHM, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptHashCertificate2,
+    CryptProtectData, CryptUnprotectData,
+};
+use windows::Win32::Security::WinTrust::{
+    SGNR_TYPE_TIMESTAMP, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+    WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4, WTD_REVOCATION_CHECK_NONE,
+    WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+    WTD_UICONTEXT_EXECUTE, WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain,
+    WTHelperProvDataFromStateData, WinVerifyTrustEx,
 };
 use windows::Win32::Security::{
-    EqualSid, GetTokenInformation, IsValidSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-    TOKEN_QUERY, TOKEN_USER, TokenUser,
+    GetTokenInformation, IsValidSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    TOKEN_STATISTICS, TOKEN_USER, TokenSessionId, TokenStatistics, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, MOVE_FILE_FLAGS,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+};
+use windows::Win32::Storage::Packaging::Appx::{
+    APPLICATION_USER_MODEL_ID_MAX_LENGTH, GetApplicationUserModelId,
+    GetApplicationUserModelIdFromToken, GetPackageFamilyName, GetPackageFamilyNameFromToken,
+    GetPackageFullName, GetPackageFullNameFromToken, GetPackagePathByFullName2,
+    PACKAGE_FAMILY_NAME_MAX_LENGTH, PACKAGE_FULL_NAME_MAX_LENGTH, PACKAGE_ID,
+    PACKAGE_INFORMATION_FULL, PackageFamilyNameFromId, PackageIdFromFullName,
+    PackagePathType_Install,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData,
@@ -56,8 +74,9 @@ use windows::Win32::System::StationsAndDesktops::{
     OpenInputDesktop, UOI_NAME,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, OpenProcessToken,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetProcessId, GetProcessTimes,
+    OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -138,11 +157,14 @@ const DPAPI_ENTROPY: &[u8] = b"Nodavo/current-user-secret/v1";
 const MAX_WINDOWS_PATH_UNITS: usize = 32_767;
 const MAX_RAW_INPUT_BYTES: u32 = 64 * 1024;
 const MAX_HOOK_OBSERVATIONS: usize = 256;
+const MAX_AUTHENTICODE_CHAIN_CERTIFICATES: u32 = 32;
 const HOOK_OBSERVATION_MAX_AGE_MS: u32 = 250;
 const CAPTURE_TIMER_ID: usize = 1;
 const CAPTURE_TIMER_INTERVAL_MS: u32 = 500;
 const WM_NODAVO_CAPTURE_STOP: u32 = WM_APP + 0x4e;
 const NODAVO_INPUT_TAG_LOW32: u32 = 0x564f_5749;
+const MAX_APPMODEL_STRING_UNITS: usize = 32_768;
+const MAX_TOKEN_INFORMATION_BYTES: usize = 64 * 1024;
 
 thread_local! {
     static CAPTURE_CONTEXT: Cell<*mut InputCaptureContext> = const { Cell::new(ptr::null_mut()) };
@@ -1181,71 +1203,854 @@ pub(super) fn create_private_named_pipe(
     .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)
 }
 
-pub(super) fn validate_named_pipe_client(
+pub(super) fn authenticate_named_pipe_client(
     pipe: &NamedPipeServer,
-) -> Result<u32, WindowsPlatformError> {
-    let handle = HANDLE(pipe.as_raw_handle());
-    let mut client_process_id = 0_u32;
+) -> Result<NativeNamedPipeClient, WindowsPlatformError> {
+    let pipe_process_id = named_pipe_client_process_id(pipe)?;
+    let pipe_handle = duplicate_handle(HANDLE(pipe.as_raw_handle()))?;
+
+    // SAFETY: the PID came directly from the connected pipe. The returned
+    // process handle is uniquely owned and includes synchronization access so
+    // its liveness can be checked without trusting PID reuse.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pipe_process_id,
+        )
+    }
+    .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let process = owned_handle(process)?;
+    let process_id = process_id_from_handle(as_windows_handle(&process))?;
+    if process_id != pipe_process_id {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let creation_time = process_creation_time(as_windows_handle(&process))?;
+    let token = open_query_token(as_windows_handle(&process))?;
+    let token_identity = read_token_identity(as_windows_handle(&token))?;
+    validate_client_against_agent(process_id, &token_identity)?;
+    let package_identity =
+        read_package_identity(as_windows_handle(&process), as_windows_handle(&token))?;
+    let image_file = open_image_file(&package_identity.image_path)?;
+
+    if named_pipe_client_process_id_from_handle(as_windows_handle(&pipe_handle))? != pipe_process_id
+        || !process_is_live(as_windows_handle(&process))
+    {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+
+    Ok(NativeNamedPipeClient {
+        process_id,
+        pipe: pipe_handle,
+        process,
+        token,
+        image_file,
+        creation_time,
+        token_identity,
+        package_identity,
+    })
+}
+
+pub(super) fn derive_package_family_name(
+    package_name: &str,
+    publisher: &str,
+) -> Result<String, WindowsPlatformError> {
+    if package_name.is_empty()
+        || publisher.is_empty()
+        || package_name.contains('\0')
+        || publisher.contains('\0')
+    {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let mut package_name_wide = wide_null(package_name)?;
+    let mut publisher_wide = wide_null(publisher)?;
+    let package_id = PACKAGE_ID {
+        name: PWSTR(package_name_wide.as_mut_ptr()),
+        publisher: PWSTR(publisher_wide.as_mut_ptr()),
+        resourceId: PWSTR::null(),
+        publisherId: PWSTR::null(),
+        ..PACKAGE_ID::default()
+    };
+    package_family_name_from_id(&package_id)
+}
+
+pub(super) struct NativeNamedPipeClient {
+    process_id: u32,
+    pipe: OwnedHandle,
+    process: OwnedHandle,
+    token: OwnedHandle,
+    image_file: OwnedHandle,
+    creation_time: u64,
+    token_identity: NativeTokenIdentity,
+    package_identity: NativePackageIdentity,
+}
+
+impl NativeNamedPipeClient {
+    pub(super) fn package_identity(&self) -> &NativePackageIdentity {
+        &self.package_identity
+    }
+
+    pub(super) fn verify_signer(
+        &self,
+        expected_certificate_sha256: &[u8; 32],
+        requires_trusted_timestamp: bool,
+    ) -> Result<(), WindowsPlatformError> {
+        verify_authenticode_signer(
+            as_windows_handle(&self.image_file),
+            &self.package_identity.image_path,
+            expected_certificate_sha256,
+            requires_trusted_timestamp,
+        )
+    }
+
+    pub(super) fn revalidate(&self) -> Result<(), WindowsPlatformError> {
+        if named_pipe_client_process_id_from_handle(as_windows_handle(&self.pipe))?
+            != self.process_id
+            || process_id_from_handle(as_windows_handle(&self.process))? != self.process_id
+            || process_creation_time(as_windows_handle(&self.process))? != self.creation_time
+            || !process_is_live(as_windows_handle(&self.process))
+        {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+
+        // The retained token proves the initially inspected object is still
+        // live. Reopening the process token additionally rejects a process that
+        // replaced its primary token after the connection was authorized.
+        if read_token_identity(as_windows_handle(&self.token))? != self.token_identity {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+        let current_token = open_query_token(as_windows_handle(&self.process))?;
+        let current_token_identity = read_token_identity(as_windows_handle(&current_token))?;
+        if current_token_identity != self.token_identity {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+        validate_client_against_agent(self.process_id, &current_token_identity)?;
+
+        let current_package_identity = read_package_identity(
+            as_windows_handle(&self.process),
+            as_windows_handle(&current_token),
+        )?;
+        if current_package_identity != self.package_identity
+            || named_pipe_client_process_id_from_handle(as_windows_handle(&self.pipe))?
+                != self.process_id
+            || !process_is_live(as_windows_handle(&self.process))
+        {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct NativePackageIdentity {
+    pub(super) package_full_name: String,
+    pub(super) package_name: String,
+    pub(super) publisher: String,
+    pub(super) package_family_name: String,
+    pub(super) application_user_model_id: String,
+    pub(super) package_relative_executable: String,
+    pub(super) processor_architecture: u32,
+    pub(super) resource_id: String,
+    pub(super) publisher_id: String,
+    image_path: String,
+    package_path: String,
+}
+
+impl PartialEq for NativePackageIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.package_full_name == other.package_full_name
+            && self.package_name == other.package_name
+            && self.publisher == other.publisher
+            && self.package_family_name == other.package_family_name
+            && self.application_user_model_id == other.application_user_model_id
+            && self.package_relative_executable == other.package_relative_executable
+            && self.processor_architecture == other.processor_architecture
+            && self.resource_id == other.resource_id
+            && self.publisher_id == other.publisher_id
+            && self.image_path == other.image_path
+            && self.package_path == other.package_path
+    }
+}
+
+impl Eq for NativePackageIdentity {}
+
+#[derive(Clone, Eq, PartialEq)]
+struct NativeTokenIdentity {
+    user_sid: String,
+    session_id: u32,
+    token_id: NativeLuid,
+    authentication_id: NativeLuid,
+    modified_id: NativeLuid,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct NativeLuid {
+    low: u32,
+    high: i32,
+}
+
+fn named_pipe_client_process_id(pipe: &NamedPipeServer) -> Result<u32, WindowsPlatformError> {
+    named_pipe_client_process_id_from_handle(HANDLE(pipe.as_raw_handle()))
+}
+
+fn named_pipe_client_process_id_from_handle(handle: HANDLE) -> Result<u32, WindowsPlatformError> {
+    let mut process_id = 0_u32;
     // SAFETY: the Tokio server owns a connected pipe HANDLE for the duration
     // of this call and the PID output points to a live `u32`.
     unsafe {
-        GetNamedPipeClientProcessId(handle, &raw mut client_process_id)
+        GetNamedPipeClientProcessId(handle, &raw mut process_id)
             .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
     }
-    if client_process_id == 0 {
+    if process_id == 0 {
+        Err(WindowsPlatformError::UnauthorizedLocalIpc)
+    } else {
+        Ok(process_id)
+    }
+}
+
+fn duplicate_handle(source: HANDLE) -> Result<OwnedHandle, WindowsPlatformError> {
+    let mut duplicate = HANDLE::default();
+    // SAFETY: both process arguments are the live current-process
+    // pseudo-handle, `source` is live, and the output is uniquely adopted by
+    // std's OwnedHandle on success.
+    unsafe {
+        let process = GetCurrentProcess();
+        DuplicateHandle(
+            process,
+            source,
+            process,
+            &raw mut duplicate,
+            0,
+            false,
+            DUPLICATE_SAME_ACCESS,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    owned_handle(duplicate)
+}
+
+fn owned_handle(handle: HANDLE) -> Result<OwnedHandle, WindowsPlatformError> {
+    if handle.is_invalid() {
         return Err(WindowsPlatformError::UnauthorizedLocalIpc);
     }
+    // SAFETY: the caller transfers unique ownership of a successful Win32
+    // handle, which std closes exactly once.
+    Ok(unsafe { OwnedHandle::from_raw_handle(handle.0) })
+}
 
-    // SAFETY: the PID came directly from the connected pipe. The returned
-    // process handle is uniquely owned by `OwnedHandle` and closed on drop.
-    let client_process =
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, client_process_id) }
-            .map(OwnedHandle)
-            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
-    let client_token = open_query_token(client_process.0)?;
-    // SAFETY: GetCurrentProcess returns a process pseudo-handle that must not
-    // be closed and remains valid for the current process lifetime.
-    let current_token = open_query_token(unsafe { GetCurrentProcess() })?;
-    let client_user = read_token_user(client_token.0)?;
-    let current_user = read_token_user(current_token.0)?;
-    // SAFETY: both SID pointers refer into their still-live aligned token
-    // buffers and IsValidSid succeeded before this comparison.
-    unsafe {
-        EqualSid(client_user.sid, current_user.sid)
-            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+fn as_windows_handle(handle: &OwnedHandle) -> HANDLE {
+    HANDLE(handle.as_raw_handle())
+}
+
+fn process_id_from_handle(process: HANDLE) -> Result<u32, WindowsPlatformError> {
+    // SAFETY: `process` is a live process handle retained by the caller.
+    let process_id = unsafe { GetProcessId(process) };
+    if process_id == 0 {
+        Err(WindowsPlatformError::UnauthorizedLocalIpc)
+    } else {
+        Ok(process_id)
     }
+}
 
-    let client_session = process_session_id(client_process_id)?;
-    let current_session = process_session_id(
+fn process_creation_time(process: HANDLE) -> Result<u64, WindowsPlatformError> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all four outputs are live and `process` is queryable for the
+    // duration of this call.
+    unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
+fn process_is_live(process: HANDLE) -> bool {
+    // SAFETY: synchronization access was requested when the retained process
+    // handle was opened; a zero timeout only observes the signaled state.
+    unsafe { WaitForSingleObject(process, 0) == WAIT_TIMEOUT }
+}
+
+fn validate_client_against_agent(
+    process_id: u32,
+    client: &NativeTokenIdentity,
+) -> Result<(), WindowsPlatformError> {
+    // SAFETY: the current-process pseudo-handle is live and must not be closed.
+    let agent_token = open_query_token(unsafe { GetCurrentProcess() })?;
+    let agent = read_token_identity(as_windows_handle(&agent_token))?;
+    let process_session = process_session_id(process_id)?;
+    let agent_process_session = process_session_id(
         // SAFETY: no parameters and no ownership transfer.
         unsafe { GetCurrentProcessId() },
     )?;
-    if client_session != current_session || current_session == 0 {
+    if client.user_sid != agent.user_sid
+        || client.session_id == 0
+        || client.session_id != agent.session_id
+        || client.session_id != process_session
+        || agent.session_id != agent_process_session
+        || client.authentication_id != agent.authentication_id
+    {
         return Err(WindowsPlatformError::UnauthorizedLocalIpc);
     }
-    Ok(client_process_id)
+    Ok(())
+}
+
+fn read_token_identity(token: HANDLE) -> Result<NativeTokenIdentity, WindowsPlatformError> {
+    let token_user = read_token_user(token)?;
+    let user_sid = sid_to_string(token_user.sid)?;
+    let session_id = read_token_session_id(token)?;
+    let statistics = read_token_statistics(token)?;
+    Ok(NativeTokenIdentity {
+        user_sid,
+        session_id,
+        token_id: luid(statistics.TokenId),
+        authentication_id: luid(statistics.AuthenticationId),
+        modified_id: luid(statistics.ModifiedId),
+    })
+}
+
+const fn luid(value: windows::Win32::Foundation::LUID) -> NativeLuid {
+    NativeLuid {
+        low: value.LowPart,
+        high: value.HighPart,
+    }
+}
+
+fn read_token_session_id(token: HANDLE) -> Result<u32, WindowsPlatformError> {
+    let mut value = 0_u32;
+    let mut returned = 0_u32;
+    // SAFETY: the output is correctly sized/aligned for TokenSessionId and all
+    // pointers remain live for the synchronous call.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenSessionId,
+            Some(ptr::from_mut(&mut value).cast::<c_void>()),
+            u32::try_from(size_of::<u32>())
+                .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?,
+            &raw mut returned,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    if returned != u32::try_from(size_of::<u32>()).unwrap_or(0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    Ok(value)
+}
+
+fn read_token_statistics(token: HANDLE) -> Result<TOKEN_STATISTICS, WindowsPlatformError> {
+    let mut value = TOKEN_STATISTICS::default();
+    let mut returned = 0_u32;
+    // SAFETY: the output is correctly sized/aligned for TokenStatistics and
+    // all pointers remain live for the synchronous call.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenStatistics,
+            Some(ptr::from_mut(&mut value).cast::<c_void>()),
+            u32::try_from(size_of::<TOKEN_STATISTICS>())
+                .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?,
+            &raw mut returned,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    if returned != u32::try_from(size_of::<TOKEN_STATISTICS>()).unwrap_or(0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    Ok(value)
+}
+
+fn read_package_identity(
+    process: HANDLE,
+    token: HANDLE,
+) -> Result<NativePackageIdentity, WindowsPlatformError> {
+    let package_full_name =
+        query_appmodel_string(PACKAGE_FULL_NAME_MAX_LENGTH + 1, |length, output| {
+            // SAFETY: process is live and queryable, while the helper owns the
+            // sizing/output buffers for this synchronous call.
+            unsafe { GetPackageFullName(process, length, output) }
+        })?;
+    let token_package_full_name =
+        query_appmodel_string(PACKAGE_FULL_NAME_MAX_LENGTH + 1, |length, output| {
+            // SAFETY: token is live with TOKEN_QUERY access and buffers are valid.
+            unsafe { GetPackageFullNameFromToken(token, length, output) }
+        })?;
+    if token_package_full_name != package_full_name {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+
+    let process_family_name =
+        query_appmodel_string(PACKAGE_FAMILY_NAME_MAX_LENGTH + 1, |length, output| {
+            // SAFETY: same handle/buffer invariants as above.
+            unsafe { GetPackageFamilyName(process, length, output) }
+        })?;
+    let token_family_name =
+        query_appmodel_string(PACKAGE_FAMILY_NAME_MAX_LENGTH + 1, |length, output| {
+            // SAFETY: same handle/buffer invariants as above.
+            unsafe { GetPackageFamilyNameFromToken(token, length, output) }
+        })?;
+    if token_family_name != process_family_name {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+
+    let process_aumid =
+        query_appmodel_string(APPLICATION_USER_MODEL_ID_MAX_LENGTH, |length, output| {
+            // SAFETY: same handle/buffer invariants as above.
+            unsafe { GetApplicationUserModelId(process, length, output) }
+        })?;
+    let token_aumid =
+        query_appmodel_string(APPLICATION_USER_MODEL_ID_MAX_LENGTH, |length, output| {
+            // SAFETY: same handle/buffer invariants as above.
+            unsafe { GetApplicationUserModelIdFromToken(token, length, output) }
+        })?;
+    if token_aumid != process_aumid {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+
+    let parsed = parse_package_full_name(&package_full_name)?;
+    if parsed.family_name != process_family_name {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let package_path = package_install_path(&package_full_name)?;
+    let image_path = process_image_path(process)?;
+    let relative = PathBuf::from(&image_path)
+        .strip_prefix(Path::new(&package_path))
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?
+        .to_path_buf();
+    if relative.components().count() != 1 {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let package_relative_executable = relative
+        .to_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?
+        .to_owned();
+
+    Ok(NativePackageIdentity {
+        package_full_name,
+        package_name: parsed.name,
+        publisher: parsed.publisher,
+        package_family_name: parsed.family_name,
+        application_user_model_id: process_aumid,
+        package_relative_executable,
+        processor_architecture: parsed.processor_architecture,
+        resource_id: parsed.resource_id,
+        publisher_id: parsed.publisher_id,
+        image_path,
+        package_path,
+    })
+}
+
+struct ParsedPackageIdentity {
+    name: String,
+    publisher: String,
+    family_name: String,
+    processor_architecture: u32,
+    resource_id: String,
+    publisher_id: String,
+}
+
+fn parse_package_full_name(value: &str) -> Result<ParsedPackageIdentity, WindowsPlatformError> {
+    let wide = wide_null(value)?;
+    let mut required = 0_u32;
+    // SAFETY: sizing call has a live length output and deliberately omits the
+    // destination buffer.
+    let status = unsafe {
+        PackageIdFromFullName(
+            PCWSTR(wide.as_ptr()),
+            PACKAGE_INFORMATION_FULL,
+            &raw mut required,
+            None,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let required_usize =
+        usize::try_from(required).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    if required_usize < size_of::<PACKAGE_ID>() || required_usize > MAX_TOKEN_INFORMATION_BYTES {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let mut storage = vec![0_usize; required_usize.div_ceil(size_of::<usize>())];
+    let storage_bytes = size_of_val(storage.as_slice());
+    let mut supplied =
+        u32::try_from(storage_bytes).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    // SAFETY: usize storage is sufficiently large/aligned, the input is
+    // NUL-terminated, and the package parser initializes one PACKAGE_ID whose
+    // string pointers refer into the retained storage.
+    let status = unsafe {
+        PackageIdFromFullName(
+            PCWSTR(wide.as_ptr()),
+            PACKAGE_INFORMATION_FULL,
+            &raw mut supplied,
+            Some(storage.as_mut_ptr().cast::<u8>()),
+        )
+    };
+    if status != ERROR_SUCCESS || usize::try_from(supplied).ok() != Some(required_usize) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let package_id_pointer = storage.as_ptr().cast::<PACKAGE_ID>();
+    // SAFETY: the parser initialized a PACKAGE_ID at the aligned buffer start.
+    // `read_unaligned` also accommodates the SDK's packed 64-bit definition.
+    let package_id = unsafe { ptr::read_unaligned(package_id_pointer) };
+    let name = package_id_string(&storage, package_id.name)?;
+    let publisher = package_id_string(&storage, package_id.publisher)?;
+    let resource_id = package_id_string(&storage, package_id.resourceId)?;
+    let publisher_id = package_id_string(&storage, package_id.publisherId)?;
+    let family_name = package_family_name_from_id(package_id_pointer)?;
+    Ok(ParsedPackageIdentity {
+        name,
+        publisher,
+        family_name,
+        processor_architecture: package_id.processorArchitecture,
+        resource_id,
+        publisher_id,
+    })
+}
+
+fn package_id_string(storage: &[usize], value: PWSTR) -> Result<String, WindowsPlatformError> {
+    if value.is_null() {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let start = storage.as_ptr().cast::<u8>() as usize;
+    let end = start
+        .checked_add(size_of_val(storage))
+        .ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let pointer = value.0 as usize;
+    if pointer < start || pointer >= end || !(pointer - start).is_multiple_of(2) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let remaining_units = (end - pointer) / size_of::<u16>();
+    // SAFETY: the pointer was range/alignment checked against the retained
+    // allocation and the slice cannot extend beyond it.
+    let units = unsafe { std::slice::from_raw_parts(value.0, remaining_units) };
+    let terminator = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    String::from_utf16(&units[..terminator]).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)
+}
+
+fn package_family_name_from_id(
+    package_id: *const PACKAGE_ID,
+) -> Result<String, WindowsPlatformError> {
+    query_appmodel_string(PACKAGE_FAMILY_NAME_MAX_LENGTH + 1, |length, output| {
+        // SAFETY: the caller retains the PACKAGE_ID and all of its referenced
+        // strings; the helper owns valid sizing/output buffers.
+        unsafe { PackageFamilyNameFromId(package_id, length, output) }
+    })
+}
+
+fn package_install_path(package_full_name: &str) -> Result<String, WindowsPlatformError> {
+    let wide = wide_null(package_full_name)?;
+    query_appmodel_string(
+        u32::try_from(MAX_WINDOWS_PATH_UNITS + 1)
+            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?,
+        |length, output| {
+            // SAFETY: the package name is NUL-terminated and the helper owns valid
+            // sizing/output buffers.
+            unsafe {
+                GetPackagePathByFullName2(
+                    PCWSTR(wide.as_ptr()),
+                    PackagePathType_Install,
+                    length,
+                    output,
+                )
+            }
+        },
+    )
+}
+
+fn process_image_path(process: HANDLE) -> Result<String, WindowsPlatformError> {
+    let mut storage = vec![0_u16; MAX_WINDOWS_PATH_UNITS + 1];
+    let mut length =
+        u32::try_from(storage.len()).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    // SAFETY: the process is queryable and the output buffer/length remain live.
+    unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(storage.as_mut_ptr()),
+            &raw mut length,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    let used = usize::try_from(length).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    if used == 0 || used >= storage.len() || storage[..used].contains(&0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    String::from_utf16(&storage[..used]).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)
+}
+
+fn query_appmodel_string(
+    maximum_units_including_nul: u32,
+    mut call: impl FnMut(*mut u32, Option<PWSTR>) -> windows::Win32::Foundation::WIN32_ERROR,
+) -> Result<String, WindowsPlatformError> {
+    let mut required = 0_u32;
+    if call(&raw mut required, None) != ERROR_INSUFFICIENT_BUFFER {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let required_usize =
+        usize::try_from(required).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let maximum = usize::try_from(maximum_units_including_nul)
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    if !(2..=maximum.min(MAX_APPMODEL_STRING_UNITS)).contains(&required_usize) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let mut storage = vec![0_u16; required_usize];
+    let mut supplied = required;
+    if call(&raw mut supplied, Some(PWSTR(storage.as_mut_ptr()))) != ERROR_SUCCESS {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let used = usize::try_from(supplied).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    if used < 2 || used > storage.len() || storage[used - 1] != 0 {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    storage.truncate(used - 1);
+    if storage.contains(&0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    String::from_utf16(&storage).map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)
+}
+
+fn wide_null(value: &str) -> Result<Vec<u16>, WindowsPlatformError> {
+    let mut wide: Vec<u16> = value.encode_utf16().collect();
+    if wide.is_empty() || wide.len() >= MAX_APPMODEL_STRING_UNITS || wide.contains(&0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+fn open_image_file(path: &str) -> Result<OwnedHandle, WindowsPlatformError> {
+    let path = wide_null(path)?;
+    // SAFETY: the path is NUL-terminated. The returned handle is adopted by
+    // std ownership and retained for the complete authorized connection. Only
+    // FILE_SHARE_READ is granted, preventing replacement/deletion while live.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    }
+    .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    owned_handle(handle)
+}
+
+fn verify_authenticode_signer(
+    image_file: HANDLE,
+    image_path: &str,
+    expected_certificate_sha256: &[u8; 32],
+    requires_trusted_timestamp: bool,
+) -> Result<(), WindowsPlatformError> {
+    if requires_trusted_timestamp {
+        let evidence = run_wintrust(
+            image_file,
+            image_path,
+            WTD_REVOKE_NONE,
+            WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+            0,
+            true,
+        )?;
+        if !constant_time_eq(&evidence.certificate_sha256, expected_certificate_sha256)
+            || !evidence.has_timestamp
+        {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+        return Ok(());
+    }
+
+    let evidence = run_wintrust(
+        image_file,
+        image_path,
+        WTD_REVOKE_NONE,
+        WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+        0,
+        true,
+    )?;
+    if !constant_time_eq(&evidence.certificate_sha256, expected_certificate_sha256) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    Ok(())
+}
+
+struct AuthenticodeEvidence {
+    certificate_sha256: [u8; 32],
+    has_timestamp: bool,
+}
+
+fn run_wintrust(
+    image_file: HANDLE,
+    image_path: &str,
+    revocation_checks: windows::Win32::Security::WinTrust::WINTRUST_DATA_REVOCATION_CHECKS,
+    provider_flags: windows::Win32::Security::WinTrust::WINTRUST_DATA_PROVIDER_FLAGS,
+    expected_status: i32,
+    collect_evidence: bool,
+) -> Result<AuthenticodeEvidence, WindowsPlatformError> {
+    let image_path = wide_null(image_path)?;
+    let mut file = WINTRUST_FILE_INFO {
+        cbStruct: u32::try_from(size_of::<WINTRUST_FILE_INFO>())
+            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?,
+        pcwszFilePath: PCWSTR(image_path.as_ptr()),
+        hFile: image_file,
+        pgKnownSubject: ptr::null_mut(),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: u32::try_from(size_of::<WINTRUST_DATA>())
+            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: revocation_checks,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: provider_flags,
+        dwUIContext: WTD_UICONTEXT_EXECUTE,
+        ..WINTRUST_DATA::default()
+    };
+    data.Anonymous.pFile = &raw mut file;
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // SAFETY: all WinTrust structures and the retained file handle remain live
+    // through verification, evidence extraction, and mandatory state close.
+    let status = unsafe { WinVerifyTrustEx(HWND::default(), &raw mut action, &raw mut data) };
+    let result = if status != expected_status {
+        Err(WindowsPlatformError::UnauthorizedLocalIpc)
+    } else if collect_evidence {
+        // SAFETY: a successful VERIFY action populated hWVTStateData and keeps
+        // provider-owned signer/certificate pointers live until CLOSE below.
+        unsafe { authenticode_evidence(data.hWVTStateData) }
+    } else {
+        Ok(AuthenticodeEvidence {
+            certificate_sha256: [0_u8; 32],
+            has_timestamp: false,
+        })
+    };
+
+    data.dwStateAction = WTD_STATEACTION_CLOSE;
+    // SAFETY: this closes exactly the state established by the call above;
+    // the same action GUID/data storage remains live.
+    let close_status = unsafe { WinVerifyTrustEx(HWND::default(), &raw mut action, &raw mut data) };
+    if close_status != 0 {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    result
+}
+
+unsafe fn authenticode_evidence(
+    state: HANDLE,
+) -> Result<AuthenticodeEvidence, WindowsPlatformError> {
+    if state.is_invalid() {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    // SAFETY: WinVerifyTrust VERIFY produced the state and it remains open.
+    let provider = unsafe { WTHelperProvDataFromStateData(state) };
+    if provider.is_null() || unsafe { (*provider).csSigners } != 1 {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    // SAFETY: provider is live and reports exactly one primary signer.
+    let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
+    if signer.is_null()
+        || unsafe { (*signer).dwError } != 0
+        || unsafe { (*signer).csCertChain } == 0
+        || unsafe { (*signer).csCertChain } > MAX_AUTHENTICODE_CHAIN_CERTIFICATES
+        || unsafe { (*signer).pasCertChain }.is_null()
+    {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    // SAFETY: signer reports a nonempty provider-owned certificate chain.
+    let provider_certificate = unsafe { WTHelperGetProvCertFromChain(signer, 0) };
+    if provider_certificate.is_null()
+        || unsafe { (*provider_certificate).dwError } != 0
+        || unsafe { (*provider_certificate).pCert }.is_null()
+    {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    // SAFETY: the certificate context belongs to the open provider state.
+    let certificate = unsafe { &*(*provider_certificate).pCert };
+    let encoded_len = usize::try_from(certificate.cbCertEncoded)
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    if certificate.pbCertEncoded.is_null() || encoded_len == 0 || encoded_len > 1024 * 1024 {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    // SAFETY: CERT_CONTEXT exposes cbCertEncoded readable bytes until CLOSE.
+    let encoded = unsafe { std::slice::from_raw_parts(certificate.pbCertEncoded, encoded_len) };
+    let mut certificate_sha256 = [0_u8; 32];
+    let mut hash_len = u32::try_from(certificate_sha256.len())
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    // SAFETY: encoded certificate bytes and fixed hash output are live and
+    // correctly bounded for the synchronous Crypt32 call.
+    unsafe {
+        CryptHashCertificate2(
+            BCRYPT_SHA256_ALGORITHM,
+            0,
+            None,
+            Some(encoded),
+            Some(certificate_sha256.as_mut_ptr()),
+            &raw mut hash_len,
+        )
+        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    if hash_len != u32::try_from(certificate_sha256.len()).unwrap_or(0) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+
+    let has_timestamp = unsafe { (*signer).csCounterSigners } == 1
+        && !unsafe { (*signer).pasCounterSigners }.is_null()
+        && {
+            // SAFETY: the signer reports at least one live countersigner.
+            let timestamp = unsafe { WTHelperGetProvSignerFromChain(provider, 0, true, 0) };
+            if timestamp.is_null() {
+                false
+            } else {
+                let timestamp_certificates = unsafe { (*timestamp).csCertChain };
+                let timestamp_certificate = if timestamp_certificates > 0
+                    && timestamp_certificates <= MAX_AUTHENTICODE_CHAIN_CERTIFICATES
+                    && !unsafe { (*timestamp).pasCertChain }.is_null()
+                {
+                    // SAFETY: the countersigner reports a bounded nonempty chain.
+                    unsafe { WTHelperGetProvCertFromChain(timestamp, 0) }
+                } else {
+                    ptr::null_mut()
+                };
+                (unsafe { (*timestamp).dwError }) == 0
+                    && (unsafe { (*timestamp).dwSignerType }) == SGNR_TYPE_TIMESTAMP
+                    && (unsafe { (*timestamp).sftVerifyAsOf.dwLowDateTime } != 0
+                        || unsafe { (*timestamp).sftVerifyAsOf.dwHighDateTime } != 0)
+                    && !timestamp_certificate.is_null()
+                    && (unsafe { (*timestamp_certificate).dwError }) == 0
+                    && !unsafe { (*timestamp_certificate).pCert }.is_null()
+            }
+        };
+    Ok(AuthenticodeEvidence {
+        certificate_sha256,
+        has_timestamp,
+    })
+}
+
+fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 pub(super) fn current_user_sid_string() -> Result<String, WindowsPlatformError> {
     // SAFETY: GetCurrentProcess returns a process pseudo-handle that must not
     // be closed and remains valid for the current process lifetime.
     let current_token = open_query_token(unsafe { GetCurrentProcess() })?;
-    let current_user = read_token_user(current_token.0)?;
-    let mut sid_text = PWSTR::null();
-    // SAFETY: current_user retains the validated SID backing buffer for this
-    // call. Windows returns a NUL-terminated LocalAlloc string on success.
-    unsafe {
-        ConvertSidToStringSidW(current_user.sid, &raw mut sid_text)
-            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
-    }
-    if sid_text.is_null() {
-        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
-    }
-    let sid_text = LocalWideString(sid_text);
-    // SAFETY: ConvertSidToStringSidW returned a live NUL-terminated string
-    // retained by sid_text until after this copy.
-    let value = unsafe { sid_text.0.to_string() }
-        .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let current_user = read_token_user(as_windows_handle(&current_token))?;
+    let value = sid_to_string(current_user.sid)?;
     if value.is_empty()
         || value.len() > 184
         || !value.is_ascii()
@@ -1267,10 +2072,7 @@ fn open_query_token(process: HANDLE) -> Result<OwnedHandle, WindowsPlatformError
         OpenProcessToken(process, TOKEN_QUERY, &raw mut token)
             .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
     }
-    if token.is_invalid() {
-        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
-    }
-    Ok(OwnedHandle(token))
+    owned_handle(token)
 }
 
 fn read_token_user(token: HANDLE) -> Result<TokenUserBuffer, WindowsPlatformError> {
@@ -1280,7 +2082,7 @@ fn read_token_user(token: HANDLE) -> Result<TokenUserBuffer, WindowsPlatformErro
     let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &raw mut reported_required) };
     let required = usize::try_from(reported_required)
         .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
-    if required < size_of::<TOKEN_USER>() || required > 64 * 1024 {
+    if required < size_of::<TOKEN_USER>() || required > MAX_TOKEN_INFORMATION_BYTES {
         return Err(WindowsPlatformError::UnauthorizedLocalIpc);
     }
     let units = required.div_ceil(size_of::<usize>());
@@ -1313,6 +2115,23 @@ fn read_token_user(token: HANDLE) -> Result<TokenUserBuffer, WindowsPlatformErro
     })
 }
 
+fn sid_to_string(sid: PSID) -> Result<String, WindowsPlatformError> {
+    let mut sid_text = PWSTR::null();
+    // SAFETY: the caller retains the validated SID backing buffer for this
+    // call. Windows returns a NUL-terminated LocalAlloc string on success.
+    unsafe {
+        ConvertSidToStringSidW(sid, &raw mut sid_text)
+            .map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)?;
+    }
+    if sid_text.is_null() {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    let sid_text = LocalWideString(sid_text);
+    // SAFETY: ConvertSidToStringSidW returned a live NUL-terminated string
+    // retained by sid_text until after this copy.
+    unsafe { sid_text.0.to_string() }.map_err(|_| WindowsPlatformError::UnauthorizedLocalIpc)
+}
+
 fn process_session_id(process_id: u32) -> Result<u32, WindowsPlatformError> {
     let mut session_id = 0_u32;
     // SAFETY: the output pointer is live and the PID is supplied by Windows or
@@ -1341,16 +2160,6 @@ impl Drop for LocalWideString {
         // SAFETY: ConvertSidToStringSidW allocated this exact pointer with
         // LocalAlloc; it is released once after conversion.
         let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0.cast::<c_void>()))) };
-    }
-}
-
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: this guard uniquely owns a non-pseudo HANDLE returned by
-        // OpenProcess or OpenProcessToken.
-        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 

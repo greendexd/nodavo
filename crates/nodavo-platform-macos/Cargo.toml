@@ -8,6 +8,10 @@ rust-version.workspace = true
 description = "macOS platform adapter for Nodavo"
 publish = false
 
+[features]
+default = []
+development-unverified-local-ipc = []
+
 [dependencies]
 bytes.workspace = true
 nodavo-clipboard = { path = "../nodavo-clipboard" }

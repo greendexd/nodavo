@@ -17,6 +17,11 @@
     <string>dev.nodavo.agent</string>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
+    <key>MachServices</key>
+    <dict>
+        <key>dev.nodavo.agent.ipc</key>
+        <@MACH_SERVICE_BOOL@/>
+    </dict>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>RunAtLoad</key>

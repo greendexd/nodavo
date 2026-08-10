@@ -20,6 +20,20 @@
   <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Emergency stop</value></data>
   <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha shell</value></data>
   <data name="PreAlphaNotice.Message" xml:space="preserve"><value>Pairing, trust management, and selected-path transfers are pre-alpha. Input and clipboard runtime remain under qualification.</value></data>
+  <data name="AgentLifecycleHeading.Text" xml:space="preserve"><value>Per-user agent</value></data>
+  <data name="StartAgentButton.Content" xml:space="preserve"><value>Start agent</value></data>
+  <data name="LifecycleAgentChecking" xml:space="preserve"><value>Checking the local agent…</value></data>
+  <data name="LifecycleAgentStopped" xml:space="preserve"><value>Agent is not running</value></data>
+  <data name="LifecycleAgentStarting" xml:space="preserve"><value>Starting the packaged agent…</value></data>
+  <data name="LifecycleAgentRunning" xml:space="preserve"><value>Agent is reachable</value></data>
+  <data name="LifecycleAgentTimedOut" xml:space="preserve"><value>Agent did not become ready</value></data>
+  <data name="LifecycleAgentUnsupported" xml:space="preserve"><value>Packaged launch is unavailable</value></data>
+  <data name="LifecycleAgentFailed" xml:space="preserve"><value>Agent launch failed</value></data>
+  <data name="LifecycleNoRecovery" xml:space="preserve"><value>Readiness is confirmed only after the private local pipe responds.</value></data>
+  <data name="LifecycleAgentStoppedHelp" xml:space="preserve"><value>Choose Start agent to launch the fixed executable bundled in this installed package.</value></data>
+  <data name="LifecycleAgentTimedOutHelp" xml:space="preserve"><value>The launch request was sent once, but the private pipe did not respond before the bounded deadline. Review the installed package and try again explicitly.</value></data>
+  <data name="LifecycleAgentUnsupportedHelp" xml:space="preserve"><value>This action requires an installed MSIX package. Unpackaged source runs do not use an executable-path fallback.</value></data>
+  <data name="LifecycleAgentFailedHelp" xml:space="preserve"><value>The exact bundled executable was missing, unsafe, or could not be created without a shell. Reinstall the package before retrying.</value></data>
   <data name="DevicesTitle.Text" xml:space="preserve"><value>Devices</value></data>
   <data name="DevicesSubtitle.Text" xml:space="preserve"><value>Pair directly on your local network and confirm the same six-digit code on both computers.</value></data>
   <data name="TrustedDevicesHeading.Text" xml:space="preserve"><value>Trusted devices</value></data>
@@ -162,6 +176,26 @@
   <data name="UnavailableBadge.Title" xml:space="preserve"><value>Not available in this build</value></data>
   <data name="UnavailableBadge.Message" xml:space="preserve"><value>This screen does not perform an action yet.</value></data>
   <data name="SettingsTitle.Text" xml:space="preserve"><value>Settings</value></data>
+  <data name="StartupHeading.Text" xml:space="preserve"><value>Start agent at sign-in</value></data>
+  <data name="StartupDescription.Text" xml:space="preserve"><value>This per-user Windows startup task launches only the bundled unprivileged agent after you sign in. It never runs at the login screen, in Session 0, or on the UAC secure desktop.</value></data>
+  <data name="StartupTaskDisplayName" xml:space="preserve"><value>Nodavo per-user agent</value></data>
+  <data name="StartupChecking" xml:space="preserve"><value>Checking Windows startup state…</value></data>
+  <data name="StartupDisabled" xml:space="preserve"><value>Disabled</value></data>
+  <data name="StartupDisabledByUser" xml:space="preserve"><value>Disabled in Windows</value></data>
+  <data name="StartupDisabledByPolicy" xml:space="preserve"><value>Disabled by administrator policy</value></data>
+  <data name="StartupEnabled" xml:space="preserve"><value>Enabled for this user</value></data>
+  <data name="StartupEnabledByPolicy" xml:space="preserve"><value>Enabled by administrator policy</value></data>
+  <data name="StartupUnavailable" xml:space="preserve"><value>Startup task unavailable</value></data>
+  <data name="StartupCheckingHelp" xml:space="preserve"><value>Waiting for the bounded Windows startup-task query.</value></data>
+  <data name="StartupDisabledHelp" xml:space="preserve"><value>Nothing starts at sign-in until you explicitly enable it here.</value></data>
+  <data name="StartupDisabledByUserHelp" xml:space="preserve"><value>Windows will not let the app override your Task Manager or Startup Apps choice. Re-enable Nodavo manually there if desired.</value></data>
+  <data name="StartupDisabledByPolicyHelp" xml:space="preserve"><value>An administrator policy prevents this startup task. Nodavo will not bypass policy.</value></data>
+  <data name="StartupEnabledHelp" xml:space="preserve"><value>Windows will launch the bundled agent only after this user signs in.</value></data>
+  <data name="StartupEnabledByPolicyHelp" xml:space="preserve"><value>Administrator policy controls this enabled task; the app cannot change it.</value></data>
+  <data name="StartupUnavailableHelp" xml:space="preserve"><value>The installed package declaration is missing or Windows does not support the API. No registry, service, or scheduled-task fallback is used.</value></data>
+  <data name="StartupEnableAction" xml:space="preserve"><value>Enable at sign-in</value></data>
+  <data name="StartupDisableAction" xml:space="preserve"><value>Disable at sign-in</value></data>
+  <data name="StartupManagedAction" xml:space="preserve"><value>Managed by Windows</value></data>
   <data name="PrivacyHeading.Text" xml:space="preserve"><value>Privacy</value></data>
   <data name="TelemetryLabel.Text" xml:space="preserve"><value>Telemetry</value></data>
   <data name="DisabledValue.Text" xml:space="preserve"><value>Disabled</value></data>

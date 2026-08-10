@@ -1,7 +1,8 @@
 import Darwin
 import Foundation
+import XPC
 
-enum AgentClientError: Error {
+enum AgentClientError: Error, Sendable {
     case agentUnavailable
     case unsafePath
     case unsafeValue
@@ -9,6 +10,66 @@ enum AgentClientError: Error {
     case invalidResponse
     case agent(code: String, message: String)
     case system(Int32)
+}
+
+struct AgentXpcConfiguration: Equatable, Sendable {
+    static let expectedServiceName = "dev.nodavo.agent.ipc"
+    static let agentIdentifier = "dev.nodavo.agent"
+
+    let serviceName: String
+    let teamIdentifier: String
+
+    static func load(infoDictionary: [String: Any]? = Bundle.main.infoDictionary) throws -> Self {
+        guard let serviceName = infoDictionary?["NodavoAgentMachService"] as? String,
+              serviceName == expectedServiceName,
+              let teamIdentifier = infoDictionary?["NodavoAppleTeamIdentifier"] as? String,
+              validTeamIdentifier(teamIdentifier)
+        else {
+            throw AgentClientError.agentUnavailable
+        }
+        return Self(serviceName: serviceName, teamIdentifier: teamIdentifier)
+    }
+
+    var peerCodeSigningRequirement: String {
+        "anchor apple generic and identifier \"\(Self.agentIdentifier)\" "
+            + "and certificate leaf[subject.OU] = \"\(teamIdentifier)\" "
+            + "and certificate 1[field.1.2.840.113635.100.6.2.6] exists "
+            + "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists "
+            + "and entitlement[\"com.apple.application-identifier\"] = "
+            + "\"\(teamIdentifier).\(Self.agentIdentifier)\" "
+            + "and entitlement[\"com.apple.developer.team-identifier\"] = "
+            + "\"\(teamIdentifier)\" "
+            + "and entitlement[\"com.apple.security.get-task-allow\"] absent"
+    }
+
+    private static func validTeamIdentifier(_ value: String) -> Bool {
+        value.utf8.count == 10 && value.utf8.allSatisfy { byte in
+            (65 ... 90).contains(byte) || (48 ... 57).contains(byte)
+        }
+    }
+}
+
+private final class XpcReplyWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var result: Result<Data, AgentClientError>?
+
+    func finish(_ candidate: Result<Data, AgentClientError>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard result == nil else { return }
+        result = candidate
+        semaphore.signal()
+    }
+
+    func wait(seconds: Int) -> Result<Data, AgentClientError>? {
+        guard semaphore.wait(timeout: .now() + .seconds(seconds)) == .success else {
+            return nil
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        return result
+    }
 }
 
 enum PairingCapability: String, CaseIterable, Hashable, Identifiable, Codable {
@@ -445,7 +506,10 @@ enum AgentResponseDecoder {
 }
 
 actor AgentClient {
-    private let maximumMessageSize = 64 * 1024
+    private static let maximumMessageSize = 64 * 1024
+    // Matches the agent's hard ceiling and exceeds its longest bounded command
+    // (five-minute transfer preparation), preventing ambiguous early retries.
+    private static let xpcReplyDeadlineSeconds = 360
     private let maximumEndpointBytes = 512
     static let maximumSelectedPaths = 32
     static let maximumSelectedPathBytes = 4 * 1024
@@ -634,35 +698,17 @@ actor AgentClient {
     }
 
     private func request(_ command: AgentCommand) throws -> AgentResponse {
-        let socketPath = try defaultSocketPath()
-        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else {
-            throw AgentClientError.system(errno)
-        }
-        defer { close(descriptor) }
-
-        do {
-            try connect(descriptor: descriptor, path: socketPath)
-        } catch AgentClientError.system(let code) where code == ENOENT || code == ECONNREFUSED {
-            throw AgentClientError.agentUnavailable
-        }
-
         let payload = try JSONEncoder().encode(command)
-        guard payload.count <= maximumMessageSize else {
+        guard !payload.isEmpty, payload.count <= Self.maximumMessageSize else {
             throw AgentClientError.messageTooLarge
         }
-        var length = UInt32(payload.count).bigEndian
-        try withUnsafeBytes(of: &length) { try writeAll(descriptor, bytes: $0) }
-        try payload.withUnsafeBytes { try writeAll(descriptor, bytes: $0) }
 
-        var responseLength: UInt32 = 0
-        try withUnsafeMutableBytes(of: &responseLength) { try readAll(descriptor, bytes: $0) }
-        let count = Int(UInt32(bigEndian: responseLength))
-        guard count <= maximumMessageSize else {
-            throw AgentClientError.messageTooLarge
-        }
-        var response = Data(count: count)
-        try response.withUnsafeMutableBytes { try readAll(descriptor, bytes: $0) }
+        #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+        let response = try requestOverDevelopmentSocket(payload)
+        #else
+        let response = try requestOverSignedXpc(payload)
+        #endif
+
         let decoded = try JSONDecoder().decode(AgentResponse.self, from: response)
         if decoded.event == "error" {
             guard let code = decoded.code,
@@ -677,13 +723,124 @@ actor AgentClient {
         return decoded
     }
 
+    #if !NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+    private func requestOverSignedXpc(_ payload: Data) throws -> Data {
+        let configuration = try AgentXpcConfiguration.load()
+        let connection = xpc_connection_create_mach_service(
+            configuration.serviceName,
+            nil,
+            0
+        )
+        let requirementStatus = xpc_connection_set_peer_code_signing_requirement(
+            connection,
+            configuration.peerCodeSigningRequirement
+        )
+        guard requirementStatus == 0 else {
+            // XPC requires every created connection to be activated before its
+            // final reference is released, including fail-closed setup paths.
+            xpc_connection_set_event_handler(connection) { _ in }
+            xpc_connection_activate(connection)
+            xpc_connection_cancel(connection)
+            throw AgentClientError.agentUnavailable
+        }
+
+        let waiter = XpcReplyWaiter()
+        xpc_connection_set_event_handler(connection) { event in
+            if xpc_get_type(event) == XPC_TYPE_ERROR {
+                waiter.finish(.failure(.agentUnavailable))
+            }
+        }
+        xpc_connection_activate(connection)
+        defer { xpc_connection_cancel(connection) }
+
+        let message = xpc_dictionary_create(nil, nil, 0)
+        payload.withUnsafeBytes { bytes in
+            xpc_dictionary_set_data(message, "frame", bytes.baseAddress, bytes.count)
+        }
+        xpc_connection_send_message_with_reply(connection, message, nil) { reply in
+            waiter.finish(Self.decodeXpcReply(reply))
+        }
+
+        guard let result = waiter.wait(seconds: Self.xpcReplyDeadlineSeconds) else {
+            throw AgentClientError.agentUnavailable
+        }
+        return try result.get()
+    }
+
+    private nonisolated static func decodeXpcReply(
+        _ reply: xpc_object_t
+    ) -> Result<Data, AgentClientError> {
+        guard xpc_get_type(reply) == XPC_TYPE_DICTIONARY,
+              xpc_dictionary_get_count(reply) == 1
+        else {
+            return .failure(.agentUnavailable)
+        }
+        var length = 0
+        guard let bytes = xpc_dictionary_get_data(reply, "frame", &length),
+              length > 0,
+              length <= maximumMessageSize
+        else {
+            return .failure(.invalidResponse)
+        }
+        return .success(Data(bytes: bytes, count: length))
+    }
+    #else
+    private func requestOverDevelopmentSocket(_ payload: Data) throws -> Data {
+        let socketPath = try defaultSocketPath()
+        let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else {
+            throw AgentClientError.system(errno)
+        }
+        defer { close(descriptor) }
+        try Self.setCloseOnExec(descriptor)
+
+        do {
+            try connect(descriptor: descriptor, path: socketPath)
+        } catch AgentClientError.system(let code) where code == ENOENT || code == ECONNREFUSED {
+            throw AgentClientError.agentUnavailable
+        }
+
+        var length = UInt32(payload.count).bigEndian
+        try withUnsafeBytes(of: &length) { try writeAll(descriptor, bytes: $0) }
+        try payload.withUnsafeBytes { try writeAll(descriptor, bytes: $0) }
+
+        var responseLength: UInt32 = 0
+        try withUnsafeMutableBytes(of: &responseLength) { try readAll(descriptor, bytes: $0) }
+        let count = Int(UInt32(bigEndian: responseLength))
+        guard count > 0, count <= Self.maximumMessageSize else {
+            throw AgentClientError.messageTooLarge
+        }
+        var response = Data(count: count)
+        try response.withUnsafeMutableBytes { try readAll(descriptor, bytes: $0) }
+        return response
+    }
+
     private func defaultSocketPath() throws -> String {
-        if let override = ProcessInfo.processInfo.environment["NODAVO_IPC_PATH"], !override.isEmpty {
+        Self.socketPath()
+    }
+
+    static func socketPath(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> String {
+        #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+        if let override = environment["NODAVO_IPC_PATH"], !override.isEmpty {
             return override
         }
-        return FileManager.default.homeDirectoryForCurrentUser
+        #endif
+        return homeDirectory
             .appending(path: "Library/Application Support/Nodavo/agent.sock")
             .path
+    }
+
+    static func setCloseOnExec(_ descriptor: Int32) throws {
+        let flags = Darwin.fcntl(descriptor, F_GETFD)
+        guard flags >= 0 else {
+            throw AgentClientError.system(errno)
+        }
+        guard Darwin.fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) == 0 else {
+            throw AgentClientError.system(errno)
+        }
     }
 
     private func connect(descriptor: Int32, path: String) throws {
@@ -743,6 +900,7 @@ actor AgentClient {
             offset += readCount
         }
     }
+    #endif
 }
 
 private func containsControlCharacter(_ value: String) -> Bool {

@@ -269,6 +269,13 @@ pub struct PairingTxn {
 }
 
 impl PairingTxn {
+    /// Creates a transaction bound to the authenticated TLS exporter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the TLS exporter is outside the accepted bounds,
+    /// the protocol version is zero, or the participants reuse an identity,
+    /// certificate, or nonce.
     pub fn new(
         protocol_version: u16,
         tls_exporter: &[u8],
@@ -304,7 +311,8 @@ impl PairingTxn {
         sas_digest.update(binding_digest);
         let sas_digest: [u8; 32] = sas_digest.finalize().into();
         let sas = SasCode(
-            u32::from_be_bytes(sas_digest[..4].try_into().expect("fixed slice")) % SAS_MODULUS,
+            u32::from_be_bytes([sas_digest[0], sas_digest[1], sas_digest[2], sas_digest[3]])
+                % SAS_MODULUS,
         );
 
         Ok(Self {
@@ -333,6 +341,12 @@ impl PairingTxn {
         self.phase
     }
 
+    /// Creates this role's signed acceptance for the transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `signer` does not own the specified role's
+    /// identity or its signing backend fails.
     pub fn create_acceptance(
         &self,
         role: PairingRole,
@@ -346,6 +360,11 @@ impl PairingTxn {
     }
 
     /// Applies exactly one state-machine action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the action is invalid for the current phase, is
+    /// duplicated, has a mismatched SAS or acceptance, or cannot be committed.
     pub fn reduce(&mut self, action: PairingAction) -> Result<PairingPhase, PairingError> {
         if matches!(self.phase, PairingPhase::Committed | PairingPhase::Aborted) {
             return Err(PairingError::InvalidTransition);
@@ -364,6 +383,11 @@ impl PairingTxn {
     }
 
     /// Returns the peer trust record visible from `local_role` after commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PairingError::NotCommitted`] unless the transaction has
+    /// completed successfully.
     pub fn committed_trust_for(
         &self,
         local_role: PairingRole,
@@ -453,7 +477,7 @@ impl fmt::Debug for PairingTxn {
             .debug_struct("PairingTxn")
             .field("phase", &self.phase)
             .field("sensitive_fields", &"[redacted]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

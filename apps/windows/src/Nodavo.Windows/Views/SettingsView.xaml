@@ -27,6 +27,20 @@
             </Border>
 
             <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="10">
+                    <TextBlock x:Uid="StartupHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock x:Uid="StartupDescription" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    <TextBlock Text="{x:Bind Lifecycle.StartupStateText, Mode=OneWay}" FontWeight="SemiBold" />
+                    <TextBlock Text="{x:Bind Lifecycle.StartupRecoveryText, Mode=OneWay}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    <Button
+                        Content="{x:Bind Lifecycle.StartupActionText, Mode=OneWay}"
+                        IsEnabled="{x:Bind Lifecycle.CanChangeStartup, Mode=OneWay}"
+                        Click="StartupActionButton_Click"
+                        HorizontalAlignment="Left" />
+                </StackPanel>
+            </Border>
+
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
                 <StackPanel Spacing="12">
                     <TextBlock x:Uid="SafetyHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
                     <TextBlock x:Uid="SafetyScope" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />

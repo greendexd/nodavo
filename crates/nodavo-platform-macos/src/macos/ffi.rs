@@ -1,8 +1,9 @@
 //! The only direct native FFI boundary in this crate.
 
-use std::ffi::c_void;
+use std::ffi::{CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
+use std::rc::Rc;
 
 use core_foundation::base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType, ToVoid};
 use core_foundation::boolean::CFBoolean;
@@ -46,6 +47,124 @@ const PASTEBOARD_UTF8_TEXT: u8 = 1;
 const PASTEBOARD_HTML: u8 = 2;
 const PASTEBOARD_PNG: u8 = 3;
 
+const AUDIT_TOKEN_WORDS: usize = 8;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+const SIGNING_IDENTIFIER_CAPACITY: usize = 128;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+const TEAM_IDENTIFIER_CAPACITY: usize = 32;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+const APPLICATION_IDENTIFIER_CAPACITY: usize = 192;
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) const CODE_EVIDENCE_EXTERNAL_REQUIREMENT: u8 = 1 << 0;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) const CODE_EVIDENCE_DESIGNATED_REQUIREMENT: u8 = 1 << 1;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) const CODE_EVIDENCE_CERTIFICATE_CHAIN: u8 = 1 << 2;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) const CODE_EVIDENCE_CMS: u8 = 1 << 3;
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) const CODE_EVIDENCE_GET_TASK_ALLOW: u8 = 1 << 4;
+
+#[repr(C)]
+struct RawAuditToken {
+    words: [u32; AUDIT_TOKEN_WORDS],
+}
+
+#[repr(C)]
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+struct RawCodeSignatureClaims {
+    static_flags: u32,
+    dynamic_status: u32,
+    external_requirement_valid: u8,
+    designated_requirement_valid: u8,
+    certificate_chain_present: u8,
+    cms_present: u8,
+    get_task_allow: u8,
+    signing_identifier: [c_char; SIGNING_IDENTIFIER_CAPACITY],
+    team_identifier: [c_char; TEAM_IDENTIFIER_CAPACITY],
+    secured_bundle_identifier: [c_char; SIGNING_IDENTIFIER_CAPACITY],
+    application_identifier: [c_char; APPLICATION_IDENTIFIER_CAPACITY],
+}
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+impl RawCodeSignatureClaims {
+    const fn empty() -> Self {
+        Self {
+            static_flags: 0,
+            dynamic_status: 0,
+            external_requirement_valid: 0,
+            designated_requirement_valid: 0,
+            certificate_chain_present: 0,
+            cms_present: 0,
+            get_task_allow: 0,
+            signing_identifier: [0; SIGNING_IDENTIFIER_CAPACITY],
+            team_identifier: [0; TEAM_IDENTIFIER_CAPACITY],
+            secured_bundle_identifier: [0; SIGNING_IDENTIFIER_CAPACITY],
+            application_identifier: [0; APPLICATION_IDENTIFIER_CAPACITY],
+        }
+    }
+}
+
+pub(crate) struct NativePeerToken {
+    pub(crate) words: [u32; AUDIT_TOKEN_WORDS],
+    pub(crate) effective_uid: u32,
+}
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) struct NativeCodeSignatureClaims {
+    pub(crate) signing_identifier: Option<String>,
+    pub(crate) team_identifier: Option<String>,
+    pub(crate) secured_bundle_identifier: Option<String>,
+    pub(crate) application_identifier: Option<String>,
+    pub(crate) static_flags: u32,
+    pub(crate) dynamic_status: u32,
+    pub(crate) evidence: u8,
+}
+
+const XPC_EVENT_REQUEST: u32 = 1;
+const XPC_EVENT_LISTENER_INVALID: u32 = 2;
+
+type RawXpcEventCallback = unsafe extern "C" fn(*mut c_void, u32, *const u8, usize, *mut c_void);
+
+pub(crate) enum NativeXpcEvent {
+    Request {
+        payload: Vec<u8>,
+        reply: NativeXpcReply,
+    },
+    ListenerInvalid,
+}
+
+struct XpcCallbackContext {
+    maximum_message_bytes: usize,
+    callback: Box<dyn Fn(NativeXpcEvent) + Send + Sync>,
+}
+
+pub(crate) struct NativeXpcListener {
+    raw: NonNull<c_void>,
+    callback_context: NonNull<XpcCallbackContext>,
+    // Prevent safe code from moving the listener into a callback-accessible
+    // cross-thread owner and dropping it reentrantly while the trampoline is
+    // borrowing the callback context.
+    _not_send_or_sync: std::marker::PhantomData<Rc<()>>,
+}
+
+pub(crate) struct NativeXpcListenerLimits {
+    pub(crate) maximum_message_bytes: usize,
+    pub(crate) maximum_peers: usize,
+    pub(crate) maximum_peer_outstanding: usize,
+    pub(crate) maximum_global_outstanding: usize,
+    pub(crate) reply_deadline_milliseconds: u64,
+}
+
+pub(crate) struct NativeXpcReply {
+    raw: Option<NonNull<c_void>>,
+}
+
+// SAFETY: A native reply handle is consumed exactly once by send or drop. Both
+// native operations enqueue completion onto the listener's serial queue.
+unsafe impl Send for NativeXpcReply {}
+
 #[repr(C)]
 struct RawPasteboardSnapshot {
     change_count: i64,
@@ -76,6 +195,37 @@ impl Drop for RawPasteboardSnapshot {
 }
 
 unsafe extern "C" {
+    fn ndv_xpc_listener_create(
+        service_name: *const c_char,
+        peer_requirement: *const c_char,
+        maximum_message_bytes: usize,
+        maximum_peers: usize,
+        maximum_peer_outstanding: usize,
+        maximum_global_outstanding: usize,
+        reply_deadline_milliseconds: u64,
+        callback: RawXpcEventCallback,
+        callback_context: *mut c_void,
+    ) -> *mut c_void;
+    fn ndv_xpc_listener_activate(listener: *mut c_void) -> i32;
+    fn ndv_xpc_listener_destroy(listener: *mut c_void);
+    fn ndv_xpc_reply_send(
+        reply: *mut c_void,
+        bytes: *const u8,
+        length: usize,
+        maximum_message_bytes: usize,
+    ) -> i32;
+    fn ndv_xpc_reply_abandon(reply: *mut c_void);
+    fn ndv_copy_local_peer_token(
+        socket_fd: i32,
+        out_token: *mut RawAuditToken,
+        out_effective_uid: *mut u32,
+    ) -> i32;
+    #[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+    fn ndv_copy_peer_code_signature_claims(
+        token: *const RawAuditToken,
+        requirement_utf8: *const c_char,
+        out_claims: *mut RawCodeSignatureClaims,
+    ) -> i32;
     fn ndv_pasteboard_copy_snapshot(
         nullable_name: *const c_void,
         max_text: usize,
@@ -95,6 +245,226 @@ unsafe extern "C" {
     -> i32;
     #[cfg(test)]
     fn ndv_pasteboard_release_named(name: *const c_void);
+}
+
+impl NativeXpcListener {
+    pub(crate) fn start<F>(
+        service_name: &str,
+        peer_requirement: &str,
+        limits: &NativeXpcListenerLimits,
+        callback: F,
+    ) -> Result<Self, ()>
+    where
+        F: Fn(NativeXpcEvent) + Send + Sync + 'static,
+    {
+        let service_name = CString::new(service_name).map_err(|_| ())?;
+        let peer_requirement = CString::new(peer_requirement).map_err(|_| ())?;
+        let context = Box::new(XpcCallbackContext {
+            maximum_message_bytes: limits.maximum_message_bytes,
+            callback: Box::new(callback),
+        });
+        let callback_context = NonNull::from(Box::leak(context));
+        // SAFETY: Both strings are NUL-terminated and immutable for the call.
+        // The leaked callback context remains valid until listener destruction,
+        // whose native queue drain precedes reclaiming it in `Drop`.
+        let raw = unsafe {
+            ndv_xpc_listener_create(
+                service_name.as_ptr(),
+                peer_requirement.as_ptr(),
+                limits.maximum_message_bytes,
+                limits.maximum_peers,
+                limits.maximum_peer_outstanding,
+                limits.maximum_global_outstanding,
+                limits.reply_deadline_milliseconds,
+                native_xpc_event,
+                callback_context.as_ptr().cast(),
+            )
+        };
+        let Some(raw) = NonNull::new(raw) else {
+            // SAFETY: `callback_context` came from `Box::leak` above and native
+            // creation failed without retaining or invoking it.
+            drop(unsafe { Box::from_raw(callback_context.as_ptr()) });
+            return Err(());
+        };
+
+        // SAFETY: `raw` is one retained native listener returned by create.
+        if unsafe { ndv_xpc_listener_activate(raw.as_ptr()) } != 0 {
+            // SAFETY: Activation failure still leaves one valid native handle
+            // that must be canceled and released before reclaiming context.
+            unsafe { ndv_xpc_listener_destroy(raw.as_ptr()) };
+            // SAFETY: Native destruction drains callbacks before returning.
+            drop(unsafe { Box::from_raw(callback_context.as_ptr()) });
+            return Err(());
+        }
+        Ok(Self {
+            raw,
+            callback_context,
+            _not_send_or_sync: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for NativeXpcListener {
+    fn drop(&mut self) {
+        // SAFETY: This object owns the one native handle. Destruction cancels
+        // and drains its serial callback queue before the Rust context is freed.
+        unsafe { ndv_xpc_listener_destroy(self.raw.as_ptr()) };
+        // SAFETY: The context was allocated by `Box::leak` in `start` and is
+        // reclaimed exactly once after native callback quiescence.
+        drop(unsafe { Box::from_raw(self.callback_context.as_ptr()) });
+    }
+}
+
+impl NativeXpcReply {
+    pub(crate) fn send(mut self, payload: &[u8], maximum_message_bytes: usize) -> Result<(), ()> {
+        let raw = self.raw.take().ok_or(())?;
+        let bytes = if payload.is_empty() {
+            ptr::null()
+        } else {
+            payload.as_ptr()
+        };
+        // SAFETY: `raw` is the one owned reply reference and is transferred to
+        // the native send call. The slice stays immutable for the synchronous
+        // copy and is non-null whenever its length is nonzero.
+        let status = unsafe {
+            ndv_xpc_reply_send(raw.as_ptr(), bytes, payload.len(), maximum_message_bytes)
+        };
+        if status == 0 { Ok(()) } else { Err(()) }
+    }
+}
+
+impl Drop for NativeXpcReply {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            // SAFETY: `raw` is the one owned native reply reference. Abandon
+            // consumes it and schedules bounded peer cancellation.
+            unsafe { ndv_xpc_reply_abandon(raw.as_ptr()) };
+        }
+    }
+}
+
+unsafe extern "C" fn native_xpc_event(
+    callback_context: *mut c_void,
+    event_kind: u32,
+    nullable_bytes: *const u8,
+    length: usize,
+    nullable_reply: *mut c_void,
+) {
+    let reply = NonNull::new(nullable_reply).map(|raw| NativeXpcReply { raw: Some(raw) });
+    let Some(context) = NonNull::new(callback_context.cast::<XpcCallbackContext>()) else {
+        drop(reply);
+        return;
+    };
+
+    // SAFETY: Listener creation stores this context until native destruction
+    // drains the callback queue. This trampoline runs only inside that window.
+    let context = unsafe { context.as_ref() };
+    let event = match event_kind {
+        XPC_EVENT_REQUEST => {
+            let Some(reply) = reply else {
+                return;
+            };
+            if nullable_bytes.is_null() || length == 0 || length > context.maximum_message_bytes {
+                drop(reply);
+                return;
+            }
+            // SAFETY: The XPC data storage is valid and immutable for this
+            // synchronous native callback, and native code already bounded it.
+            let payload = unsafe { std::slice::from_raw_parts(nullable_bytes, length) }.to_vec();
+            NativeXpcEvent::Request { payload, reply }
+        }
+        XPC_EVENT_LISTENER_INVALID => {
+            drop(reply);
+            NativeXpcEvent::ListenerInvalid
+        }
+        _ => {
+            drop(reply);
+            return;
+        }
+    };
+    let _ = catch_unwind(AssertUnwindSafe(|| (context.callback)(event)));
+}
+
+pub(crate) fn local_peer_token(socket: i32) -> Result<NativePeerToken, ()> {
+    let mut token = RawAuditToken {
+        words: [0; AUDIT_TOKEN_WORDS],
+    };
+    let mut effective_uid = 0_u32;
+    // SAFETY: Both outputs are initialized, exclusively borrowed, and valid
+    // for the call. The native shim validates the descriptor, exact token
+    // length, and output pointers before copying bounded scalar fields.
+    let status =
+        unsafe { ndv_copy_local_peer_token(socket, &raw mut token, &raw mut effective_uid) };
+    if status == 0 {
+        Ok(NativePeerToken {
+            words: token.words,
+            effective_uid,
+        })
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+pub(crate) fn peer_code_signature_claims(
+    token_words: [u32; AUDIT_TOKEN_WORDS],
+    requirement: &str,
+) -> Result<NativeCodeSignatureClaims, ()> {
+    let requirement = CString::new(requirement).map_err(|_| ())?;
+    let token = RawAuditToken { words: token_words };
+    let mut claims = RawCodeSignatureClaims::empty();
+    // SAFETY: `token`, the NUL-terminated immutable requirement, and the
+    // initialized exclusive output remain valid for the synchronous call. The
+    // native shim copies only fixed-capacity scalar/string claims and retains
+    // no caller-owned pointer.
+    let status = unsafe {
+        ndv_copy_peer_code_signature_claims(&raw const token, requirement.as_ptr(), &raw mut claims)
+    };
+    if status != 0 {
+        return Err(());
+    }
+    let evidence = evidence_bit(
+        claims.external_requirement_valid,
+        CODE_EVIDENCE_EXTERNAL_REQUIREMENT,
+    )? | evidence_bit(
+        claims.designated_requirement_valid,
+        CODE_EVIDENCE_DESIGNATED_REQUIREMENT,
+    )? | evidence_bit(
+        claims.certificate_chain_present,
+        CODE_EVIDENCE_CERTIFICATE_CHAIN,
+    )? | evidence_bit(claims.cms_present, CODE_EVIDENCE_CMS)?
+        | evidence_bit(claims.get_task_allow, CODE_EVIDENCE_GET_TASK_ALLOW)?;
+    Ok(NativeCodeSignatureClaims {
+        signing_identifier: decode_bounded_c_string(&claims.signing_identifier)?,
+        team_identifier: decode_bounded_c_string(&claims.team_identifier)?,
+        secured_bundle_identifier: decode_bounded_c_string(&claims.secured_bundle_identifier)?,
+        application_identifier: decode_bounded_c_string(&claims.application_identifier)?,
+        static_flags: claims.static_flags,
+        dynamic_status: claims.dynamic_status,
+        evidence,
+    })
+}
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+fn decode_bounded_c_string<const N: usize>(value: &[c_char; N]) -> Result<Option<String>, ()> {
+    let bytes = value.map(i8::cast_unsigned);
+    let end = bytes.iter().position(|byte| *byte == 0).ok_or(())?;
+    if end == 0 {
+        return Ok(None);
+    }
+    std::str::from_utf8(&bytes[..end])
+        .map(str::to_owned)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+#[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
+const fn evidence_bit(value: u8, bit: u8) -> Result<u8, ()> {
+    match value {
+        0 => Ok(0),
+        1 => Ok(bit),
+        _ => Err(()),
+    }
 }
 
 pub(crate) fn clipboard_snapshot(

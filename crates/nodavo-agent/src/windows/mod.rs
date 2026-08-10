@@ -3,21 +3,35 @@
 mod platform;
 mod storage;
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use nodavo_platform_windows::{
-    create_private_named_pipe, current_user_agent_pipe_name, probe_environment,
-    validate_named_pipe_client,
+    AuthorizedWindowsUi, authorize_named_pipe_client, create_private_named_pipe,
+    current_user_agent_pipe_name, probe_environment,
 };
 use tokio::signal;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use self::storage::WindowsDpapiStorage;
-use crate::{initialize_runtime, serve_connection};
+use crate::{FrameAuthorization, initialize_runtime, serve_connection_authorized};
 
 pub(crate) use self::platform::WindowsPlatformPort;
+
+struct WindowsUiFrameAuthorization(AuthorizedWindowsUi);
+
+impl FrameAuthorization for WindowsUiFrameAuthorization {
+    fn authorize_frame_gate(&mut self) -> io::Result<()> {
+        self.0.revalidate().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Windows UI authorization changed",
+            )
+        })
+    }
+}
 
 pub(crate) fn default_state_directory() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("NODAVO_STATE_DIR") {
@@ -53,12 +67,15 @@ pub(super) async fn run_server() -> Result<(), String> {
             }
             connected = ipc_server.connect() => {
                 connected.map_err(|_| "local IPC accept failed".to_owned())?;
-                if validate_named_pipe_client(&ipc_server).is_err() {
-                    warn!(code = "local_ipc_peer_rejected", "local IPC peer was rejected");
-                    ipc_server = create_private_named_pipe(&pipe_name, false)
-                        .map_err(|_| "failed to renew private local IPC".to_owned())?;
-                    continue;
-                }
+                let authorization = match authorize_named_pipe_client(&ipc_server) {
+                    Ok(authorization) => WindowsUiFrameAuthorization(authorization),
+                    Err(_) => {
+                        warn!(code = "local_ipc_peer_rejected", "local IPC peer was rejected");
+                        ipc_server = create_private_named_pipe(&pipe_name, false)
+                            .map_err(|_| "failed to renew private local IPC".to_owned())?;
+                        continue;
+                    }
+                };
 
                 let stream = ipc_server;
                 ipc_server = create_private_named_pipe(&pipe_name, false)
@@ -66,7 +83,12 @@ pub(super) async fn run_server() -> Result<(), String> {
                 let runtime = Arc::clone(&runtime);
                 let shutdown = shutdown_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = serve_connection(stream, runtime, shutdown).await {
+                    if let Err(error) = serve_connection_authorized(
+                        stream,
+                        runtime,
+                        shutdown,
+                        authorization,
+                    ).await {
                         error!(code = "local_ipc", %error, "local UI connection failed");
                     }
                 });

@@ -1,13 +1,21 @@
 {
   "schemaVersion": 1,
+  "lifecycle": {
+    "agentExecutable": "agent\\nodavo-agent.exe",
+    "startupTaskId": "NodavoAgentStartup"
+  },
   "release": {
     "packageIdentityName": "dev.nodavo.Nodavo",
+    "applicationId": "App",
+    "executable": "Nodavo.Windows.exe",
     "displayName": "Nodavo",
     "description": "Local-first software KVM for macOS and Windows"
   },
   "development": {
     "packageIdentityName": "dev.nodavo.Nodavo.Development",
     "publisher": "CN=Nodavo Development Only",
+    "applicationId": "App",
+    "executable": "Nodavo.Windows.exe",
     "publisherDisplayName": "Nodavo Development",
     "displayName": "Nodavo (Development)",
     "description": "DEVELOPMENT BUILD - NOT FOR DISTRIBUTION"

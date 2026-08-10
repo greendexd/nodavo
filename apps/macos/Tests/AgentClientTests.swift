@@ -1,6 +1,61 @@
 import Foundation
+import Darwin
+import Security
 import Testing
 @testable import NodavoMac
+
+#if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+@Test func localSocketDescriptorIsClosedAcrossExec() throws {
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    #expect(descriptor >= 0)
+    defer { close(descriptor) }
+
+    try AgentClient.setCloseOnExec(descriptor)
+
+    let flags = Darwin.fcntl(descriptor, F_GETFD)
+    #expect(flags >= 0)
+    #expect(flags & FD_CLOEXEC == FD_CLOEXEC)
+}
+#endif
+
+@Test func releaseXpcConfigurationBindsExactAgentIdentity() throws {
+    #if !NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+    let configuration = try AgentXpcConfiguration.load(infoDictionary: [
+        "NodavoAgentMachService": "dev.nodavo.agent.ipc",
+        "NodavoAppleTeamIdentifier": "ABCDE12345",
+    ])
+    #expect(configuration.serviceName == "dev.nodavo.agent.ipc")
+    #expect(configuration.peerCodeSigningRequirement.contains("identifier \"dev.nodavo.agent\""))
+    #expect(configuration.peerCodeSigningRequirement.contains("ABCDE12345.dev.nodavo.agent"))
+    #expect(configuration.peerCodeSigningRequirement.contains("get-task-allow\"] absent"))
+
+    var requirement: SecRequirement?
+    let status = SecRequirementCreateWithString(
+        configuration.peerCodeSigningRequirement as CFString,
+        SecCSFlags(),
+        &requirement
+    )
+    #expect(status == errSecSuccess)
+    #expect(requirement != nil)
+    #endif
+}
+
+@Test func releaseXpcConfigurationRejectsWrongServiceOrTeam() {
+    #if !NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+    #expect(throws: AgentClientError.self) {
+        try AgentXpcConfiguration.load(infoDictionary: [
+            "NodavoAgentMachService": "dev.attacker.agent.ipc",
+            "NodavoAppleTeamIdentifier": "ABCDE12345",
+        ])
+    }
+    #expect(throws: AgentClientError.self) {
+        try AgentXpcConfiguration.load(infoDictionary: [
+            "NodavoAgentMachService": "dev.nodavo.agent.ipc",
+            "NodavoAppleTeamIdentifier": "DEVELOPMENT",
+        ])
+    }
+    #endif
+}
 
 @Test func trustedPeerDecoderAcceptsBoundedPublicSummary() throws {
     let data = Data(#"""

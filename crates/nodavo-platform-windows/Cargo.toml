@@ -8,6 +8,10 @@ rust-version.workspace = true
 description = "Windows input, display, session, and clipboard boundary for Nodavo"
 publish = false
 
+[features]
+windows-ui-auth-development = []
+windows-ui-auth-release = []
+
 [dependencies]
 nodavo-input = { path = "../nodavo-input" }
 thiserror.workspace = true
@@ -21,7 +25,11 @@ windows = { workspace = true, features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",

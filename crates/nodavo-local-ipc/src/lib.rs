@@ -21,10 +21,10 @@ pub const MAX_SELECTED_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_UPDATE_VERSION_BYTES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
+#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiCommand {
-    GetStatus,
-    ListTrustedPeers,
+    GetStatus {},
+    ListTrustedPeers {},
     BeginPairing {
         endpoint: String,
         #[serde(default)]
@@ -51,23 +51,23 @@ pub enum UiCommand {
         ttl_ms: u32,
     },
     /// Returns focus to the local device without tearing down the peer link.
-    ReleaseFocus,
+    ReleaseFocus {},
     /// Reports a trusted local workstation-lock notification.
-    LocalLocked,
+    LocalLocked {},
     /// Reports a trusted local system-sleep notification.
-    LocalSleeping,
+    LocalSleeping {},
     /// Returns the current public updater state without starting network work.
-    GetUpdateStatus,
+    GetUpdateStatus {},
     /// Starts an explicitly requested update check.
-    CheckForUpdate,
+    CheckForUpdate {},
     /// Records a decision for exactly the currently offered update identifier.
     DecideUpdate {
         #[serde(deserialize_with = "deserialize_offer_id")]
         offer_id: String,
         accepted: bool,
     },
-    EmergencyStop,
-    Shutdown,
+    EmergencyStop {},
+    Shutdown {},
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,13 +517,36 @@ mod tests {
 
     #[tokio::test]
     async fn command_round_trip() {
-        let expected = UiCommand::EmergencyStop;
+        let expected = UiCommand::EmergencyStop {};
         let mut encoded = Vec::new();
         write_frame(&mut encoded, &expected).await.unwrap();
         let actual = read_frame::<_, UiCommand>(&mut encoded.as_slice())
             .await
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn command_decoder_rejects_unknown_fields_directly_and_in_a_frame() {
+        let unexpected = br#"{"command":"get_status","queued_before_exec":true}"#;
+        assert!(serde_json::from_slice::<UiCommand>(unexpected).is_err());
+
+        let mut framed = u32::try_from(unexpected.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        framed.extend_from_slice(unexpected);
+        assert!(matches!(
+            read_frame::<_, UiCommand>(&mut framed.as_slice()).await,
+            Err(IpcError::InvalidMessage(_))
+        ));
+
+        assert!(
+            serde_json::from_str::<UiCommand>(
+                r#"{"command":"begin_pairing","endpoint":"listen","unexpected":1}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -556,15 +579,15 @@ mod tests {
         assert_eq!(request, UiCommand::RequestRemoteFocus { ttl_ms: 5_000 });
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"release_focus"}"#).unwrap(),
-            UiCommand::ReleaseFocus
+            UiCommand::ReleaseFocus {}
         );
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"local_locked"}"#).unwrap(),
-            UiCommand::LocalLocked
+            UiCommand::LocalLocked {}
         );
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"local_sleeping"}"#).unwrap(),
-            UiCommand::LocalSleeping
+            UiCommand::LocalSleeping {}
         );
     }
 
@@ -600,7 +623,7 @@ mod tests {
     fn trusted_peer_listing_has_a_stable_command_name() {
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"list_trusted_peers"}"#).unwrap(),
-            UiCommand::ListTrustedPeers
+            UiCommand::ListTrustedPeers {}
         );
     }
 
@@ -633,11 +656,11 @@ mod tests {
     fn updater_commands_have_stable_exact_offer_shape() {
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"get_update_status"}"#).unwrap(),
-            UiCommand::GetUpdateStatus
+            UiCommand::GetUpdateStatus {}
         );
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"check_for_update"}"#).unwrap(),
-            UiCommand::CheckForUpdate
+            UiCommand::CheckForUpdate {}
         );
         let decision = UiCommand::DecideUpdate {
             offer_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),

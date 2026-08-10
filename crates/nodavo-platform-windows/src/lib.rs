@@ -14,6 +14,12 @@ mod clipboard;
 
 mod input_runtime;
 
+#[cfg(any(target_os = "windows", test))]
+mod windows_ipc_policy;
+
+#[cfg(any(target_os = "windows", test))]
+pub use windows_ipc_policy::WindowsUiAuthMode;
+
 pub use input_runtime::{
     ForceReleaseAcknowledgement, WindowsInputCaptureEvent, WindowsInputLifecycleEvent,
 };
@@ -266,7 +272,7 @@ pub enum WindowsPlatformError {
     InvalidClipboardHtml,
     #[error("clipboard image data is empty or uses an unsupported format")]
     InvalidClipboardImage,
-    #[error("the local Windows IPC client is not the current interactive user session")]
+    #[error("the local Windows IPC client is not the authorized packaged UI")]
     UnauthorizedLocalIpc,
     #[error("the secret or protected blob exceeds its hard size limit")]
     SecretTooLarge,
@@ -285,10 +291,11 @@ mod windows;
 
 #[cfg(target_os = "windows")]
 pub use self::windows::{
-    WindowsClipboard, WindowsInputCapture, WindowsInputInjector, active_displays,
+    AuthorizedWindowsUi, WindowsClipboard, WindowsInputCapture, WindowsInputInjector,
+    active_displays, authorize_named_pipe_client, compiled_windows_ui_auth_mode,
     create_private_named_pipe, current_user_agent_pipe_name, probe_environment,
     protect_current_user_secret, replace_file_atomic, run_input_capture,
-    unprotect_current_user_secret, validate_named_pipe_client,
+    unprotect_current_user_secret, validate_compiled_windows_ui_auth_policy,
 };
 
 /// Non-Windows probe stub used by workspace tooling and portable callers.

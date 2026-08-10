@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 3 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 7 -->
 
 # Архитектура
 
@@ -16,7 +16,7 @@ flowchart TB
         MUI["SwiftUI menu-bar app"]
         MA["Rust session agent"]
         MAP["CGEventTap / CGEvent / NSPasteboard"]
-        MUI <-->|"private user UDS<br/>для release нужен client auth"| MA
+        MUI <-->|"launchd Mach-service XPC<br/>взаимные per-message signing gates"| MA
         MA <--> MAP
     end
 
@@ -24,7 +24,7 @@ flowchart TB
         WUI["WinUI 3 tray app"]
         WA["Rust session agent"]
         WAP["Raw Input / hooks / SendInput / Win32 Clipboard + OLE"]
-        WUI <-->|"same-user/session named pipe<br/>для release нужен client auth"| WA
+        WUI <-->|"current-user named pipe<br/>package/process/Authenticode gate"| WA
         WA <--> WAP
     end
 
@@ -45,7 +45,7 @@ flowchart TB
 | `nodavo-input` | Canonical HID events, mappings, coordinates и modifier state |
 | `nodavo-clipboard` | Text/HTML/image normalization, revisions, ownership и limits |
 | `nodavo-transfer` | Manifests, chunks, staging, BLAKE3, resume, quota и finalize |
-| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard и drag APIs |
+| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard, Keychain и signed local-IPC peer policy |
 | `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard и OLE APIs |
 | `nodavo-local-ipc` | Authenticated UI ↔ agent protocol и OS access controls |
 | `nodavo-agent` | Process orchestration и lifecycle |
@@ -101,6 +101,14 @@ Finder ↔ Explorer drag/drop является M0 research gate. Если native
 ## Привилегии процессов
 
 Agent 1.0 по умолчанию работает в user session. Privileged Windows service исключён: управление login/UAC secure desktop значительно расширит attack surface. Будущий privileged component потребует отдельный threat model и capability boundary.
+
+## Доверие локальных процессов
+
+Release-путь macOS использует пользовательский launchd Mach service `dev.nodavo.agent.ipc`. До activation агент настраивает listener и каждое принятое connection точным code-signing requirement UI; Swift UI до activation client устанавливает взаимный точный requirement агента. XPC проверяет каждое полученное сообщение. Оба requirements связывают Developer ID chain, Team ID времени компиляции, точные identifiers и application/team entitlements, а также отсутствие `get-task-allow`. XPC dictionaries с одним значением переносят существующий bounded deny-unknown JSON contract в общий exhaustive dispatcher агента.
+
+Предыдущий UDS audit-token design отозван, потому что текущая task identity из `LOCAL_PEERTOKEN` не определяет происхождение bytes, поставленных в очередь до exec. Development packaging намеренно сохраняет этот приватный same-UID UDS только за non-default feature и помечает артефакт unsafe/non-distributable; release Mach service в нём не объявляется. Release не имеет UDS fallback или environment path override. Взаимный enforcement реализован в source, а live evidence production signing/notarization и installed mutual runtime остаются открытыми release gates. Payload и metadata процесса не логируются.
+
+В Windows каждое current-user named-pipe connection переносит ровно один request и response. Server удерживает связанные с connection handles pipe, process, token и executable точного packaged UI. До отправки UI аутентифицирует собственные compile-time package/PFN/AUMID и installed content root, затем удерживает server process, token, точный non-reparse agent executable внутри этого root и закреплённый Authenticode evidence. В обоих направлениях проверяются session/logon lineage и стабильность process/token до использования аутентифицированного результата. Для отдельно запущенного Rust agent не заявляется package identity; взаимным trust anchor служат его точный installed path и signature. Development и release UI package identities разделены compile-time policies; unpackaged или unconfigured peers fail closed, а packaging подписывает и проверяет оба executables. Policy покрыта source и cross-target checks, но installed-MSIX behavior, production publisher/signing/timestamp credentials и реальное выполнение x64/ARM64 остаются release gates. Эта граница отклоняет независимый same-user process, занявший endpoint. Она не создаёт отдельный Windows principal: invasive access к handles или memory авторизованного process явно находится вне заявленной threat model 1.0.
 
 ## Наблюдаемость
 

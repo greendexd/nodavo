@@ -35,6 +35,24 @@
                 </StackPanel>
             </Border>
 
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="10">
+                    <TextBlock x:Uid="AgentLifecycleHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="{x:Bind Lifecycle.AgentStateText, Mode=OneWay}" FontWeight="SemiBold" />
+                    <TextBlock Text="{x:Bind Lifecycle.AgentRecoveryText, Mode=OneWay}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <Button
+                            x:Uid="StartAgentButton"
+                            IsEnabled="{x:Bind Lifecycle.CanStartAgent, Mode=OneWay}"
+                            Click="StartAgentButton_Click" />
+                        <ProgressRing
+                            Width="20"
+                            Height="20"
+                            IsActive="{x:Bind Lifecycle.IsLifecycleOperationInProgress, Mode=OneWay}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
             <StackPanel Orientation="Horizontal" Spacing="10">
                 <Button x:Uid="RefreshButton" Click="RefreshButton_Click" />
                 <Button x:Uid="EmergencyStopButton" Click="EmergencyStopButton_Click" />

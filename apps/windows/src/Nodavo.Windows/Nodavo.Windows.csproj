@@ -35,4 +35,35 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.6.250205002" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.3916" />
   </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.Mode</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthMode)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.PackageNameBase64</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthPackageNameBase64)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.PublisherBase64</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthPublisherBase64)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.PackageFamilyNameBase64</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthPackageFamilyNameBase64)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.ApplicationUserModelIdBase64</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthApplicationUserModelIdBase64)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.RelativeExecutableBase64</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthRelativeExecutableBase64)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>Nodavo.AgentServerAuth.SignerCertificateSha256</_Parameter1>
+      <_Parameter2>$(NodavoAgentServerAuthSignerCertificateSha256)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
 </Project>

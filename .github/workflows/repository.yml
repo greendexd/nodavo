@@ -79,10 +79,25 @@ jobs:
         run: rustup toolchain install stable --profile minimal
       - name: Check the Rust workspace for Windows x64
         run: cargo check --workspace --locked --target x86_64-pc-windows-msvc
+      - name: Run Windows local IPC policy and ordinary-process rejection tests
+        shell: pwsh
+        env:
+          NODAVO_WINDOWS_AUTH_SIGNER_CERT_SHA256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: |
+          cargo test -p nodavo-platform-windows --locked --target x86_64-pc-windows-msvc
+          cargo test -p nodavo-platform-windows --locked `
+            --target x86_64-pc-windows-msvc `
+            --no-default-features `
+            --features windows-ui-auth-development `
+            private_pipe_rejects_an_unpackaged_current_process
       - name: Install .NET 8 for the WinUI shell
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.x
+      - name: Run Windows product and lifecycle static checks
+        run: python apps/windows/tests/check_product_ui.py
+      - name: Run Windows agent auth policy, lifecycle, race, and timeout tests
+        run: dotnet run --project apps/windows/tests/Nodavo.Windows.Lifecycle.Tests/Nodavo.Windows.Lifecycle.Tests.csproj --configuration Release
       - name: Restore Windows App SDK packages
         run: dotnet restore apps/windows/Nodavo.Windows.sln -p:Platform=x64
       - name: Compile the WinUI 3 shell for Windows x64

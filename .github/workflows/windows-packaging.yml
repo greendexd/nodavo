@@ -43,6 +43,12 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Run agent auth policy, lifecycle, race, timeout, and manifest checks
+        shell: pwsh
+        run: |
+          python apps/windows/tests/check_product_ui.py
+          dotnet run --project apps/windows/tests/Nodavo.Windows.Lifecycle.Tests/Nodavo.Windows.Lifecycle.Tests.csproj --configuration Release
+
       - name: Build and verify the development MSIX bundle
         shell: pwsh
         run: |

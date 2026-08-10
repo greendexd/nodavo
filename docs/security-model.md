@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 10 -->
+<!-- doc-id: security-model; lang: en; revision: 13 -->
 
 # Security model
 
@@ -20,11 +20,11 @@ This is a design target, not a claim about a released implementation. The public
 - An attacker on the same local network.
 - A spoofed discovery service or pairing man-in-the-middle.
 - A previously trusted but now compromised peer.
-- A malicious local process attempting to impersonate the UI or agent.
+- An independent malicious local process attempting to impersonate the UI or agent over its documented IPC endpoint, without first obtaining invasive access to an authorized Nodavo process.
 - A malicious clipboard/file sender exploiting parsers, paths, quotas, or auto-open behavior.
 - A compromised dependency, build runner, download host, or update manifest.
 
-Physical compromise of either paired machine, kernel compromise, malicious firmware, and a compromised OS trust store are outside the 1.0 defensive boundary, but must be stated in release documentation.
+Physical compromise of either paired machine, kernel compromise, malicious firmware, and a compromised OS trust store are outside the 1.0 defensive boundary, but must be stated in release documentation. So are code injection, process hollowing, debugging, `PROCESS_DUP_HANDLE`, process-memory read/write, or arbitrary-code compromise involving an already authorized Nodavo UI or agent process: the local IPC gates reject an independent impersonating endpoint, but they do not create a separate OS principal or integrity boundary around the trusted process itself. Windows full-trust UI/agent processes make this distinction especially important. Supporting a threat model that includes invasive same-user process access requires a separately qualified broker or OS principal and is not claimed by 1.0.
 
 ## Trust establishment
 
@@ -99,12 +99,20 @@ The running agent associates inbound transfer identifiers only after an authenti
 
 ## Local IPC
 
-- macOS uses a user-owned Unix domain socket with restrictive permissions and peer credential checks.
-- Windows uses a named pipe with an ACL limited to the current user and validates the peer process context.
+- macOS release builds use the per-user launchd Mach service `dev.nodavo.agent.ipc` with reciprocal per-message XPC code-signing requirements; only the explicit non-distributable development feature uses a private same-UID UDS.
+- Windows uses one-request named-pipe connections with a current-user ACL and reciprocal connection-bound guards for the exact packaged UI and agent processes before any request is sent or decoded.
 - UI requests are capability checked; the UI does not directly read private network keys.
 - Trusted-device listing is bounded to 32 public summaries containing only the local peer identifier, bounded display name, active/revoked state, and locally issued grants. It excludes certificates, endpoints, private material, and the peer's independently issued grants.
 
-The current pre-alpha Unix socket authenticates only the owning user credential, and the Windows pipe authenticates the same SID/session. That blocks cross-user and remote clients but does not yet distinguish the signed Nodavo UI from another process already running as the same user. This also applies to update-check and exact-offer consent commands that mutate updater state. Signed-client or launch-bound authentication is therefore a stable-release gate; sensitive local requests remain narrowly bounded and release storage must not expose network private keys to the UI.
+The macOS agent installs an exact `xpc_connection_set_peer_code_signing_requirement` before activating its Mach-service listener and every accepted peer; the Swift UI installs the reciprocal helper requirement before activating its client connection. Both requirements bind the Apple/Developer ID chain, compile-time ten-character Team ID, exact `dev.nodavo.macos` or `dev.nodavo.agent` identifier, exact application/team entitlements, and absence of `get-task-allow`. The XPC contract checks every received message, so an independent same-user process cannot launder bytes queued before an exec into the signed UI. Requests/replies are exact one-value XPC dictionaries carrying the existing deny-unknown JSON contract, limited to 64 KiB, 16 peers, four outstanding requests per peer, 32 globally, and a 360-second hard request ceiling.
+
+The earlier UDS audit-token design is explicitly withdrawn: `LOCAL_PEERTOKEN` describes current peer task state, not the origin of already queued bytes, so token rechecks and finite challenges cannot establish message provenance. Missing compile-time Team ID or Mach service fails closed, release has no UDS fallback, and `NODAVO_IPC_PATH` is ignored. Development packaging alone compiles the non-default `development-unverified-local-ipc` same-UID UDS bypass, marks it unsafe/non-distributable, and does not advertise the release Mach service. Reciprocal XPC authentication is implemented for correctly signed release builds, but live Nodavo Developer ID/provisioning/notarization credential proof and an installed mutual runtime exercise remain release gates.
+
+The Windows UI-to-agent source path retains the accepted pipe, process, primary token, and exact process-image handles for the whole one-request connection. Initial authorization requires the same SID, interactive session and logon authentication identifier as the agent; unchanged process creation time and token identifiers; a full package identity matching the compile-time package name, publisher-derived family name, AUMID, architecture, empty resource identifier, and exact `Nodavo.Windows.exe`; and a valid Authenticode signature whose leaf certificate DER hash matches the policy embedded in that agent build. The retained identity is rechecked before blocking frame input and after bounded decode immediately before dispatch.
+
+Before the Windows UI writes that request, it authenticates its own exact `Package.Current` name, publisher, PFN, AUMID, and installed content root, then obtains the pipe server PID and retains the server process, token, and no-share-delete executable handles. The server must execute the exact non-reparse `agent\nodavo-agent.exe` beneath that authenticated package root, share the UI's session/logon lineage, retain stable process creation and token identifiers, and carry the compile-time pinned Authenticode signer. It revalidates the retained identity after the framed reply and before JSON decoding. The separately launched Rust agent is not claimed to possess package identity or an AUMID; its authority comes from the authenticated package root plus the exact signed executable inside it. Development and release policies are mutually exclusive compile-time metadata with separate UI package identities; unconfigured, unpackaged, mismatched, unsigned, or substituted binaries fail closed. Release policy additionally requires normal Windows trust and validated timestamp evidence; development policy requires its separately installed development certificate and exact pin. Packaging signs and verifies both native executables before packing and again after unpacking.
+
+These Windows checks have source, policy-test, cross-target, and package-script evidence only at this stage. They have not yet been exercised by an installed packaged UI on qualified Windows x64 or ARM64 hardware, and production publisher, Authenticode, and timestamp credentials are absent. Mutual source enforcement therefore exists, while installed mutual local-IPC qualification remains a release gate. A process with invasive access to an already authorized UI or agent can still steal or manipulate its handles or memory; this is the explicitly excluded authorized-process-compromise boundary, not a claimed same-user security principal.
 
 ## Updates and supply chain
 
@@ -119,7 +127,7 @@ The following are mandatory release requirements:
 - Release artifacts will be code signed; macOS will be notarized and Windows will use Authenticode.
 - Update manifests will be signed with an offline-controlled release key.
 - Update state will reject rollback below the recorded safe version unless the user performs a documented recovery action.
-- Update-mutating local IPC will authenticate an authorized signed/provisioned Nodavo UI, not merely another process running as the same user.
+- Correctly signed releases must preserve macOS per-message reciprocal XPC code requirements and Windows reciprocal process/package/Authenticode guards with one-request pipe connections; signed mutual macOS runtime qualification, installed Windows mutual-IPC evidence, and live production credential proof remain release requirements.
 - Releases will publish checksums, SBOM, provenance, dependency lockfiles, and source commit.
 - Dependency policy, audits, CodeQL, fuzzing, and secret scanning will run continuously before a supported release exists.
 

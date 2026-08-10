@@ -41,9 +41,11 @@
     <string>Nodavo discovers and connects to explicitly paired devices on your local network.</string>
     <key>NodavoAgentBundleIdentifier</key>
     <string>dev.nodavo.agent</string>
+    <key>NodavoAgentMachService</key>
+    <string>dev.nodavo.agent.ipc</string>
+    <key>NodavoAppleTeamIdentifier</key>
+    <string>@TEAM_ID@</string>
     <key>NodavoDevelopmentBuild</key>
     <@DEVELOPMENT_BOOL@/>
-    <key>NodavoKeychainAccessGroup</key>
-    <string>@KEYCHAIN_ACCESS_GROUP@</string>
 </dict>
 </plist>

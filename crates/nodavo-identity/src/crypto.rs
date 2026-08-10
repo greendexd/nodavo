@@ -60,6 +60,12 @@ impl PublicIdentity {
         }
     }
 
+    /// Reconstructs an identity after validating its stable identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningError::IdentityMismatch`] when `device_id` was not
+    /// derived from `public_key`.
     pub fn from_parts(device_id: DeviceId, public_key: [u8; 32]) -> Result<Self, SigningError> {
         if device_id == DeviceId::from_public_key(&public_key) {
             Ok(Self {
@@ -81,6 +87,13 @@ impl PublicIdentity {
         &self.public_key
     }
 
+    /// Verifies an Ed25519 signature over `message`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigningError::InvalidPublicKey`] when this identity contains
+    /// an invalid Ed25519 key, or [`SigningError::InvalidSignature`] when the
+    /// signature does not verify for `message`.
     pub fn verify(&self, message: &[u8], signature: &DeviceSignature) -> Result<(), SigningError> {
         let key = VerifyingKey::from_bytes(&self.public_key)
             .map_err(|_| SigningError::InvalidPublicKey)?;
@@ -134,6 +147,12 @@ pub enum SigningError {
 pub trait DeviceSigner: Send + Sync {
     fn public_identity(&self) -> PublicIdentity;
 
+    /// Signs `message` with this device's persistent identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing signing provider cannot complete the
+    /// operation.
     fn sign(&self, message: &[u8]) -> Result<DeviceSignature, SigningError>;
 }
 

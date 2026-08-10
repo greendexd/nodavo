@@ -8,7 +8,7 @@ using Nodavo.Windows.Models;
 
 namespace Nodavo.Windows.Services;
 
-internal sealed class AgentClient
+internal sealed class AgentClient : IAgentReadinessProbe
 {
     private const int MaximumMessageSize = 64 * 1024;
     private const int MaximumEndpointLength = 512;
@@ -72,6 +72,26 @@ internal sealed class AgentClient
             StatusRequestTimeout,
             DecodeStatus,
             cancellationToken);
+
+    async Task<bool> IAgentReadinessProbe.IsAgentReachableAsync(
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            _ = await GetStatusAsync(cancellationToken);
+            return true;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception exception) when (
+            exception is UnauthorizedAccessException or IOException or InvalidDataException or
+            JsonException or InvalidOperationException or AgentProtocolException)
+        {
+            return false;
+        }
+    }
 
     internal Task<AgentStatusSnapshot> EmergencyStopAsync(
         CancellationToken cancellationToken = default) =>
@@ -207,9 +227,12 @@ internal sealed class AgentClient
             TokenImpersonationLevel.Identification);
 
         await pipe.ConnectAsync(deadline.Token).ConfigureAwait(false);
+        using AuthenticatedAgentServer server = AgentServerAuthenticator.Authenticate(pipe);
         byte[] payload = JsonSerializer.SerializeToUtf8Bytes(request);
         await WriteFrameAsync(pipe, payload, deadline.Token).ConfigureAwait(false);
+        server.Revalidate();
         byte[] response = await ReadFrameAsync(pipe, deadline.Token).ConfigureAwait(false);
+        server.Revalidate();
         return decode(response);
     }
 

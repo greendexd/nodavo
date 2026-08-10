@@ -136,6 +136,12 @@ pub struct CapabilityGrants(u8);
 impl CapabilityGrants {
     pub const NONE: Self = Self(0);
 
+    /// Creates a capability set from its serialized bit representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustStoreError::InvalidCapabilities`] when `bits` contains
+    /// values not assigned to a known capability.
     pub fn from_bits(bits: u8) -> Result<Self, TrustStoreError> {
         if bits & !KNOWN_CAPABILITY_BITS == 0 {
             Ok(Self(bits))
@@ -408,17 +414,38 @@ pub enum TrustStoreError {
 
 /// Atomic trust-store update. Dropping without `commit` rolls changes back.
 pub trait TrustStoreTransaction: Send {
+    /// Looks up the record for `peer` in this transaction's view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trust-store backend cannot complete the read.
     fn get(&self, peer: DeviceId) -> Result<Option<TrustRecord>, TrustStoreError>;
 
     /// Stages only a record issued by a completed pairing transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trust-store backend cannot stage the update.
     fn stage_trust(&mut self, trust: CommittedTrust) -> Result<(), TrustStoreError>;
 
+    /// Stages a revocation for the record identified by `peer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record is missing or already revoked, the
+    /// revocation predates trust establishment, or the backend rejects it.
     fn stage_revocation(
         &mut self,
         peer: DeviceId,
         revocation: Revocation,
     ) -> Result<(), TrustStoreError>;
 
+    /// Atomically commits all staged changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transaction conflicts with another commit or
+    /// the trust-store backend cannot persist the changes.
     fn commit(self: Box<Self>) -> Result<(), TrustStoreError>;
 
     fn rollback(self: Box<Self>);
@@ -426,6 +453,12 @@ pub trait TrustStoreTransaction: Send {
 
 /// Transactional persistence boundary for an OS-protected trust database.
 pub trait TrustStore: Send + Sync {
+    /// Begins an atomic trust-store update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the trust-store backend is unavailable or cannot
+    /// create a transaction.
     fn begin(&self) -> Result<Box<dyn TrustStoreTransaction + '_>, TrustStoreError>;
 }
 

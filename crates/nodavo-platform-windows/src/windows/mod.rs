@@ -18,11 +18,17 @@ use crate::input_runtime::{
     CaptureTranslator, ForceReleaseAcknowledgement, NativeInputEvent,
     lifecycle_requires_local_recovery,
 };
+use crate::windows_ipc_policy::{
+    ObservedWindowsUi, WindowsUiPolicy, authorizes_windows_ui, compiled_windows_ui_identity,
+    compiled_windows_ui_policy,
+};
 use crate::{
     ClipboardFormat, ClipboardMetadata, DisplayGeometry, EnvironmentCapabilities, MAX_DISPLAYS,
     MAX_PROTECTED_SECRET_BLOB_BYTES, MAX_PROTECTED_SECRET_BYTES, ProtectedSecretBlob,
     WindowsInputCaptureEvent, WindowsInputLifecycleEvent, WindowsPlatformError,
 };
+
+pub use crate::windows_ipc_policy::compiled_windows_ui_auth_mode;
 
 const MAX_PIPE_NAME_UNITS: usize = 240;
 const REQUIRED_PIPE_PREFIX: &str = r"\\.\pipe\nodavo-";
@@ -91,17 +97,105 @@ pub fn create_private_named_pipe(
     ffi::create_private_named_pipe(pipe_name, first_instance)
 }
 
-/// Verifies that the connected named-pipe client has the same user SID and
-/// process session as the agent before any IPC frame is decoded.
+/// Connection-bound authorization for the exact packaged Nodavo Windows UI.
+///
+/// The guard retains native process and token handles for the accepted pipe
+/// client's lifetime. Its debug representation never exposes native identity
+/// values, and callers cannot access the underlying handles.
+pub struct AuthorizedWindowsUi {
+    native: ffi::NativeNamedPipeClient,
+    policy: WindowsUiPolicy,
+    observed: ObservedWindowsUi,
+}
+
+impl std::fmt::Debug for AuthorizedWindowsUi {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AuthorizedWindowsUi([redacted])")
+    }
+}
+
+impl AuthorizedWindowsUi {
+    /// Revalidates the retained process/token and its exact package identity.
+    ///
+    /// Call this immediately before a blocking frame read and again after a
+    /// successful decode, immediately before dispatching the command.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed if the pipe endpoint, process lifetime, token statistics,
+    /// package identity, AUMID, or package-relative executable changed.
+    pub fn revalidate(&self) -> Result<(), WindowsPlatformError> {
+        self.native.revalidate()?;
+        if !authorizes_windows_ui(&self.policy, &self.observed) {
+            return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+        }
+        Ok(())
+    }
+}
+
+/// Authorizes an accepted named-pipe client as the exact packaged Nodavo UI.
+///
+/// Ordinary and unpackaged builds have no embedded policy and always fail
+/// closed. Development and release policy can only be selected at compile
+/// time; no environment variable is consulted at runtime.
 ///
 /// # Errors
 ///
-/// Fails closed if Windows cannot identify or inspect the client, or if either
-/// the user SID or process session differs from the agent.
-pub fn validate_named_pipe_client(
+/// Fails closed on an unconfigured build, missing package identity, any native
+/// inspection failure, or any exact policy mismatch.
+pub fn authorize_named_pipe_client(
     pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
-) -> Result<u32, WindowsPlatformError> {
-    ffi::validate_named_pipe_client(pipe)
+) -> Result<AuthorizedWindowsUi, WindowsPlatformError> {
+    let (package_name, publisher) =
+        compiled_windows_ui_identity().ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let package_family_name = ffi::derive_package_family_name(package_name, publisher)?;
+    let policy = compiled_windows_ui_policy(&package_family_name)
+        .ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let native = ffi::authenticate_named_pipe_client(pipe)?;
+    let identity = native.package_identity();
+    let observed = ObservedWindowsUi {
+        package_full_name: identity.package_full_name.clone(),
+        package_name: identity.package_name.clone(),
+        publisher: identity.publisher.clone(),
+        package_family_name: identity.package_family_name.clone(),
+        application_user_model_id: identity.application_user_model_id.clone(),
+        package_relative_executable: identity.package_relative_executable.clone(),
+        processor_architecture: identity.processor_architecture,
+        resource_id: identity.resource_id.clone(),
+        publisher_id: identity.publisher_id.clone(),
+    };
+    if !authorizes_windows_ui(&policy, &observed) {
+        return Err(WindowsPlatformError::UnauthorizedLocalIpc);
+    }
+    native.verify_signer(
+        &policy.signer_certificate_sha256,
+        policy.requires_trusted_timestamp,
+    )?;
+    native.revalidate()?;
+    Ok(AuthorizedWindowsUi {
+        native,
+        policy,
+        observed,
+    })
+}
+
+/// Validates the complete compile-time Windows UI authorization policy.
+///
+/// This performs no client authorization and is intended for package build
+/// self-checks before an artifact is assembled.
+///
+/// # Errors
+///
+/// Fails when the build is unconfigured or the embedded package identity,
+/// PFN, signer certificate hash, application ID, or executable is inconsistent.
+pub fn validate_compiled_windows_ui_auth_policy()
+-> Result<crate::WindowsUiAuthMode, WindowsPlatformError> {
+    let (package_name, publisher) =
+        compiled_windows_ui_identity().ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    let package_family_name = ffi::derive_package_family_name(package_name, publisher)?;
+    compiled_windows_ui_policy(&package_family_name)
+        .ok_or(WindowsPlatformError::UnauthorizedLocalIpc)?;
+    Ok(compiled_windows_ui_auth_mode())
 }
 
 /// Protects secret bytes with Windows DPAPI for the current user only.
@@ -958,14 +1052,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn private_pipe_accepts_the_current_process() {
+    async fn private_pipe_rejects_an_unpackaged_current_process() {
         let pipe_name = format!(r"\\.\pipe\nodavo-test-{}", std::process::id());
         let server = create_private_named_pipe(&pipe_name, true).unwrap();
         let _client = ClientOptions::new().open(&pipe_name).unwrap();
         server.connect().await.unwrap();
         assert_eq!(
-            validate_named_pipe_client(&server).unwrap(),
-            std::process::id()
+            authorize_named_pipe_client(&server).unwrap_err(),
+            WindowsPlatformError::UnauthorizedLocalIpc
         );
     }
 

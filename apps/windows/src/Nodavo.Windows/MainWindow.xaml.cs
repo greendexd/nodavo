@@ -13,6 +13,7 @@ namespace Nodavo.Windows;
 public sealed partial class MainWindow : Window
 {
     private readonly AgentViewModel _agent;
+    private readonly AgentLifecycleViewModel _lifecycle;
     private readonly IReadOnlyDictionary<string, UIElement> _sections;
 
     public MainWindow()
@@ -25,13 +26,16 @@ public sealed partial class MainWindow : Window
 
         var agentClient = new AgentClient();
         _agent = new AgentViewModel(agentClient, resources);
+        _lifecycle = new AgentLifecycleViewModel(
+            new AgentLifecycleCoordinator(agentClient, new PackagedAgentLifecyclePlatform()),
+            resources);
         _sections = new Dictionary<string, UIElement>(StringComparer.Ordinal)
         {
-            ["overview"] = new OverviewView(_agent),
+            ["overview"] = new OverviewView(_agent, _lifecycle),
             ["devices"] = new DevicesView(agentClient, resources),
             ["layout"] = new LayoutView(),
             ["transfers"] = new TransfersView(agentClient, resources),
-            ["settings"] = new SettingsView(_agent),
+            ["settings"] = new SettingsView(_agent, _lifecycle),
         };
 
         Navigation.SelectedItem = OverviewItem;
@@ -51,7 +55,7 @@ public sealed partial class MainWindow : Window
     {
         if (args.WindowActivationState != WindowActivationState.Deactivated)
         {
-            await _agent.RefreshAsync();
+            await Task.WhenAll(_agent.RefreshAsync(), _lifecycle.RefreshAsync());
         }
     }
 
