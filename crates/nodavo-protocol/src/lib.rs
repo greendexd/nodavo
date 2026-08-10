@@ -9,6 +9,7 @@ mod clipboard;
 mod codec;
 mod limits;
 mod message;
+mod topology;
 mod transfer;
 mod types;
 
@@ -33,12 +34,19 @@ pub use limits::{
     MANIFEST_MESSAGE_LIMIT, MAX_BULK_CHUNK_BYTES, MAX_CLIPBOARD_MESSAGE_BYTES,
     MAX_CONTROL_MESSAGE_BYTES, MAX_DATAGRAM_BYTES, MAX_FILE_CHUNK_BYTES,
     MAX_FILE_DATA_MESSAGE_BYTES, MAX_MANIFEST_AGGREGATE_BYTES, MAX_MANIFEST_BYTES,
-    MAX_MANIFEST_ENTRIES, MAX_PATH_BYTES, MAX_POINTER_FALLBACK_BYTES, MAX_RELIABLE_INPUT_BYTES,
-    PATH_BYTE_LIMIT, POINTER_FALLBACK_MESSAGE_LIMIT, RELIABLE_INPUT_MESSAGE_LIMIT,
+    MAX_MANIFEST_ENTRIES, MAX_PATH_BYTES, MAX_POINTER_DELTA_MAGNITUDE, MAX_POINTER_FALLBACK_BYTES,
+    MAX_RELIABLE_INPUT_BYTES, PATH_BYTE_LIMIT, POINTER_FALLBACK_MESSAGE_LIMIT,
+    RELIABLE_INPUT_MESSAGE_LIMIT,
 };
 pub use message::{
     ButtonState, ControlMessage, InputMessage, KeyEvent, KeyState, PointerButtonEvent,
-    PointerMotionEvent, ProtocolErrorCode, ReleaseAllEvent, ScrollEvent, ScrollUnit, WireMessage,
+    PointerDeltaEvent, PointerEnterEvent, PointerMotionEvent, ProtocolErrorCode, ReleaseAllEvent,
+    ScrollEvent, ScrollUnit, WireMessage,
+};
+pub use topology::{
+    DISPLAY_TOPOLOGY_SCHEMA_VERSION, DisplayDescriptor, DisplayRotation, DisplayTopology,
+    MAX_DISPLAY_ORIGIN_MILLI, MAX_DISPLAY_PIXEL_DIMENSION, MAX_DISPLAY_SCALE_MILLI,
+    MAX_TOPOLOGY_DISPLAYS, MIN_DISPLAY_SCALE_MILLI, SessionDisplayId, TopologyValidationError,
 };
 pub use transfer::{
     FileDataMessage, FileManifestMessage, ManifestEntry, ManifestEntryKind, RelativePath,

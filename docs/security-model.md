@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 5 -->
+<!-- doc-id: security-model; lang: en; revision: 7 -->
 
 # Security model
 
@@ -51,6 +51,7 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - A single ownership lease controls remote input routing.
 - Emergency disconnect is processed locally and cannot depend on the peer.
 - Lock, sleep, timeout, and disconnect release all keys/buttons and revoke the active lease.
+- Display snapshots are critical, versioned, bounded to 32 records, session-bound, and replay-checked. Native display identifiers remain local; a peer can name only an opaque token installed for this authenticated session.
 
 ## Input capture and injection
 
@@ -58,9 +59,13 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - macOS requires the user-granted Accessibility trust boundary. Windows remains inside the current interactive user's default input desktop; login, Session 0, UAC secure desktop, and privileged unattended control are rejected.
 - Nodavo injection carries a private process tag where the platform supports one. Capture rejects that tag and every event the OS reports as injected, preventing synthetic feedback loops.
 - Keyboard usages, modifiers, media keys, pointer buttons, normalized motion, and line/precise scrolling are validated before injection. Native codes never cross the peer protocol directly.
+- An edge transition uses a critical reliable pointer-entry message. Native suppression and relative deltas remain gated until the receiver validates the lease/session/grant, resolves the session display token, injects the entry position, and returns an authenticated acknowledgement. This prevents a lost or reordered entry datagram from applying deltas at a stale cursor.
+- Routed motion uses bounded nonzero relative deltas with no display identity. Callback-queue coalescing preserves the exact sum only while it remains in range; otherwise events stay separate or fail back to explicit recovery instead of silently truncating physical motion.
 - The injector tracks every accepted key/button press. Emergency stop, focus loss, lock, sleep, tap/hook disable, timeout, and transport failure synchronously request deterministic release and local-ownership restoration before successful acknowledgement.
 - A disabled or timed-out capture hook fails closed: suppression stops, local ownership is restored, and the remote session cannot continue silently.
 - Input payloads and pairing codes are excluded from logs, crash metadata, and telemetry.
+- A topology revision must be installed and acknowledged before focus can move in the corresponding direction. Peer layout coordinates are descriptive only and never create adjacency. Edge routes are explicit local policy, disabled when empty, and still pass through the ordinary focus lease, debounce, hysteresis, and cooldown checks.
+- macOS CGEvent and Windows Raw Input relative capture plus native relative injection are implemented and compile-tested. Real-device behavior, acceleration differences, extreme hardware deltas, mixed-DPI hardware, and long-session drift remain release-validation gates.
 
 ## Clipboard security
 

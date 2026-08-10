@@ -733,11 +733,13 @@ fn make_private_file(path: &Path) -> Result<(), TransferError> {
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn make_private(_path: &Path) -> Result<(), TransferError> {
     Ok(())
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn make_private_file(_path: &Path) -> Result<(), TransferError> {
     Ok(())
 }

@@ -21,12 +21,17 @@ const TAG_PING: u16 = 8;
 const TAG_PONG: u16 = 9;
 const TAG_EMERGENCY_DISCONNECT: u16 = 10;
 const TAG_ERROR: u16 = 11;
+const TAG_DISPLAY_TOPOLOGY: u16 = 12;
+const TAG_DISPLAY_TOPOLOGY_ACK: u16 = 13;
+const TAG_POINTER_ENTER_ACK: u16 = 14;
 
 const TAG_KEY: u16 = 0x1000;
 const TAG_POINTER_BUTTON: u16 = 0x1001;
 const TAG_POINTER_MOTION: u16 = 0x1002;
 const TAG_SCROLL: u16 = 0x1003;
 const TAG_RELEASE_ALL: u16 = 0x1004;
+const TAG_POINTER_DELTA: u16 = 0x1005;
+const TAG_POINTER_ENTER: u16 = 0x1006;
 
 const MAX_NEGOTIATED_VERSIONS: usize = 16;
 const MAX_LEASE_TTL_MS: u32 = 30_000;
@@ -149,11 +154,40 @@ struct FocusLeaseBody {
     lease_id: u64,
     #[n(2)]
     ttl_ms: u32,
+    #[n(3)]
+    pointer_enter_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(map)]
 struct FocusLeaseReleaseBody {
+    #[n(0)]
+    meta: EventMeta,
+    #[n(1)]
+    lease_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+struct DisplayTopologyBody {
+    #[n(0)]
+    meta: EventMeta,
+    #[n(1)]
+    topology: crate::DisplayTopology,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+struct DisplayTopologyAckBody {
+    #[n(0)]
+    meta: EventMeta,
+    #[n(1)]
+    revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(map)]
+struct PointerEnterAckBody {
     #[n(0)]
     meta: EventMeta,
     #[n(1)]
@@ -398,6 +432,10 @@ fn encode_payload(message: &WireMessage) -> Result<(u16, bool, Vec<u8>), EncodeE
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the exhaustive control-tag mapping is intentionally kept together for auditability"
+)]
 fn encode_control_payload(message: &ControlMessage) -> Result<(u16, bool, Vec<u8>), EncodeError> {
     let encoded = match message {
         ControlMessage::Hello {
@@ -446,16 +484,54 @@ fn encode_control_payload(message: &ControlMessage) -> Result<(u16, bool, Vec<u8
             meta,
             lease_id,
             ttl_ms,
-        } => encode_focus_lease_payload(TAG_FOCUS_LEASE_REQUEST, *meta, *lease_id, *ttl_ms)?,
+            pointer_enter_required,
+        } => encode_focus_lease_payload(
+            TAG_FOCUS_LEASE_REQUEST,
+            *meta,
+            *lease_id,
+            *ttl_ms,
+            *pointer_enter_required,
+        )?,
         ControlMessage::FocusLeaseGrant {
             meta,
             lease_id,
             ttl_ms,
-        } => encode_focus_lease_payload(TAG_FOCUS_LEASE_GRANT, *meta, *lease_id, *ttl_ms)?,
+            pointer_enter_required,
+        } => encode_focus_lease_payload(
+            TAG_FOCUS_LEASE_GRANT,
+            *meta,
+            *lease_id,
+            *ttl_ms,
+            *pointer_enter_required,
+        )?,
         ControlMessage::FocusLeaseRelease { meta, lease_id } => (
             TAG_FOCUS_LEASE_RELEASE,
             true,
             encode_body(&FocusLeaseReleaseBody {
+                meta: *meta,
+                lease_id: *lease_id,
+            })?,
+        ),
+        ControlMessage::DisplayTopology { meta, topology } => (
+            TAG_DISPLAY_TOPOLOGY,
+            true,
+            encode_body(&DisplayTopologyBody {
+                meta: *meta,
+                topology: topology.clone(),
+            })?,
+        ),
+        ControlMessage::DisplayTopologyAck { meta, revision } => (
+            TAG_DISPLAY_TOPOLOGY_ACK,
+            true,
+            encode_body(&DisplayTopologyAckBody {
+                meta: *meta,
+                revision: *revision,
+            })?,
+        ),
+        ControlMessage::PointerEnterAck { meta, lease_id } => (
+            TAG_POINTER_ENTER_ACK,
+            true,
+            encode_body(&PointerEnterAckBody {
                 meta: *meta,
                 lease_id: *lease_id,
             })?,
@@ -507,6 +583,7 @@ fn encode_focus_lease_payload(
     meta: EventMeta,
     lease_id: u64,
     ttl_ms: u32,
+    pointer_enter_required: bool,
 ) -> Result<(u16, bool, Vec<u8>), EncodeError> {
     Ok((
         tag,
@@ -515,6 +592,7 @@ fn encode_focus_lease_payload(
             meta,
             lease_id,
             ttl_ms,
+            pointer_enter_required,
         })?,
     ))
 }
@@ -524,12 +602,15 @@ fn encode_input_payload(message: &InputMessage) -> Result<(u16, bool, Vec<u8>), 
         InputMessage::Key(event) => (TAG_KEY, true, encode_body(event)?),
         InputMessage::PointerButton(event) => (TAG_POINTER_BUTTON, true, encode_body(event)?),
         InputMessage::PointerMotion(event) => (TAG_POINTER_MOTION, false, encode_body(event)?),
+        InputMessage::PointerDelta(event) => (TAG_POINTER_DELTA, false, encode_body(event)?),
+        InputMessage::PointerEnter(event) => (TAG_POINTER_ENTER, true, encode_body(event)?),
         InputMessage::Scroll(event) => (TAG_SCROLL, false, encode_body(event)?),
         InputMessage::ReleaseAll(meta) => (TAG_RELEASE_ALL, true, encode_body(meta)?),
     };
     Ok(encoded)
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_payload(tag: u16, payload: &[u8]) -> Result<WireMessage, DecodeError> {
     let message = match tag {
         TAG_HELLO => {
@@ -578,12 +659,14 @@ fn decode_payload(tag: u16, payload: &[u8]) -> Result<WireMessage, DecodeError> 
                     meta: body.meta,
                     lease_id: body.lease_id,
                     ttl_ms: body.ttl_ms,
+                    pointer_enter_required: body.pointer_enter_required,
                 }
             } else {
                 ControlMessage::FocusLeaseGrant {
                     meta: body.meta,
                     lease_id: body.lease_id,
                     ttl_ms: body.ttl_ms,
+                    pointer_enter_required: body.pointer_enter_required,
                 }
             };
             WireMessage::Control(message)
@@ -591,6 +674,27 @@ fn decode_payload(tag: u16, payload: &[u8]) -> Result<WireMessage, DecodeError> 
         TAG_FOCUS_LEASE_RELEASE => {
             let body: FocusLeaseReleaseBody = decode_body(payload)?;
             WireMessage::Control(ControlMessage::FocusLeaseRelease {
+                meta: body.meta,
+                lease_id: body.lease_id,
+            })
+        }
+        TAG_DISPLAY_TOPOLOGY => {
+            let body: DisplayTopologyBody = decode_body(payload)?;
+            WireMessage::Control(ControlMessage::DisplayTopology {
+                meta: body.meta,
+                topology: body.topology,
+            })
+        }
+        TAG_DISPLAY_TOPOLOGY_ACK => {
+            let body: DisplayTopologyAckBody = decode_body(payload)?;
+            WireMessage::Control(ControlMessage::DisplayTopologyAck {
+                meta: body.meta,
+                revision: body.revision,
+            })
+        }
+        TAG_POINTER_ENTER_ACK => {
+            let body: PointerEnterAckBody = decode_body(payload)?;
+            WireMessage::Control(ControlMessage::PointerEnterAck {
                 meta: body.meta,
                 lease_id: body.lease_id,
             })
@@ -624,6 +728,8 @@ fn decode_payload(tag: u16, payload: &[u8]) -> Result<WireMessage, DecodeError> 
         TAG_POINTER_MOTION => {
             WireMessage::Input(InputMessage::PointerMotion(decode_body(payload)?))
         }
+        TAG_POINTER_DELTA => WireMessage::Input(InputMessage::PointerDelta(decode_body(payload)?)),
+        TAG_POINTER_ENTER => WireMessage::Input(InputMessage::PointerEnter(decode_body(payload)?)),
         TAG_SCROLL => WireMessage::Input(InputMessage::Scroll(decode_body(payload)?)),
         TAG_RELEASE_ALL => WireMessage::Input(InputMessage::ReleaseAll(decode_body(payload)?)),
         _ => unreachable!("known tags are exhaustively matched"),
@@ -641,11 +747,17 @@ fn expected_critical(tag: u16) -> Option<bool> {
         | TAG_FOCUS_LEASE_REQUEST
         | TAG_FOCUS_LEASE_GRANT
         | TAG_FOCUS_LEASE_RELEASE
+        | TAG_DISPLAY_TOPOLOGY
+        | TAG_DISPLAY_TOPOLOGY_ACK
+        | TAG_POINTER_ENTER_ACK
         | TAG_EMERGENCY_DISCONNECT
         | TAG_KEY
         | TAG_POINTER_BUTTON
-        | TAG_RELEASE_ALL => Some(true),
-        TAG_PING | TAG_PONG | TAG_ERROR | TAG_POINTER_MOTION | TAG_SCROLL => Some(false),
+        | TAG_RELEASE_ALL
+        | TAG_POINTER_ENTER => Some(true),
+        TAG_PING | TAG_PONG | TAG_ERROR | TAG_POINTER_MOTION | TAG_POINTER_DELTA | TAG_SCROLL => {
+            Some(false)
+        }
         _ => None,
     }
 }
@@ -733,14 +845,29 @@ fn validate_control_message(
             meta,
             lease_id,
             ttl_ms,
+            pointer_enter_required: _,
         }
         | ControlMessage::FocusLeaseGrant {
             meta,
             lease_id,
             ttl_ms,
+            pointer_enter_required: _,
         } => validate_focus_lease(meta, *lease_id, Some(*ttl_ms))?,
-        ControlMessage::FocusLeaseRelease { meta, lease_id } => {
+        ControlMessage::FocusLeaseRelease { meta, lease_id }
+        | ControlMessage::PointerEnterAck { meta, lease_id } => {
             validate_focus_lease(meta, *lease_id, None)?;
+        }
+        ControlMessage::DisplayTopology { meta, topology } => {
+            validate_meta(meta)?;
+            topology
+                .validate()
+                .map_err(|_| "display topology is invalid")?;
+        }
+        ControlMessage::DisplayTopologyAck { meta, revision } => {
+            validate_meta(meta)?;
+            if *revision == 0 {
+                return Err("display topology acknowledgement revision must be nonzero");
+            }
         }
         _ => {}
     }
@@ -810,6 +937,25 @@ fn validate_input_message(input: &InputMessage, channel: Channel) -> Result<(), 
         }
         InputMessage::PointerMotion(event) => {
             validate_replaceable_channel(channel)?;
+            if event.display_id == 0 {
+                return Err("pointer display ID must be nonzero");
+            }
+        }
+        InputMessage::PointerDelta(event) => {
+            validate_replaceable_channel(channel)?;
+            if event.delta_x == 0 && event.delta_y == 0 {
+                return Err("relative pointer delta must contain motion");
+            }
+            if event.delta_x.unsigned_abs() > crate::MAX_POINTER_DELTA_MAGNITUDE
+                || event.delta_y.unsigned_abs() > crate::MAX_POINTER_DELTA_MAGNITUDE
+            {
+                return Err("relative pointer delta exceeds the per-event magnitude limit");
+            }
+        }
+        InputMessage::PointerEnter(event) => {
+            if channel != Channel::ReliableInput {
+                return Err("pointer enter must use the reliable input stream");
+            }
             if event.display_id == 0 {
                 return Err("pointer display ID must be nonzero");
             }
@@ -1000,6 +1146,7 @@ mod tests {
             meta: meta(),
             lease_id: 17,
             ttl_ms: 5_000,
+            pointer_enter_required: true,
         });
         let encoded = encode_control(&message).unwrap();
         assert_eq!(decode_control(&encoded).unwrap(), message);
@@ -1012,6 +1159,49 @@ mod tests {
             encode_control(&invalid),
             Err(EncodeError::InvalidMessage(
                 "focus lease ID must be nonzero"
+            ))
+        );
+    }
+
+    #[test]
+    fn topology_snapshot_and_ack_are_bounded_session_control_messages() {
+        let topology = crate::DisplayTopology::new(
+            3,
+            vec![
+                crate::DisplayDescriptor::new(
+                    crate::SessionDisplayId::new(1),
+                    -1_280_000,
+                    0,
+                    3_840,
+                    2_160,
+                    2_000,
+                    2_000,
+                    crate::DisplayRotation::Degrees0,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let snapshot = WireMessage::Control(ControlMessage::DisplayTopology {
+            meta: meta(),
+            topology,
+        });
+        let encoded = encode_control(&snapshot).unwrap();
+        assert!(encoded.len() < CONTROL_MESSAGE_LIMIT);
+        assert_eq!(decode_control(&encoded).unwrap(), snapshot);
+
+        let ack = WireMessage::Control(ControlMessage::DisplayTopologyAck {
+            meta: meta(),
+            revision: 3,
+        });
+        assert_eq!(decode_control(&encode_control(&ack).unwrap()).unwrap(), ack);
+        assert_eq!(
+            encode_control(&WireMessage::Control(ControlMessage::DisplayTopologyAck {
+                meta: meta(),
+                revision: 0,
+            })),
+            Err(EncodeError::InvalidMessage(
+                "display topology acknowledgement revision must be nonzero"
             ))
         );
     }
@@ -1090,6 +1280,57 @@ mod tests {
             encode_pointer_fallback(&key),
             Err(EncodeError::InvalidMessage(
                 "key event must use the reliable input stream"
+            ))
+        );
+    }
+
+    #[test]
+    fn relative_delta_is_replaceable_but_pointer_enter_is_reliable() {
+        let delta = WireMessage::Input(InputMessage::PointerDelta(crate::PointerDeltaEvent {
+            meta: meta(),
+            delta_x: -17,
+            delta_y: 9,
+            lease_id: 8,
+        }));
+        assert_eq!(
+            decode_datagram(&encode_datagram(&delta).unwrap()).unwrap(),
+            delta
+        );
+        assert_eq!(
+            decode_pointer_fallback(&encode_pointer_fallback(&delta).unwrap()).unwrap(),
+            delta
+        );
+        assert!(encode_reliable_input(&delta).is_err());
+
+        let enter = WireMessage::Input(InputMessage::PointerEnter(crate::PointerEnterEvent {
+            meta: meta(),
+            display_id: 2,
+            x: 0,
+            y: u32::MAX,
+            lease_id: 8,
+        }));
+        assert_eq!(
+            decode_reliable_input(&encode_reliable_input(&enter).unwrap()).unwrap(),
+            enter
+        );
+        assert!(encode_datagram(&enter).is_err());
+
+        let ack = WireMessage::Control(ControlMessage::PointerEnterAck {
+            meta: meta(),
+            lease_id: 8,
+        });
+        assert_eq!(decode_control(&encode_control(&ack).unwrap()).unwrap(), ack);
+
+        let invalid = WireMessage::Input(InputMessage::PointerDelta(crate::PointerDeltaEvent {
+            meta: meta(),
+            delta_x: 32_768,
+            delta_y: 0,
+            lease_id: 8,
+        }));
+        assert_eq!(
+            encode_datagram(&invalid),
+            Err(EncodeError::InvalidMessage(
+                "relative pointer delta exceeds the per-event magnitude limit"
             ))
         );
     }

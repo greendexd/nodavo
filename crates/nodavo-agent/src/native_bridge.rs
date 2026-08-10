@@ -1,11 +1,11 @@
 //! Bounded handoff from native callback threads to the async session owner.
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use nodavo_input::InputEvent;
+use nodavo_input::{InputEvent, PointerDelta};
 use tokio::sync::watch;
 
 const INPUT_CAPACITY: usize = 128;
@@ -20,6 +20,7 @@ pub(crate) enum PlatformSafetyEvent {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NativeInputBridgeError {
     ReliableCapacityExhausted,
+    ReplaceableCapacityExhausted,
     Poisoned,
 }
 
@@ -57,11 +58,12 @@ pub(crate) fn native_input_channel() -> (NativeInputSender, NativeInputReceiver)
 impl NativeInputSender {
     /// Enqueues a physical event without ever evicting a key or button event.
     ///
-    /// Motion and scroll are replaceable. Their newest value displaces an
-    /// older value of the same kind, and either kind may be evicted to admit a
-    /// reliable event when the fixed-size queue is full. Exhausting the queue
-    /// with reliable events is an explicit failure so the adapter can restore
-    /// local ownership instead of silently losing a release.
+    /// Absolute motion and scroll are replaceable. Relative motion coalesces by
+    /// bounded summation so callback backpressure does not turn queued physical
+    /// movement into an unrelated absolute position. Replaceable input may be
+    /// evicted to admit a reliable event. Exhausting the queue with reliable
+    /// events is an explicit failure so the adapter can restore local ownership
+    /// instead of silently losing a release.
     pub(crate) fn send(&self, event: InputEvent) -> Result<(), NativeInputBridgeError> {
         let mut buffer = self
             .buffer
@@ -74,14 +76,40 @@ impl NativeInputSender {
                 .iter()
                 .rposition(|queued| same_replaceable_kind(*queued, event))
             {
-                let _ = buffer.events.remove(index);
+                match merge_relative_delta(buffer.events[index], event) {
+                    RelativeMerge::Merged(merged) => {
+                        buffer.events[index] = merged;
+                        notify_revision(buffer, &self.revision);
+                        return Ok(());
+                    }
+                    RelativeMerge::Cancelled => {
+                        let _ = buffer.events.remove(index);
+                        notify_revision(buffer, &self.revision);
+                        return Ok(());
+                    }
+                    RelativeMerge::Overflow => {
+                        if buffer.events.len() == INPUT_CAPACITY {
+                            let Some(eviction) = buffer
+                                .events
+                                .iter()
+                                .position(|queued| is_lossy_replaceable(*queued))
+                            else {
+                                return Err(NativeInputBridgeError::ReplaceableCapacityExhausted);
+                            };
+                            let _ = buffer.events.remove(eviction);
+                        }
+                    }
+                    RelativeMerge::NotRelative => {
+                        let _ = buffer.events.remove(index);
+                    }
+                }
             } else if buffer.events.len() == INPUT_CAPACITY {
                 let Some(index) = buffer
                     .events
                     .iter()
-                    .position(|queued| is_replaceable(*queued))
+                    .position(|queued| is_lossy_replaceable(*queued))
                 else {
-                    return Err(NativeInputBridgeError::ReliableCapacityExhausted);
+                    return Err(NativeInputBridgeError::ReplaceableCapacityExhausted);
                 };
                 let _ = buffer.events.remove(index);
             }
@@ -102,6 +130,12 @@ impl NativeInputSender {
         self.revision.send_replace(next);
         Ok(())
     }
+}
+
+fn notify_revision(buffer: std::sync::MutexGuard<'_, InputBuffer>, revision: &watch::Sender<u64>) {
+    drop(buffer);
+    let next = revision.borrow().wrapping_add(1);
+    revision.send_replace(next);
 }
 
 impl NativeInputReceiver {
@@ -168,6 +202,15 @@ impl PlatformSafetyReceiver {
 const fn is_replaceable(event: InputEvent) -> bool {
     matches!(
         event,
+        InputEvent::PointerMotion { .. }
+            | InputEvent::PointerDelta { .. }
+            | InputEvent::Scroll { .. }
+    )
+}
+
+const fn is_lossy_replaceable(event: InputEvent) -> bool {
+    matches!(
+        event,
         InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. }
     )
 }
@@ -178,15 +221,45 @@ const fn same_replaceable_kind(left: InputEvent, right: InputEvent) -> bool {
         (
             InputEvent::PointerMotion { .. },
             InputEvent::PointerMotion { .. }
+        ) | (
+            InputEvent::PointerDelta { .. },
+            InputEvent::PointerDelta { .. }
         ) | (InputEvent::Scroll { .. }, InputEvent::Scroll { .. })
     )
+}
+
+enum RelativeMerge {
+    NotRelative,
+    Merged(InputEvent),
+    Cancelled,
+    Overflow,
+}
+
+fn merge_relative_delta(left: InputEvent, right: InputEvent) -> RelativeMerge {
+    let (InputEvent::PointerDelta { delta: left }, InputEvent::PointerDelta { delta: right }) =
+        (left, right)
+    else {
+        return RelativeMerge::NotRelative;
+    };
+    let Some(horizontal) = left.horizontal().checked_add(right.horizontal()) else {
+        return RelativeMerge::Overflow;
+    };
+    let Some(vertical) = left.vertical().checked_add(right.vertical()) else {
+        return RelativeMerge::Overflow;
+    };
+    if horizontal == 0 && vertical == 0 {
+        return RelativeMerge::Cancelled;
+    }
+    PointerDelta::new(horizontal, vertical).map_or(RelativeMerge::Overflow, |delta| {
+        RelativeMerge::Merged(InputEvent::PointerDelta { delta })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use nodavo_input::{
         ButtonState, DisplayId, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, Modifiers,
-        NormalizedAxis, NormalizedPosition, PointerButton, ScrollUnit,
+        NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, ScrollUnit,
     };
 
     use super::*;
@@ -206,6 +279,12 @@ mod tests {
                 NormalizedAxis::from_bits(u16::try_from(axis).unwrap()),
                 NormalizedAxis::from_bits(u16::try_from(axis).unwrap()),
             ),
+        }
+    }
+
+    fn delta(horizontal: i32, vertical: i32) -> InputEvent {
+        InputEvent::PointerDelta {
+            delta: PointerDelta::new(horizontal, vertical).unwrap(),
         }
     }
 
@@ -239,6 +318,19 @@ mod tests {
             receiver.recv().await.unwrap(),
             InputEvent::PointerButton { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn coalesces_relative_motion_without_truncating_overflow() {
+        let (sender, mut receiver) = native_input_channel();
+        sender.send(delta(3, -4)).unwrap();
+        sender.send(delta(7, 2)).unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), delta(10, -2));
+
+        sender.send(delta(32_000, 1)).unwrap();
+        sender.send(delta(2_000, 1)).unwrap();
+        assert_eq!(receiver.recv().await.unwrap(), delta(32_000, 1));
+        assert_eq!(receiver.recv().await.unwrap(), delta(2_000, 1));
     }
 
     #[test]

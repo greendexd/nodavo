@@ -197,6 +197,52 @@ pub struct NormalizedPosition {
     y: NormalizedAxis,
 }
 
+/// A bounded relative pointer displacement with no display identity.
+///
+/// Deltas are semantic signed motion units produced by the active physical
+/// pointer source. They are used only after a focus lease is granted; absolute
+/// positions remain the local edge-detection and remote-entry primitive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct PointerDelta {
+    horizontal: i32,
+    vertical: i32,
+}
+
+impl PointerDelta {
+    /// Largest magnitude accepted on either axis in one semantic event.
+    pub const MAX_MAGNITUDE: u32 = 32_767;
+
+    /// Creates one nonzero bounded displacement.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero/zero motion and an axis outside the supported magnitude.
+    pub fn new(horizontal: i32, vertical: i32) -> Result<Self, InputValueError> {
+        if horizontal == 0 && vertical == 0 {
+            return Err(InputValueError::ZeroPointerDelta);
+        }
+        if horizontal.unsigned_abs() > Self::MAX_MAGNITUDE
+            || vertical.unsigned_abs() > Self::MAX_MAGNITUDE
+        {
+            return Err(InputValueError::PointerDeltaOutOfRange);
+        }
+        Ok(Self {
+            horizontal,
+            vertical,
+        })
+    }
+
+    #[must_use]
+    pub const fn horizontal(self) -> i32 {
+        self.horizontal
+    }
+
+    #[must_use]
+    pub const fn vertical(self) -> i32 {
+        self.vertical
+    }
+}
+
 impl NormalizedPosition {
     #[must_use]
     pub const fn new(display: DisplayId, x: NormalizedAxis, y: NormalizedAxis) -> Self {
@@ -239,6 +285,9 @@ pub enum InputEvent {
     PointerMotion {
         position: NormalizedPosition,
     },
+    PointerDelta {
+        delta: PointerDelta,
+    },
     PointerButton {
         button: PointerButton,
         state: ButtonState,
@@ -256,6 +305,7 @@ impl fmt::Debug for InputEvent {
         let kind = match self {
             Self::Key { .. } => "Key",
             Self::PointerMotion { .. } => "PointerMotion",
+            Self::PointerDelta { .. } => "PointerDelta",
             Self::PointerButton { .. } => "PointerButton",
             Self::Scroll { .. } => "Scroll",
         };
@@ -274,6 +324,10 @@ pub enum InputValueError {
     InvalidPointerButton(u8),
     #[error("normalized coordinate must be finite and in the inclusive range 0.0..=1.0")]
     InvalidNormalizedCoordinate,
+    #[error("relative pointer delta must contain motion")]
+    ZeroPointerDelta,
+    #[error("relative pointer delta exceeds the per-event magnitude limit")]
+    PointerDeltaOutOfRange,
 }
 
 /// Keys and pointer buttons currently considered pressed by a session.
@@ -330,7 +384,9 @@ impl PressedState {
                     self.buttons.remove(&button);
                 }
             },
-            InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. } => {}
+            InputEvent::PointerMotion { .. }
+            | InputEvent::PointerDelta { .. }
+            | InputEvent::Scroll { .. } => {}
         }
     }
 
@@ -379,6 +435,21 @@ mod tests {
 
         assert_eq!(NormalizedAxis::from_unit_f64(0.0), Ok(NormalizedAxis::MIN));
         assert_eq!(NormalizedAxis::from_unit_f64(1.0), Ok(NormalizedAxis::MAX));
+    }
+
+    #[test]
+    fn pointer_delta_is_nonzero_and_bounded() {
+        assert_eq!(
+            PointerDelta::new(0, 0),
+            Err(InputValueError::ZeroPointerDelta)
+        );
+        assert_eq!(
+            PointerDelta::new(32_768, 0),
+            Err(InputValueError::PointerDeltaOutOfRange)
+        );
+        let delta = PointerDelta::new(-7, 11).unwrap();
+        assert_eq!(delta.horizontal(), -7);
+        assert_eq!(delta.vertical(), 11);
     }
 
     #[test]

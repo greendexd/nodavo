@@ -9,6 +9,9 @@
 use nodavo_input::{DisplayId, NormalizedPosition};
 use thiserror::Error;
 
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+mod clipboard;
+
 mod input_runtime;
 
 pub use input_runtime::{
@@ -192,7 +195,13 @@ fn scale_axis(bits: u16, extent: u32) -> Result<i32, WindowsPlatformError> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ClipboardFormat {
     UnicodeText,
+    Html,
+    Png,
+    /// Canonical BMP file bytes, including `BITMAPFILEHEADER`.
+    Bmp,
+    /// Raw `CF_DIB`, retained only for low-level platform probes.
     Dib,
+    /// Raw `CF_DIBV5`, retained only for low-level platform probes.
     DibV5,
 }
 
@@ -207,6 +216,7 @@ pub struct ClipboardFormatMetadata {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardMetadata {
     pub sequence_number: u32,
+    pub native_types_empty: bool,
     pub formats: Vec<ClipboardFormatMetadata>,
 }
 
@@ -252,6 +262,8 @@ pub enum WindowsPlatformError {
     ClipboardTooLarge,
     #[error("clipboard text is malformed")]
     InvalidClipboardText,
+    #[error("clipboard HTML framing or UTF-8 content is malformed")]
+    InvalidClipboardHtml,
     #[error("clipboard image data is empty or uses an unsupported format")]
     InvalidClipboardImage,
     #[error("the local Windows IPC client is not the current interactive user session")]

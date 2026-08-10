@@ -10,8 +10,8 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use nodavo_input::{
-    ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, PressedState,
-    ScrollUnit,
+    ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, PointerDelta,
+    PressedState, ScrollUnit,
 };
 
 use crate::input_runtime::{
@@ -233,7 +233,9 @@ impl WindowsInputInjector {
                 match release {
                     InputEvent::Key { .. } => released_keys += 1,
                     InputEvent::PointerButton { .. } => released_buttons += 1,
-                    InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. } => {}
+                    InputEvent::PointerMotion { .. }
+                    | InputEvent::PointerDelta { .. }
+                    | InputEvent::Scroll { .. } => {}
                 }
             }
         }
@@ -272,6 +274,10 @@ impl WindowsInputInjector {
                     y: absolute_y,
                 }
             }
+            InputEvent::PointerDelta { delta } => ffi::NativeInput::RelativeMotion {
+                delta_x: delta.horizontal(),
+                delta_y: delta.vertical(),
+            },
             InputEvent::PointerButton { button, state } => pointer_button(button.get(), state)?,
             InputEvent::Scroll {
                 horizontal,
@@ -296,7 +302,8 @@ impl WindowsInputInjector {
     }
 }
 
-type CaptureCallback = dyn Fn(WindowsInputCaptureEvent) + Send + Sync + 'static;
+type CaptureCallback =
+    dyn Fn(WindowsInputCaptureEvent) -> Result<(), WindowsPlatformError> + Send + Sync + 'static;
 
 struct CaptureRuntime {
     stop: ffi::NativeInputCaptureStopHandle,
@@ -329,6 +336,24 @@ impl fmt::Debug for WindowsInputCapture {
 impl WindowsInputCapture {
     #[must_use]
     pub fn new(callback: impl Fn(WindowsInputCaptureEvent) + Send + Sync + 'static) -> Self {
+        Self::new_routed_fallible(move |event| {
+            callback(event);
+            Ok(())
+        })
+    }
+
+    /// Creates a capture boundary whose callback may request fail-closed stop.
+    ///
+    /// A callback error immediately clears routing and terminates the native
+    /// capture loop. This lets bounded consumers refuse reliable input rather
+    /// than suppressing an event that could not be delivered to the session.
+    #[must_use]
+    pub fn new_routed_fallible(
+        callback: impl Fn(WindowsInputCaptureEvent) -> Result<(), WindowsPlatformError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         Self {
             callback: Arc::new(callback),
             routing_to_peer: Arc::new(AtomicBool::new(false)),
@@ -361,15 +386,26 @@ impl WindowsInputCapture {
                 let capture = ffi::NativeInputCapture::new(
                     Arc::clone(&routing_to_peer),
                     move |native: NativeInputEvent| {
-                        let Some(event) = translator.convert(native, &displays) else {
-                            return;
+                        let relative_pointer = event_routing.load(Ordering::Acquire);
+                        if relative_pointer
+                            && let NativeInputEvent::PointerMotion {
+                                delta_x, delta_y, ..
+                            } = native
+                            && (delta_x != 0 || delta_y != 0)
+                            && PointerDelta::new(delta_x, delta_y).is_err()
+                        {
+                            return Err(WindowsPlatformError::RawInputUnavailable);
+                        }
+                        let Some(event) = translator.convert(native, &displays, relative_pointer)
+                        else {
+                            return Ok(());
                         };
                         if let WindowsInputCaptureEvent::Lifecycle(lifecycle) = event
                             && lifecycle_requires_local_recovery(lifecycle)
                         {
                             event_routing.store(false, Ordering::Release);
                         }
-                        event_callback(event);
+                        event_callback(event)
                     },
                 );
                 let mut capture = match capture {
@@ -519,9 +555,9 @@ fn emit_callback(
     lifecycle: WindowsInputLifecycleEvent,
 ) -> Result<(), WindowsPlatformError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        callback(WindowsInputCaptureEvent::Lifecycle(lifecycle));
+        callback(WindowsInputCaptureEvent::Lifecycle(lifecycle))
     }))
-    .map_err(|_| WindowsPlatformError::CaptureCallbackFailed)
+    .map_err(|_| WindowsPlatformError::CaptureCallbackFailed)?
 }
 
 fn pressed_equivalent(release: InputEvent) -> InputEvent {
@@ -537,7 +573,9 @@ fn pressed_equivalent(release: InputEvent) -> InputEvent {
             button,
             state: ButtonState::Pressed,
         },
-        InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. } => release,
+        InputEvent::PointerMotion { .. }
+        | InputEvent::PointerDelta { .. }
+        | InputEvent::Scroll { .. } => release,
     }
 }
 
@@ -765,7 +803,8 @@ impl WindowsClipboard {
         ffi::clipboard_sequence_number()
     }
 
-    /// Reads bounded metadata for supported text and DIB image formats.
+    /// Reads bounded metadata for UTF-16 text, `CF_HTML`, registered PNG, and
+    /// canonical BMP representations.
     ///
     /// # Errors
     ///
@@ -797,6 +836,83 @@ impl WindowsClipboard {
         ffi::write_clipboard_text(text, MAX_TEXT_BYTES)
     }
 
+    /// Reads the bounded UTF-8 fragment from registered `HTML Format` data.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale sequences, malformed `CF_HTML` offsets, embedded NULs,
+    /// invalid UTF-8, and content outside the text limit.
+    pub fn read_html(self, expected_sequence: u32) -> Result<String, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::read_clipboard_html(expected_sequence, MAX_TEXT_BYTES)
+    }
+
+    /// Replaces the clipboard with a bounded UTF-8 `CF_HTML` fragment.
+    ///
+    /// # Errors
+    ///
+    /// Rejects embedded NULs, oversized fragments, a busy clipboard, and
+    /// native ownership-transfer failures.
+    pub fn write_html(self, fragment: &str) -> Result<u32, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::write_clipboard_html(fragment, MAX_TEXT_BYTES)
+    }
+
+    /// Reads validated PNG file bytes from the registered `PNG` format.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale sequences, absent data, malformed chunks or CRCs, and
+    /// content outside the image limit.
+    pub fn read_png(self, expected_sequence: u32) -> Result<Vec<u8>, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::read_clipboard_png(expected_sequence, MAX_IMAGE_BYTES)
+    }
+
+    /// Replaces the clipboard with validated PNG file bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed or oversized PNG data, a busy clipboard, and native
+    /// ownership-transfer failures.
+    pub fn write_png(self, png: &[u8]) -> Result<u32, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::write_clipboard_png(png, MAX_IMAGE_BYTES)
+    }
+
+    /// Reads a strict DIB/DIBV5 representation as canonical BMP file bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale sequences, unsupported DIB compression/profile layouts,
+    /// inconsistent offsets, and content outside the image limit.
+    pub fn read_bmp(self, expected_sequence: u32) -> Result<Vec<u8>, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::read_clipboard_bmp(expected_sequence, MAX_IMAGE_BYTES)
+    }
+
+    /// Replaces the clipboard with a DIB derived from canonical BMP bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed headers, unsupported compression/profile layouts,
+    /// inconsistent offsets, oversized content, and native write failures.
+    pub fn write_bmp(self, bmp: &[u8]) -> Result<u32, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::write_clipboard_bmp(bmp, MAX_IMAGE_BYTES)
+    }
+
+    /// Empties the native clipboard.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the default interactive desktop is unavailable or Windows
+    /// cannot open and empty the clipboard.
+    pub fn clear(self) -> Result<u32, WindowsPlatformError> {
+        probe_environment()?;
+        ffi::clear_clipboard()
+    }
+
     /// Reads one bounded `CF_DIB` or `CF_DIBV5` memory block.
     ///
     /// # Errors
@@ -809,7 +925,7 @@ impl WindowsClipboard {
         expected_sequence: u32,
     ) -> Result<Vec<u8>, WindowsPlatformError> {
         probe_environment()?;
-        if format == ClipboardFormat::UnicodeText {
+        if !matches!(format, ClipboardFormat::Dib | ClipboardFormat::DibV5) {
             return Err(WindowsPlatformError::InvalidClipboardImage);
         }
         ffi::read_clipboard_image(format, expected_sequence, MAX_IMAGE_BYTES)
@@ -828,7 +944,7 @@ impl WindowsClipboard {
         dib: &[u8],
     ) -> Result<u32, WindowsPlatformError> {
         probe_environment()?;
-        if format == ClipboardFormat::UnicodeText || dib.is_empty() {
+        if !matches!(format, ClipboardFormat::Dib | ClipboardFormat::DibV5) || dib.is_empty() {
             return Err(WindowsPlatformError::InvalidClipboardImage);
         }
         ffi::write_clipboard_image(format, dib, MAX_IMAGE_BYTES)

@@ -1,5 +1,6 @@
 //! Windows-only agent startup over DPAPI storage and a private named pipe.
 
+mod platform;
 mod storage;
 
 use std::path::PathBuf;
@@ -15,6 +16,8 @@ use tracing::{error, info, warn};
 
 use self::storage::WindowsDpapiStorage;
 use crate::{initialize_runtime, serve_connection};
+
+pub(crate) use self::platform::WindowsPlatformPort;
 
 fn default_state_directory() -> Result<PathBuf, &'static str> {
     if let Some(path) = std::env::var_os("NODAVO_STATE_DIR") {

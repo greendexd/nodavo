@@ -35,12 +35,13 @@ use windows::Win32::Storage::FileSystem::{
     MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Pipes::GetNamedPipeClientProcessId;
 use windows::Win32::System::Power::{
@@ -94,6 +95,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, PCWSTR, PWSTR, w};
 use zeroize::Zeroizing;
 
+use crate::clipboard::{
+    bmp_to_dib, decode_cf_html, dib_to_bmp, encode_cf_html, maximum_cf_html_bytes, validate_png,
+};
 use crate::input_runtime::{
     NativeInputEvent, NativeLifecycleEvent, NativeModifierState, native_keyboard_is_supported,
 };
@@ -144,7 +148,8 @@ thread_local! {
     static CAPTURE_CONTEXT: Cell<*mut InputCaptureContext> = const { Cell::new(ptr::null_mut()) };
 }
 
-type NativeInputCallback = dyn FnMut(NativeInputEvent) + Send + 'static;
+type NativeInputCallback =
+    dyn FnMut(NativeInputEvent) -> Result<(), WindowsPlatformError> + Send + 'static;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HookObservationKey {
@@ -217,7 +222,10 @@ impl InputCaptureContext {
         if self.callback_failed {
             return;
         }
-        if catch_unwind(AssertUnwindSafe(|| (self.callback)(event))).is_err() {
+        if !matches!(
+            catch_unwind(AssertUnwindSafe(|| (self.callback)(event))),
+            Ok(Ok(()))
+        ) {
             self.callback_failed = true;
             self.routing_to_peer.store(false, Ordering::Release);
             // SAFETY: this callback runs only on the capture thread and requests
@@ -298,7 +306,7 @@ impl NativeInputCapture {
     #[allow(clippy::too_many_lines)]
     pub(super) fn new(
         routing_to_peer: Arc<AtomicBool>,
-        callback: impl FnMut(NativeInputEvent) + Send + 'static,
+        callback: impl FnMut(NativeInputEvent) -> Result<(), WindowsPlatformError> + Send + 'static,
     ) -> Result<Self, WindowsPlatformError> {
         probe_environment()?;
         let mut context = Box::new(InputCaptureContext {
@@ -873,6 +881,8 @@ unsafe fn process_raw_input(
                         NativeInputEvent::PointerMotion {
                             x: point.x,
                             y: point.y,
+                            delta_x: mouse.lLastX,
+                            delta_y: mouse.lLastY,
                         },
                     );
                 }
@@ -956,7 +966,7 @@ mod capture_tests {
 
     fn context() -> InputCaptureContext {
         InputCaptureContext {
-            callback: Box::new(|_| {}),
+            callback: Box::new(|_| Ok(())),
             routing_to_peer: Arc::new(AtomicBool::new(false)),
             observations: VecDeque::new(),
             session_active: true,
@@ -989,6 +999,20 @@ mod capture_tests {
             Some(crate::CaptureDisposition::RejectOtherInjected)
         );
         assert!(context.take_origin(key, 10).is_none());
+    }
+
+    #[test]
+    fn callback_error_immediately_disables_routing() {
+        let mut context = context();
+        context.routing_to_peer.store(true, Ordering::Release);
+        context.callback = Box::new(|_| Err(WindowsPlatformError::CaptureCallbackFailed));
+
+        context.emit(NativeInputEvent::Lifecycle(
+            NativeLifecycleEvent::InputDeviceChanged,
+        ));
+
+        assert!(context.callback_failed);
+        assert!(!context.routing_to_peer.load(Ordering::Acquire));
     }
 }
 
@@ -1350,6 +1374,10 @@ pub(super) enum NativeInput {
         x: i32,
         y: i32,
     },
+    RelativeMotion {
+        delta_x: i32,
+        delta_y: i32,
+    },
     Button {
         number: u8,
         released: bool,
@@ -1533,6 +1561,9 @@ pub(super) fn send_input(input: NativeInput) -> Result<(), WindowsPlatformError>
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )),
+        NativeInput::RelativeMotion { delta_x, delta_y } => {
+            native.push(mouse_input(delta_x, delta_y, 0, MOUSEEVENTF_MOVE));
+        }
         NativeInput::Button { number, released } => {
             let (data, flags) = mouse_button(number, released)?;
             native.push(mouse_input(0, 0, data, flags));
@@ -1663,26 +1694,65 @@ pub(super) fn clipboard_sequence_number() -> Result<u32, WindowsPlatformError> {
 }
 
 pub(super) fn clipboard_metadata() -> Result<ClipboardMetadata, WindowsPlatformError> {
+    let html_format = registered_html_format()?;
+    let png_format = registered_png_format()?;
     let before = clipboard_sequence_number()?;
     let clipboard = ClipboardGuard::open()?;
-    let mut formats = Vec::with_capacity(3);
-    for format in [
-        ClipboardFormat::UnicodeText,
-        ClipboardFormat::Dib,
-        ClipboardFormat::DibV5,
-    ] {
-        let native = native_format(format);
-        // SAFETY: querying format availability does not return a pointer or
-        // transfer ownership; the clipboard is open on this thread.
-        if unsafe { IsClipboardFormatAvailable(native) }.is_ok() {
-            let size = clipboard_block_size(native)?;
-            validate_clipboard_size(format, size)?;
-            formats.push(ClipboardFormatMetadata {
-                format,
-                byte_len: u64::try_from(size)
+    // SAFETY: the clipboard is open on this thread and the call has no pointer
+    // parameters. Zero means that the native clipboard currently has no data.
+    let native_types_empty = unsafe { CountClipboardFormats() } == 0;
+    let mut formats = Vec::with_capacity(4);
+
+    if format_is_available(CF_UNICODETEXT) {
+        let bytes =
+            copy_clipboard_block(CF_UNICODETEXT, maximum_native_utf16_bytes(MAX_TEXT_BYTES)?)?;
+        let text = decode_clipboard_text(&bytes, MAX_TEXT_BYTES)?;
+        formats.push(ClipboardFormatMetadata {
+            format: ClipboardFormat::UnicodeText,
+            byte_len: u64::try_from(text.len())
+                .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
+        });
+    }
+    if format_is_available(html_format) {
+        let encoded = copy_clipboard_block(
+            html_format,
+            u64::try_from(maximum_cf_html_bytes(MAX_TEXT_BYTES)?)
+                .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
+        )?;
+        match decode_cf_html(&encoded, MAX_TEXT_BYTES) {
+            Ok(fragment) => formats.push(ClipboardFormatMetadata {
+                format: ClipboardFormat::Html,
+                byte_len: u64::try_from(fragment.len())
                     .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
-            });
+            }),
+            Err(WindowsPlatformError::ClipboardTooLarge) => {
+                return Err(WindowsPlatformError::ClipboardTooLarge);
+            }
+            Err(_) => {}
         }
+    }
+    if format_is_available(png_format) {
+        let png = copy_clipboard_block(png_format, MAX_IMAGE_BYTES)?;
+        match validate_png(&png, MAX_IMAGE_BYTES) {
+            Ok(()) => formats.push(ClipboardFormatMetadata {
+                format: ClipboardFormat::Png,
+                byte_len: u64::try_from(png.len())
+                    .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
+            }),
+            Err(WindowsPlatformError::ClipboardTooLarge) => {
+                return Err(WindowsPlatformError::ClipboardTooLarge);
+            }
+            Err(_) => {}
+        }
+    }
+    match copy_canonical_bmp_from_open_clipboard(MAX_IMAGE_BYTES) {
+        Ok(Some(bmp)) => formats.push(ClipboardFormatMetadata {
+            format: ClipboardFormat::Bmp,
+            byte_len: u64::try_from(bmp.len())
+                .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
+        }),
+        Ok(None) | Err(WindowsPlatformError::InvalidClipboardImage) => {}
+        Err(error) => return Err(error),
     }
     drop(clipboard);
     let after = clipboard_sequence_number()?;
@@ -1691,6 +1761,7 @@ pub(super) fn clipboard_metadata() -> Result<ClipboardMetadata, WindowsPlatformE
     }
     Ok(ClipboardMetadata {
         sequence_number: before,
+        native_types_empty,
         formats,
     })
 }
@@ -1701,23 +1772,8 @@ pub(super) fn read_clipboard_text(
 ) -> Result<String, WindowsPlatformError> {
     ensure_sequence(expected_sequence)?;
     let clipboard = ClipboardGuard::open()?;
-    let bytes = copy_clipboard_block(CF_UNICODETEXT, max_bytes)?;
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
-        return Err(WindowsPlatformError::InvalidClipboardText);
-    }
-    let mut units = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        units.push(u16::from_le_bytes([pair[0], pair[1]]));
-    }
-    let nul = units
-        .iter()
-        .position(|unit| *unit == 0)
-        .ok_or(WindowsPlatformError::InvalidClipboardText)?;
-    if units[nul + 1..].iter().any(|unit| *unit != 0) {
-        return Err(WindowsPlatformError::InvalidClipboardText);
-    }
-    let value = String::from_utf16(&units[..nul])
-        .map_err(|_| WindowsPlatformError::InvalidClipboardText)?;
+    let bytes = copy_clipboard_block(CF_UNICODETEXT, maximum_native_utf16_bytes(max_bytes)?)?;
+    let value = decode_clipboard_text(&bytes, max_bytes)?;
     drop(clipboard);
     ensure_sequence(expected_sequence)?;
     Ok(value)
@@ -1730,12 +1786,17 @@ pub(super) fn write_clipboard_text(
     if text.contains('\0') {
         return Err(WindowsPlatformError::InvalidClipboardText);
     }
+    if u64::try_from(text.len()).map_err(|_| WindowsPlatformError::ClipboardTooLarge)? > max_bytes {
+        return Err(WindowsPlatformError::ClipboardTooLarge);
+    }
     let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
     let byte_len = units
         .len()
         .checked_mul(size_of::<u16>())
         .ok_or(WindowsPlatformError::ClipboardTooLarge)?;
-    if u64::try_from(byte_len).map_err(|_| WindowsPlatformError::ClipboardTooLarge)? > max_bytes {
+    if u64::try_from(byte_len).map_err(|_| WindowsPlatformError::ClipboardTooLarge)?
+        > maximum_native_utf16_bytes(max_bytes)?
+    {
         return Err(WindowsPlatformError::ClipboardTooLarge);
     }
     let bytes = units
@@ -1746,6 +1807,89 @@ pub(super) fn write_clipboard_text(
     clipboard_sequence_number()
 }
 
+pub(super) fn read_clipboard_html(
+    expected_sequence: u32,
+    max_bytes: u64,
+) -> Result<String, WindowsPlatformError> {
+    ensure_sequence(expected_sequence)?;
+    let clipboard = ClipboardGuard::open()?;
+    let encoded = copy_clipboard_block(
+        registered_html_format()?,
+        u64::try_from(maximum_cf_html_bytes(max_bytes)?)
+            .map_err(|_| WindowsPlatformError::ClipboardTooLarge)?,
+    )?;
+    let fragment = Zeroizing::new(decode_cf_html(&encoded, max_bytes)?);
+    let value = std::str::from_utf8(&fragment)
+        .map_err(|_| WindowsPlatformError::InvalidClipboardHtml)?
+        .to_owned();
+    drop(clipboard);
+    ensure_sequence(expected_sequence)?;
+    Ok(value)
+}
+
+pub(super) fn write_clipboard_html(
+    fragment: &str,
+    max_bytes: u64,
+) -> Result<u32, WindowsPlatformError> {
+    let encoded = Zeroizing::new(encode_cf_html(fragment.as_bytes(), max_bytes)?);
+    replace_clipboard_block(registered_html_format()?, &encoded)?;
+    clipboard_sequence_number()
+}
+
+pub(super) fn read_clipboard_png(
+    expected_sequence: u32,
+    max_bytes: u64,
+) -> Result<Vec<u8>, WindowsPlatformError> {
+    ensure_sequence(expected_sequence)?;
+    let clipboard = ClipboardGuard::open()?;
+    let bytes = copy_clipboard_block(registered_png_format()?, max_bytes)?;
+    validate_png(&bytes, max_bytes)?;
+    let value = bytes.to_vec();
+    drop(clipboard);
+    ensure_sequence(expected_sequence)?;
+    Ok(value)
+}
+
+pub(super) fn write_clipboard_png(png: &[u8], max_bytes: u64) -> Result<u32, WindowsPlatformError> {
+    validate_png(png, max_bytes)?;
+    replace_clipboard_block(registered_png_format()?, png)?;
+    clipboard_sequence_number()
+}
+
+pub(super) fn read_clipboard_bmp(
+    expected_sequence: u32,
+    max_bytes: u64,
+) -> Result<Vec<u8>, WindowsPlatformError> {
+    ensure_sequence(expected_sequence)?;
+    let clipboard = ClipboardGuard::open()?;
+    let bmp = copy_canonical_bmp_from_open_clipboard(max_bytes)?
+        .ok_or(WindowsPlatformError::ClipboardFormatUnavailable)?;
+    drop(clipboard);
+    ensure_sequence(expected_sequence)?;
+    Ok(bmp)
+}
+
+pub(super) fn write_clipboard_bmp(bmp: &[u8], max_bytes: u64) -> Result<u32, WindowsPlatformError> {
+    let dib = Zeroizing::new(bmp_to_dib(bmp, max_bytes)?);
+    let header_size = u32::from_le_bytes(
+        dib.get(..4)
+            .ok_or(WindowsPlatformError::InvalidClipboardImage)?
+            .try_into()
+            .map_err(|_| WindowsPlatformError::InvalidClipboardImage)?,
+    );
+    let format = if header_size == 124 { CF_DIBV5 } else { CF_DIB };
+    replace_clipboard_block(format, &dib)?;
+    clipboard_sequence_number()
+}
+
+pub(super) fn clear_clipboard() -> Result<u32, WindowsPlatformError> {
+    let clipboard = ClipboardGuard::open()?;
+    // SAFETY: the clipboard is open on this thread and no HGLOBAL is retained.
+    unsafe { EmptyClipboard() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+    drop(clipboard);
+    clipboard_sequence_number()
+}
+
 pub(super) fn read_clipboard_image(
     format: ClipboardFormat,
     expected_sequence: u32,
@@ -1753,11 +1897,11 @@ pub(super) fn read_clipboard_image(
 ) -> Result<Vec<u8>, WindowsPlatformError> {
     ensure_sequence(expected_sequence)?;
     let clipboard = ClipboardGuard::open()?;
-    let bytes = copy_clipboard_block(native_format(format), max_bytes)?;
+    let bytes = copy_clipboard_block(native_format(format)?, max_bytes)?;
     validate_dib(format, &bytes)?;
     drop(clipboard);
     ensure_sequence(expected_sequence)?;
-    Ok(bytes)
+    Ok(bytes.to_vec())
 }
 
 pub(super) fn write_clipboard_image(
@@ -1769,7 +1913,7 @@ pub(super) fn write_clipboard_image(
         return Err(WindowsPlatformError::ClipboardTooLarge);
     }
     validate_dib(format, dib)?;
-    replace_clipboard_block(native_format(format), dib)?;
+    replace_clipboard_block(native_format(format)?, dib)?;
     clipboard_sequence_number()
 }
 
@@ -1781,46 +1925,98 @@ fn ensure_sequence(expected: u32) -> Result<(), WindowsPlatformError> {
     }
 }
 
-fn native_format(format: ClipboardFormat) -> u32 {
-    match format {
-        ClipboardFormat::UnicodeText => CF_UNICODETEXT,
-        ClipboardFormat::Dib => CF_DIB,
-        ClipboardFormat::DibV5 => CF_DIBV5,
-    }
+fn maximum_native_utf16_bytes(maximum_utf8: u64) -> Result<u64, WindowsPlatformError> {
+    maximum_utf8
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(2))
+        .ok_or(WindowsPlatformError::ClipboardTooLarge)
 }
 
-fn validate_clipboard_size(
-    format: ClipboardFormat,
-    size: usize,
-) -> Result<(), WindowsPlatformError> {
-    let maximum = match format {
-        ClipboardFormat::UnicodeText => MAX_TEXT_BYTES,
-        ClipboardFormat::Dib | ClipboardFormat::DibV5 => MAX_IMAGE_BYTES,
-    };
-    if size == 0
-        || u64::try_from(size).map_err(|_| WindowsPlatformError::ClipboardTooLarge)? > maximum
+fn decode_clipboard_text(bytes: &[u8], maximum_utf8: u64) -> Result<String, WindowsPlatformError> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
+        return Err(WindowsPlatformError::InvalidClipboardText);
+    }
+    let mut units = Zeroizing::new(Vec::with_capacity(bytes.len() / 2));
+    for pair in bytes.chunks_exact(2) {
+        units.push(u16::from_le_bytes([pair[0], pair[1]]));
+    }
+    let nul = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or(WindowsPlatformError::InvalidClipboardText)?;
+    if units[nul + 1..].iter().any(|unit| *unit != 0) {
+        return Err(WindowsPlatformError::InvalidClipboardText);
+    }
+    let value = String::from_utf16(&units[..nul])
+        .map_err(|_| WindowsPlatformError::InvalidClipboardText)?;
+    if u64::try_from(value.len()).map_err(|_| WindowsPlatformError::ClipboardTooLarge)?
+        > maximum_utf8
     {
         return Err(WindowsPlatformError::ClipboardTooLarge);
     }
-    Ok(())
+    Ok(value)
 }
 
-fn clipboard_block_size(format: u32) -> Result<usize, WindowsPlatformError> {
-    // SAFETY: the clipboard is open on this thread and the returned handle is
-    // borrowed from the clipboard; ownership remains with Windows.
-    let handle = unsafe { GetClipboardData(format) }
-        .map_err(|_| WindowsPlatformError::ClipboardFormatUnavailable)?;
-    // SAFETY: clipboard global-memory formats return an HGLOBAL-compatible
-    // handle which remains valid while the clipboard is open.
-    let size = unsafe { GlobalSize(HGLOBAL(handle.0)) };
-    if size == 0 {
-        Err(WindowsPlatformError::ClipboardFormatUnavailable)
-    } else {
-        Ok(size)
+fn native_format(format: ClipboardFormat) -> Result<u32, WindowsPlatformError> {
+    match format {
+        ClipboardFormat::UnicodeText => Ok(CF_UNICODETEXT),
+        ClipboardFormat::Dib => Ok(CF_DIB),
+        ClipboardFormat::DibV5 => Ok(CF_DIBV5),
+        ClipboardFormat::Html | ClipboardFormat::Png | ClipboardFormat::Bmp => {
+            Err(WindowsPlatformError::InvalidClipboardImage)
+        }
     }
 }
 
-fn copy_clipboard_block(format: u32, maximum: u64) -> Result<Vec<u8>, WindowsPlatformError> {
+fn registered_html_format() -> Result<u32, WindowsPlatformError> {
+    // SAFETY: `w!` supplies a process-lifetime, NUL-terminated UTF-16 string.
+    let format = unsafe { RegisterClipboardFormatW(w!("HTML Format")) };
+    (format != 0)
+        .then_some(format)
+        .ok_or(WindowsPlatformError::NativeApi)
+}
+
+fn registered_png_format() -> Result<u32, WindowsPlatformError> {
+    // SAFETY: `w!` supplies a process-lifetime, NUL-terminated UTF-16 string.
+    let format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+    (format != 0)
+        .then_some(format)
+        .ok_or(WindowsPlatformError::NativeApi)
+}
+
+fn format_is_available(format: u32) -> bool {
+    // SAFETY: this query has no pointer or ownership transfer; callers hold the
+    // clipboard open when consistency with a read matters.
+    unsafe { IsClipboardFormatAvailable(format) }.is_ok()
+}
+
+fn copy_canonical_bmp_from_open_clipboard(
+    maximum: u64,
+) -> Result<Option<Vec<u8>>, WindowsPlatformError> {
+    let mut advertised = false;
+    for native in [CF_DIBV5, CF_DIB] {
+        if !format_is_available(native) {
+            continue;
+        }
+        advertised = true;
+        let dib = copy_clipboard_block(native, maximum)?;
+        match dib_to_bmp(&dib, maximum) {
+            Ok(bmp) => return Ok(Some(bmp)),
+            Err(WindowsPlatformError::InvalidClipboardImage) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if advertised {
+        Err(WindowsPlatformError::InvalidClipboardImage)
+    } else {
+        Ok(None)
+    }
+}
+
+fn copy_clipboard_block(
+    format: u32,
+    maximum: u64,
+) -> Result<Zeroizing<Vec<u8>>, WindowsPlatformError> {
     // SAFETY: the clipboard is open and the handle is borrowed without taking
     // ownership. Its memory remains valid until the clipboard is closed.
     let handle = unsafe { GetClipboardData(format) }
@@ -1840,7 +2036,8 @@ fn copy_clipboard_block(format: u32, maximum: u64) -> Result<Vec<u8>, WindowsPla
     }
     // SAFETY: GlobalSize bounded the readable region before slice construction;
     // the lock remains held while the data is copied into owned Rust memory.
-    let bytes = unsafe { std::slice::from_raw_parts(address.cast::<u8>(), size) }.to_vec();
+    let bytes =
+        Zeroizing::new(unsafe { std::slice::from_raw_parts(address.cast::<u8>(), size) }.to_vec());
     // SAFETY: this unlock balances the successful GlobalLock above. A false
     // return can mean the lock count reached zero, so no error is inferred.
     let _ = unsafe { GlobalUnlock(global) };
@@ -1913,7 +2110,7 @@ impl OwnedGlobal {
     fn copy_from(bytes: &[u8]) -> Result<Self, WindowsPlatformError> {
         // SAFETY: size is the exact source slice length and the returned moveable
         // allocation is owned by the guard until SetClipboardData succeeds.
-        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }
+        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }
             .map_err(|_| WindowsPlatformError::NativeApi)?;
         // SAFETY: the allocation is live and has at least `bytes.len()` bytes.
         let destination = unsafe { GlobalLock(handle) };

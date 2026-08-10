@@ -434,6 +434,10 @@ static int32_t ndv_decode_and_emit(NdvInputCapture *capture,
     case kCGEventOtherMouseDragged: {
         CGPoint location = CGEventGetLocation(event);
         input.kind = NDV_INPUT_POINTER_MOTION;
+        input.value1 = CGEventGetIntegerValueField(
+            event, kCGMouseEventDeltaX);
+        input.value2 = CGEventGetIntegerValueField(
+            event, kCGMouseEventDeltaY);
         input.x = location.x;
         input.y = location.y;
         return ndv_emit_input(capture, &input);

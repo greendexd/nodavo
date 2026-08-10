@@ -8,6 +8,8 @@ pub const RELIABLE_INPUT_MESSAGE_LIMIT: usize = 1024;
 pub const POINTER_FALLBACK_MESSAGE_LIMIT: usize = 1024;
 /// Maximum encoded QUIC datagram message size (1200 bytes).
 pub const DATAGRAM_MESSAGE_LIMIT: usize = 1200;
+/// Maximum magnitude of one semantic relative pointer delta axis.
+pub const MAX_POINTER_DELTA_MAGNITUDE: u32 = 32_767;
 /// Maximum encoded file manifest size (1 MiB).
 pub const MANIFEST_MESSAGE_LIMIT: usize = 1024 * 1024;
 /// Maximum UTF-8 byte length of one manifest path.

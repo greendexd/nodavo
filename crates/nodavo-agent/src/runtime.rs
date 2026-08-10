@@ -22,16 +22,19 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
+use crate::clipboard_port::native_clipboard_port;
 use crate::native_bridge::{native_input_channel, platform_safety_channel};
 #[cfg(target_os = "macos")]
 use crate::platform_port::MacPlatformPort;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::platform_port::UnavailablePlatformPort;
 use crate::session_runtime::{
     LocalSessionCommand, NativeSessionEvents, SessionConfig, SessionRole, SessionRuntimeError,
     command_channel, run_peer_session,
 };
 use crate::storage::{DevelopmentStorage, DeviceMaterial, PeerRecord, device_id_text};
+#[cfg(target_os = "windows")]
+use crate::windows::WindowsPlatformPort;
 use crate::wire::{
     EXPORTER_BYTES, EXPORTER_CONTEXT, EXPORTER_LABEL, PAIRING_PROTOCOL_VERSION, PairingMessage,
     PeerHello, WireError, accept_control_channel, close_pairing_connection, open_control_channel,
@@ -978,10 +981,13 @@ async fn run_platform_session(
 ) -> Result<(), SessionRuntimeError> {
     let (native_sender, native_receiver) = native_input_channel();
     let (safety_sender, safety_receiver) = platform_safety_channel();
+    let clipboard = native_clipboard_port().map_err(|_| SessionRuntimeError::Platform)?;
 
     #[cfg(target_os = "macos")]
     let mut platform = MacPlatformPort::new(native_sender, &safety_sender);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    let mut platform = WindowsPlatformPort::new(native_sender, &safety_sender);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let mut platform = {
         let _native_sender = native_sender;
         let _safety_sender = safety_sender;
@@ -995,6 +1001,7 @@ async fn run_platform_session(
         NativeSessionEvents {
             input: native_receiver,
             safety: safety_receiver,
+            clipboard,
         },
         disconnect,
         status,

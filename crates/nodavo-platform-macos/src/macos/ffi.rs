@@ -519,6 +519,8 @@ pub(crate) enum NativeInputEvent {
     PointerMotion {
         x: f64,
         y: f64,
+        delta_x: i32,
+        delta_y: i32,
     },
     PointerButton {
         button: u8,
@@ -693,7 +695,12 @@ fn decode_input_event(raw: &RawInputEvent) -> Option<NativeInputEvent> {
             modifier_bits: u16::try_from(raw.flags).ok()?,
         }),
         INPUT_POINTER_MOTION if raw.x.is_finite() && raw.y.is_finite() => {
-            Some(NativeInputEvent::PointerMotion { x: raw.x, y: raw.y })
+            Some(NativeInputEvent::PointerMotion {
+                x: raw.x,
+                y: raw.y,
+                delta_x: i32::try_from(raw.value1).ok()?,
+                delta_y: i32::try_from(raw.value2).ok()?,
+            })
         }
         INPUT_POINTER_BUTTON => Some(NativeInputEvent::PointerButton {
             button: u8::try_from(raw.code).ok()?,
@@ -763,6 +770,10 @@ mod input_tests {
 
         let mut motion = raw(INPUT_POINTER_MOTION);
         motion.x = f64::NAN;
+        assert!(decode_input_event(&motion).is_none());
+
+        let mut motion = raw(INPUT_POINTER_MOTION);
+        motion.value1 = i64::from(i32::MAX) + 1;
         assert!(decode_input_event(&motion).is_none());
     }
 

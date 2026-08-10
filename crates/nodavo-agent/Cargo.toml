@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 base64.workspace = true
 bytes.workspace = true
+nodavo-clipboard = { path = "../nodavo-clipboard" }
 nodavo-discovery = { path = "../nodavo-discovery" }
 nodavo-identity = { path = "../nodavo-identity" }
 nodavo-input = { path = "../nodavo-input" }

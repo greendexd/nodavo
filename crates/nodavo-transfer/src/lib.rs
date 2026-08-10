@@ -13,10 +13,12 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 mod fs_staging;
+mod outbound;
 mod queue;
 mod receiver;
 
 pub use fs_staging::FileSystemStagingArea;
+pub use outbound::{OutboundResumePoint, OutboundTransferSource};
 pub use queue::{
     MAX_ACTIVE_TRANSFERS, MAX_QUEUED_TRANSFERS, QueueEffect, QueuedTransfer, TransferQueue,
     TransferQueueState,
@@ -340,6 +342,16 @@ pub enum TransferError {
     DestinationExists,
     #[error("content integrity check failed")]
     IntegrityMismatch,
+    #[error("a selected source is missing, non-Unicode, or not a regular file or directory")]
+    InvalidSource,
+    #[error("source links, junctions, reparse points, or sparse files are not transferable")]
+    UnsafeSourceType,
+    #[error("source roots overlap, alias each other, or have no safe common filesystem root")]
+    UnsafeSourceRoots,
+    #[error("a source directory cycle or stable-identity alias was detected")]
+    SourceCycle,
+    #[error("source identity, size, modification time, or content changed after manifest hashing")]
+    SourceChanged,
     #[error("transfer was cancelled")]
     Cancelled,
     #[error("durable transfer progress is malformed or does not match the manifest")]

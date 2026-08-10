@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 5 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 7 -->
 
 # Модель безопасности
 
@@ -51,6 +51,7 @@ Private keys по возможности non-exportable и хранятся че
 - Единственный ownership lease управляет remote input routing.
 - Emergency disconnect выполняется локально и не зависит от peer.
 - Lock, sleep, timeout и disconnect освобождают keys/buttons и отзывают active lease.
+- Display snapshots являются critical, versioned, ограничены 32 записями, привязаны к сессии и защищены replay-проверкой. Native display IDs остаются локальными; peer может указать только непрозрачный token, установленный для этой аутентифицированной сессии.
 
 ## Захват и эмуляция ввода
 
@@ -58,9 +59,13 @@ Private keys по возможности non-exportable и хранятся че
 - macOS требует выданное пользователем Accessibility trust. Windows остаётся внутри default input desktop интерактивного текущего пользователя; login, Session 0, UAC secure desktop и privileged unattended control отклоняются.
 - Инъекция Nodavo использует приватную process tag, если платформа это поддерживает. Capture отклоняет эту tag и все события, отмеченные OS как injected, предотвращая synthetic feedback loop.
 - Keyboard usages, modifiers, media keys, pointer buttons, normalized motion и line/precise scrolling проверяются до injection. Native codes не передаются напрямую через peer protocol.
+- Edge transition использует critical reliable pointer-entry message. Native suppression и relative deltas остаются закрыты gate, пока receiver не проверит lease/session/grant, не разрешит session display token, не inject начальную позицию и не вернёт аутентифицированный acknowledgement. Это не позволяет потерянному или переупорядоченному entry datagram применить deltas к stale cursor.
+- Routed motion использует ограниченные ненулевые relative deltas без display identity. Coalescing callback queue сохраняет точную сумму только пока она остаётся в пределах; иначе события остаются раздельными или запускают явное recovery вместо тихого обрезания physical motion.
 - Injector отслеживает каждое принятое нажатие key/button. Emergency stop, потеря focus, lock, sleep, отключение tap/hook, timeout и transport failure синхронно запрашивают детерминированное освобождение и возврат local ownership до успешного acknowledgement.
 - Отключённый или просроченный capture hook работает fail-closed: suppression прекращается, local ownership возвращается, а remote session не может незаметно продолжиться.
 - Input payloads и pairing codes не попадают в logs, crash metadata или telemetry.
+- Ревизия топологии должна быть установлена и подтверждена до переноса фокуса в соответствующем направлении. Координаты layout от peer только описательные и никогда не создают adjacency. Edge routes задаются явной локальной политикой, отключены при пустой конфигурации и всё равно проходят обычные проверки focus lease, debounce, hysteresis и cooldown.
+- Relative capture через macOS CGEvent и Windows Raw Input вместе с native relative injection реализованы и compile-tested. Поведение на реальных устройствах, различия acceleration, extreme hardware deltas, mixed-DPI hardware и drift долгих сессий остаются release-validation gates.
 
 ## Безопасность буфера
 

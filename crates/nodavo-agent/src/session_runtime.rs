@@ -3,14 +3,15 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use nodavo_clipboard::PeerClipboardGrants;
 use nodavo_identity::{Capability as TrustedCapability, CapabilityGrants};
-use nodavo_input::InputEvent;
+use nodavo_input::{InputEvent, NormalizedPosition};
 use nodavo_local_ipc::{AgentStatus, FocusState as AgentFocusState, InputOwner};
 use nodavo_protocol::{
-    Capability, ControlMessage, DeviceId, EventMeta, GrantEpoch, ProtocolVersion, Sequence,
-    SessionId, WireMessage, decode_control, decode_datagram, decode_pointer_fallback,
-    decode_reliable_input, encode_control, encode_datagram, encode_pointer_fallback,
-    encode_reliable_input,
+    Capability, ClipboardMessage, ControlMessage, DeviceId, EventMeta, GrantEpoch, ProtocolVersion,
+    Sequence, SessionId, WireMessage, decode_clipboard, decode_control, decode_datagram,
+    decode_pointer_fallback, decode_reliable_input, encode_clipboard, encode_control,
+    encode_datagram, encode_pointer_fallback, encode_reliable_input,
 };
 use nodavo_session::{
     DisconnectReason, Effect, Event, FocusState as CoreFocusState, LeaseId, LinkState,
@@ -24,15 +25,21 @@ use thiserror::Error;
 use tokio::sync::{RwLock, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval};
 
-use crate::input_wire::{DecodedInput, decode_event, encode_event, encode_release_all};
+use crate::clipboard_port::ClipboardPort;
+use crate::clipboard_runtime::{ClipboardRuntimeError, PeerClipboardRuntime};
+use crate::input_wire::{
+    DecodedInput, decode_event, encode_event, encode_pointer_enter, encode_release_all,
+};
 use crate::native_bridge::{NativeInputReceiver, PlatformSafetyEvent, PlatformSafetyReceiver};
 use crate::platform_port::{PlatformPort, PlatformPortError};
+use crate::topology_runtime::{LocalPointerAction, PeerTopologyState};
 
 const SESSION_COMMAND_CAPACITY: usize = 32;
 const MIN_LEASE_TTL_MS: u32 = 1_000;
 const MAX_LEASE_TTL_MS: u32 = 30_000;
 const DEFAULT_LEASE_TTL_MS: u32 = 5_000;
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
+const INITIAL_TOPOLOGY_TIMEOUT: Duration = Duration::from_secs(5);
 const GRANT_EPOCH: GrantEpoch = GrantEpoch::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +84,17 @@ impl From<PlatformPortError> for SessionRuntimeError {
     }
 }
 
+impl From<ClipboardRuntimeError> for SessionRuntimeError {
+    fn from(error: ClipboardRuntimeError) -> Self {
+        match error {
+            ClipboardRuntimeError::Protocol | ClipboardRuntimeError::GrantDenied => {
+                Self::ProtocolViolation
+            }
+            ClipboardRuntimeError::Platform => Self::Platform,
+        }
+    }
+}
+
 pub(crate) enum LocalSessionCommand {
     RequestFocus {
         ttl_ms: u32,
@@ -107,12 +125,14 @@ pub(crate) fn command_channel() -> (
 pub(crate) struct NativeSessionEvents {
     pub(crate) input: NativeInputReceiver,
     pub(crate) safety: PlatformSafetyReceiver,
+    pub(crate) clipboard: Box<dyn ClipboardPort>,
 }
 
 struct Channels {
     control: ChannelId,
     reliable_input: ChannelId,
     pointer_fallback: Option<ChannelId>,
+    clipboard: ChannelId,
     datagrams: DatagramAvailability,
 }
 
@@ -130,6 +150,8 @@ struct PeerSession<'a> {
     replaceable_sequence: u64,
     renewal_pending: bool,
     routing_to_peer: bool,
+    topology: PeerTopologyState,
+    clipboard: PeerClipboardRuntime,
 }
 
 pub(crate) async fn run_peer_session(
@@ -144,6 +166,15 @@ pub(crate) async fn run_peer_session(
     let channels = establish_channels(connection.as_mut(), &config).await?;
     let (session_id, peer_grants) =
         negotiate_session(connection.as_mut(), &config, &channels).await?;
+    let clipboard = PeerClipboardRuntime::new(
+        config.local_device,
+        config.peer_device,
+        session_id,
+        GRANT_EPOCH,
+        clipboard_grants(config.local_grants_to_peer),
+        peer_grants,
+        native_events.clipboard,
+    );
     let mut core = SessionCore::default();
     let _ = core.handle(Event::ConnectStarted);
     let _ = core.handle(Event::TransportConnected);
@@ -173,8 +204,21 @@ pub(crate) async fn run_peer_session(
         replaceable_sequence: 0,
         renewal_pending: false,
         routing_to_peer: false,
+        topology: PeerTopologyState::from_environment()
+            .map_err(|_| SessionRuntimeError::Platform)?,
+        clipboard,
     };
     if session.platform.start_capture().is_err() {
+        if session
+            .force_recovery(Event::LocalEmergencyStop)
+            .await
+            .is_err()
+        {
+            return Err(SessionRuntimeError::SafetyRecoveryFailed);
+        }
+        return Err(SessionRuntimeError::Platform);
+    }
+    if session.initialize_topology().await.is_err() {
         if session
             .force_recovery(Event::LocalEmergencyStop)
             .await
@@ -282,14 +326,12 @@ impl PeerSession<'_> {
                 ttl_ms,
                 acknowledgement,
             } => {
-                let ttl_ms = ttl_ms.clamp(MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
-                let lease_id = LeaseId::new(nonzero_random_u64());
-                let expires_at = self.now().saturating_add(u64::from(ttl_ms));
-                let effects = self.core.handle(Event::LocalFocusRequested {
-                    lease_id,
-                    expires_at,
-                });
-                let result = self.apply_local_effects(effects).await;
+                let result = if self.topology.prepare_manual_focus().is_err() {
+                    Err(SessionRuntimeError::FocusRejected)
+                } else {
+                    let pointer_enter_required = self.topology.pointer_enter_required();
+                    self.request_focus(ttl_ms, pointer_enter_required).await
+                };
                 let failed = result.is_err();
                 let _ = acknowledgement.send(result);
                 if failed {
@@ -332,8 +374,7 @@ impl PeerSession<'_> {
                 };
             }
             LocalSessionCommand::LocalInput(event) => {
-                let effects = self.core.handle(Event::LocalInput(event));
-                self.apply_local_effects(effects).await?;
+                self.handle_local_input(event).await?;
             }
         }
         self.update_status().await;
@@ -345,6 +386,8 @@ impl PeerSession<'_> {
             self.force_recovery(Event::LocalEmergencyStop).await?;
             return Err(SessionRuntimeError::Platform);
         }
+        let clipboard_messages = self.clipboard.poll()?;
+        self.send_clipboard_messages(clipboard_messages).await?;
         let now = self.now();
         if let CoreFocusState::ControllingRemote {
             lease_id,
@@ -395,6 +438,15 @@ impl PeerSession<'_> {
                 self.handle_input(message).await?;
                 false
             }
+            TransportEvent::ReliableData {
+                channel, payload, ..
+            } if channel == self.channels.clipboard => {
+                let message = decode_clipboard(&payload)
+                    .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                let outbound = self.clipboard.receive(message)?;
+                self.send_clipboard_messages(outbound).await?;
+                false
+            }
             TransportEvent::Datagram { payload } => {
                 let message = decode_datagram(&payload)
                     .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
@@ -406,7 +458,9 @@ impl PeerSession<'_> {
                 true
             }
             TransportEvent::ChannelClosed { channel }
-                if channel == self.channels.control || channel == self.channels.reliable_input =>
+                if channel == self.channels.control
+                    || channel == self.channels.reliable_input
+                    || channel == self.channels.clipboard =>
             {
                 self.force_recovery(Event::LinkDisconnected).await?;
                 true
@@ -417,6 +471,7 @@ impl PeerSession<'_> {
         Ok(outcome)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_control(&mut self, payload: &[u8]) -> Result<bool, SessionRuntimeError> {
         let message =
             decode_control(payload).map_err(|_| SessionRuntimeError::ProtocolViolation)?;
@@ -428,6 +483,7 @@ impl PeerSession<'_> {
                 meta,
                 lease_id,
                 ttl_ms,
+                pointer_enter_required,
             } => {
                 let expires_at = self.now().saturating_add(u64::from(ttl_ms));
                 (
@@ -435,6 +491,7 @@ impl PeerSession<'_> {
                         meta,
                         lease_id: LeaseId::new(lease_id),
                         expires_at,
+                        pointer_enter_required,
                     }),
                     false,
                 )
@@ -443,6 +500,7 @@ impl PeerSession<'_> {
                 meta,
                 lease_id,
                 ttl_ms,
+                pointer_enter_required,
             } => {
                 let expires_at = self.now().saturating_add(u64::from(ttl_ms));
                 let event = if matches!(
@@ -453,6 +511,7 @@ impl PeerSession<'_> {
                         meta,
                         lease_id: LeaseId::new(lease_id),
                         expires_at,
+                        pointer_enter_required,
                     }
                 } else {
                     self.renewal_pending = false;
@@ -460,12 +519,59 @@ impl PeerSession<'_> {
                         meta,
                         lease_id: LeaseId::new(lease_id),
                         expires_at,
+                        pointer_enter_required,
                     }
                 };
-                (self.core.handle(event), false)
+                let mut effects = self.core.handle(event);
+                if !effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::Rejected { .. }))
+                    && matches!(
+                        self.core.focus_state(),
+                        CoreFocusState::ControllingRemote { .. }
+                    )
+                    && let Some(target) = self.topology.take_pending_target()
+                {
+                    let InputEvent::PointerMotion { position } = target else {
+                        return Err(SessionRuntimeError::ProtocolViolation);
+                    };
+                    effects.extend(self.core.handle(Event::LocalPointerEnter { position }));
+                }
+                (effects, false)
             }
             ControlMessage::FocusLeaseRelease { meta, lease_id } => (
                 self.core.handle(Event::RemoteFocusReleased {
+                    meta,
+                    lease_id: LeaseId::new(lease_id),
+                }),
+                false,
+            ),
+            ControlMessage::DisplayTopology { meta, topology } => {
+                let revision = topology.revision();
+                let effects = self
+                    .core
+                    .handle(Event::RemoteTopologyReceived { meta, revision });
+                if effects.iter().any(|effect| {
+                    matches!(
+                        effect,
+                        Effect::AcceptRemoteTopology {
+                            revision: accepted
+                        } if *accepted == revision
+                    )
+                }) {
+                    self.topology
+                        .stage_remote(topology, revision)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                }
+                (effects, false)
+            }
+            ControlMessage::DisplayTopologyAck { meta, revision } => (
+                self.core
+                    .handle(Event::RemoteTopologyAcknowledged { meta, revision }),
+                false,
+            ),
+            ControlMessage::PointerEnterAck { meta, lease_id } => (
+                self.core.handle(Event::RemotePointerEnterAcknowledged {
                     meta,
                     lease_id: LeaseId::new(lease_id),
                 }),
@@ -495,12 +601,30 @@ impl PeerSession<'_> {
         let received_at = self.now();
         let effects =
             match decode_event(&input).map_err(|_| SessionRuntimeError::ProtocolViolation)? {
-                DecodedInput::Event(event) => self.core.handle(Event::RemoteInput {
-                    meta: *input.meta(),
-                    lease_id: LeaseId::new(input.lease_id()),
-                    received_at,
-                    input: event,
-                }),
+                DecodedInput::Event(event) => {
+                    let event = self
+                        .topology
+                        .resolve_incoming(event)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                    self.core.handle(Event::RemoteInput {
+                        meta: *input.meta(),
+                        lease_id: LeaseId::new(input.lease_id()),
+                        received_at,
+                        input: event,
+                    })
+                }
+                DecodedInput::PointerEnter(position) => {
+                    let position = self
+                        .topology
+                        .resolve_incoming_position(position)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                    self.core.handle(Event::RemotePointerEnter {
+                        meta: *input.meta(),
+                        lease_id: LeaseId::new(input.lease_id()),
+                        received_at,
+                        position,
+                    })
+                }
                 DecodedInput::ReleaseAll => self.core.handle(Event::RemoteReleaseAll {
                     meta: *input.meta(),
                     lease_id: LeaseId::new(input.lease_id()),
@@ -533,14 +657,15 @@ impl PeerSession<'_> {
         self.apply_remote_effects(effects).await
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive dispatcher keeps safety effect ordering explicit and auditable"
+    )]
     async fn apply_remote_effects(
         &mut self,
         effects: Vec<Effect>,
     ) -> Result<(), SessionRuntimeError> {
-        let route_to_peer = matches!(
-            self.core.focus_state(),
-            CoreFocusState::ControllingRemote { .. }
-        );
+        let route_to_peer = self.core.local_pointer_routing_ready();
         if route_to_peer != self.routing_to_peer {
             if self.platform.set_routing_to_peer(route_to_peer).is_err() {
                 let _ = self.platform.restore_local_ownership();
@@ -555,20 +680,40 @@ impl PeerSession<'_> {
                 Effect::RequestRemoteFocus {
                     lease_id,
                     expires_at,
+                    pointer_enter_required,
+                } => {
+                    self.send_focus(
+                        ControlMessageKind::Request,
+                        lease_id,
+                        expires_at,
+                        pointer_enter_required,
+                    )
+                    .await?;
                 }
-                | Effect::RenewRemoteFocus {
+                Effect::RenewRemoteFocus {
                     lease_id,
                     expires_at,
                 } => {
-                    self.send_focus(ControlMessageKind::Request, lease_id, expires_at)
-                        .await?;
+                    self.send_focus(
+                        ControlMessageKind::Request,
+                        lease_id,
+                        expires_at,
+                        self.core.outbound_pointer_enter_required(),
+                    )
+                    .await?;
                 }
                 Effect::GrantRemoteFocus {
                     lease_id,
                     expires_at,
+                    pointer_enter_required,
                 } => {
-                    self.send_focus(ControlMessageKind::Grant, lease_id, expires_at)
-                        .await?;
+                    self.send_focus(
+                        ControlMessageKind::Grant,
+                        lease_id,
+                        expires_at,
+                        pointer_enter_required,
+                    )
+                    .await?;
                 }
                 Effect::ReleaseRemoteFocus { lease_id } => {
                     let meta = self.next_meta(SequenceKind::Control);
@@ -580,6 +725,17 @@ impl PeerSession<'_> {
                 }
                 Effect::SendInput { lease_id, input } => {
                     self.send_input(lease_id, input).await?;
+                }
+                Effect::SendPointerEnter { lease_id, position } => {
+                    self.send_pointer_enter(lease_id, position).await?;
+                }
+                Effect::AcknowledgePointerEnter { lease_id } => {
+                    let meta = self.next_meta(SequenceKind::Control);
+                    self.send_control(ControlMessage::PointerEnterAck {
+                        meta,
+                        lease_id: lease_id.get(),
+                    })
+                    .await?;
                 }
                 Effect::SendReleaseAll { lease_id } => {
                     self.send_release_all(lease_id).await?;
@@ -602,13 +758,28 @@ impl PeerSession<'_> {
                         deferred_platform_error = Some(SessionRuntimeError::Platform);
                     }
                     self.routing_to_peer = false;
+                    self.topology.clear_focus_route();
                 }
                 Effect::Disconnect { reason } => {
                     self.disconnect_transport(reason).await;
                 }
-                Effect::ArmFocusLease { .. }
-                | Effect::CancelFocusLease
-                | Effect::AbortContentOperations => {}
+                Effect::AcceptRemoteTopology { revision } => {
+                    self.topology
+                        .commit_remote(revision)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                }
+                Effect::AcknowledgeRemoteTopology { revision } => {
+                    let meta = self.next_meta(SequenceKind::Control);
+                    self.send_control(ControlMessage::DisplayTopologyAck { meta, revision })
+                        .await?;
+                }
+                Effect::LocalTopologyReady { revision } => {
+                    self.topology
+                        .mark_local_ready(revision)
+                        .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+                }
+                Effect::ArmFocusLease { .. } | Effect::CancelFocusLease => {}
+                Effect::AbortContentOperations => self.clipboard.disconnect(),
                 Effect::Rejected { .. } => return Err(SessionRuntimeError::ProtocolViolation),
             }
         }
@@ -620,6 +791,7 @@ impl PeerSession<'_> {
         kind: ControlMessageKind,
         lease_id: LeaseId,
         expires_at: MonotonicMillis,
+        pointer_enter_required: bool,
     ) -> Result<(), SessionRuntimeError> {
         let ttl_ms = expires_at.get().saturating_sub(self.now().get());
         let ttl_ms = u32::try_from(ttl_ms)
@@ -631,14 +803,87 @@ impl PeerSession<'_> {
                 meta,
                 lease_id: lease_id.get(),
                 ttl_ms,
+                pointer_enter_required,
             },
             ControlMessageKind::Grant => ControlMessage::FocusLeaseGrant {
                 meta,
                 lease_id: lease_id.get(),
                 ttl_ms,
+                pointer_enter_required,
             },
         };
         self.send_control(message).await
+    }
+
+    async fn initialize_topology(&mut self) -> Result<(), SessionRuntimeError> {
+        let snapshots = self.platform.display_snapshot()?;
+        let topology = self
+            .topology
+            .reconcile_local(&snapshots)
+            .map_err(|_| SessionRuntimeError::Platform)?
+            .ok_or(SessionRuntimeError::Platform)?;
+        if self.core.local_grant_allows_peer_input() {
+            let revision = topology.revision();
+            let effects = self.core.handle(Event::LocalTopologyPublished { revision });
+            self.apply_local_effects(effects).await?;
+            self.topology.record_local_publish(revision);
+            let meta = self.next_meta(SequenceKind::Control);
+            self.send_control(ControlMessage::DisplayTopology { meta, topology })
+                .await?;
+        }
+
+        let needs_remote = self.core.peer_grant_allows_local_input();
+        let needs_ack = self.core.local_grant_allows_peer_input();
+        let exchange = async {
+            loop {
+                let remote_ready = !needs_remote || self.core.remote_topology_revision().is_some();
+                let local_ready =
+                    !needs_ack || self.core.acknowledged_topology_revision().is_some();
+                if remote_ready && local_ready {
+                    return Ok(());
+                }
+                let event = self.connection.next_event().await?;
+                if self.handle_transport_event(event).await? {
+                    return Err(SessionRuntimeError::Transport);
+                }
+            }
+        };
+        tokio::time::timeout(INITIAL_TOPOLOGY_TIMEOUT, exchange)
+            .await
+            .map_err(|_| SessionRuntimeError::Transport)?
+    }
+
+    async fn request_focus(
+        &mut self,
+        ttl_ms: u32,
+        pointer_enter_required: bool,
+    ) -> Result<(), SessionRuntimeError> {
+        let ttl_ms = ttl_ms.clamp(MIN_LEASE_TTL_MS, MAX_LEASE_TTL_MS);
+        let lease_id = LeaseId::new(nonzero_random_u64());
+        let expires_at = self.now().saturating_add(u64::from(ttl_ms));
+        let effects = self.core.handle(Event::LocalFocusRequested {
+            lease_id,
+            expires_at,
+            pointer_enter_required,
+        });
+        self.apply_local_effects(effects).await
+    }
+
+    async fn handle_local_input(&mut self, event: InputEvent) -> Result<(), SessionRuntimeError> {
+        if let InputEvent::PointerMotion { position } = event {
+            let action = self
+                .topology
+                .local_pointer(position, self.core.focus_state(), self.now())
+                .map_err(|_| SessionRuntimeError::Platform)?;
+            match action {
+                LocalPointerAction::Local | LocalPointerAction::Suppressed => return Ok(()),
+                LocalPointerAction::RequestFocus => {
+                    return self.request_focus(DEFAULT_LEASE_TTL_MS, true).await;
+                }
+            }
+        }
+        let effects = self.core.handle(Event::LocalInput(event));
+        self.apply_local_effects(effects).await
     }
 
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), SessionRuntimeError> {
@@ -650,6 +895,20 @@ impl PeerSession<'_> {
     async fn send_release_all(&mut self, lease_id: LeaseId) -> Result<(), SessionRuntimeError> {
         let meta = self.next_meta(SequenceKind::Reliable);
         let message = encode_release_all(meta, lease_id.get());
+        let encoded = encode_reliable_input(&WireMessage::Input(message))
+            .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+        self.send_reliable(self.channels.reliable_input, encoded)
+            .await
+    }
+
+    async fn send_pointer_enter(
+        &mut self,
+        lease_id: LeaseId,
+        position: NormalizedPosition,
+    ) -> Result<(), SessionRuntimeError> {
+        let meta = self.next_meta(SequenceKind::Reliable);
+        let message = encode_pointer_enter(position, meta, lease_id.get())
+            .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
         let encoded = encode_reliable_input(&WireMessage::Input(message))
             .map_err(|_| SessionRuntimeError::ProtocolViolation)?;
         self.send_reliable(self.channels.reliable_input, encoded)
@@ -708,6 +967,18 @@ impl PeerSession<'_> {
                 end_of_stream: false,
             })
             .await?;
+        Ok(())
+    }
+
+    async fn send_clipboard_messages(
+        &mut self,
+        messages: Vec<ClipboardMessage>,
+    ) -> Result<(), SessionRuntimeError> {
+        for message in messages {
+            let payload =
+                encode_clipboard(&message).map_err(|_| SessionRuntimeError::ProtocolViolation)?;
+            self.send_reliable(self.channels.clipboard, payload).await?;
+        }
         Ok(())
     }
 
@@ -838,10 +1109,12 @@ async fn establish_channels(
     } else {
         None
     };
+    let clipboard = establish_channel(connection, config.role, ChannelKind::Clipboard).await?;
     Ok(Channels {
         control,
         reliable_input,
         pointer_fallback,
+        clipboard,
         datagrams,
     })
 }
@@ -1098,6 +1371,13 @@ const fn allows_input(grants: CapabilityGrants) -> bool {
     grants.contains(TrustedCapability::RemoteInput)
 }
 
+const fn clipboard_grants(grants: CapabilityGrants) -> PeerClipboardGrants {
+    PeerClipboardGrants {
+        allow_peer_read: grants.contains(TrustedCapability::ClipboardRead),
+        allow_peer_write: grants.contains(TrustedCapability::ClipboardWrite),
+    }
+}
+
 fn protocol_capabilities(grants: CapabilityGrants) -> Capability {
     let mut capabilities = Capability::empty();
     if grants.contains(TrustedCapability::RemoteInput) {
@@ -1118,7 +1398,9 @@ fn protocol_capabilities(grants: CapabilityGrants) -> Capability {
 const fn is_replaceable(event: InputEvent) -> bool {
     matches!(
         event,
-        InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. }
+        InputEvent::PointerMotion { .. }
+            | InputEvent::PointerDelta { .. }
+            | InputEvent::Scroll { .. }
     )
 }
 
@@ -1166,7 +1448,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use nodavo_identity::Capability as TrustedCapability;
-    use nodavo_input::{HidUsage, KEYBOARD_PAGE, KeyState, Modifiers};
+    use nodavo_input::{HidUsage, KEYBOARD_PAGE, KeyState, Modifiers, PointerDelta};
     use nodavo_transport::{BoxFuture, DatagramAvailability, Endpoint};
     use tokio::time::timeout;
 
@@ -1322,7 +1604,10 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn two_peers_return_focus_on_same_link_and_recover_before_acknowledgement() {
         let (a_connection, b_connection) = memory_pair();
-        let grants = CapabilityGrants::NONE.with(TrustedCapability::RemoteInput);
+        let grants = CapabilityGrants::NONE
+            .with(TrustedCapability::RemoteInput)
+            .with(TrustedCapability::ClipboardRead)
+            .with(TrustedCapability::ClipboardWrite);
         let a_status = Arc::new(RwLock::new(connected_status()));
         let b_status = Arc::new(RwLock::new(connected_status()));
         let a_platform = VirtualPlatformPort::default();
@@ -1331,10 +1616,15 @@ mod tests {
         let b_observer = b_platform.clone();
         let (a_commands, a_receiver) = command_channel();
         let (b_commands, b_receiver) = command_channel();
-        let (_a_native_sender, a_native_receiver) = crate::native_bridge::native_input_channel();
+        let (a_native_sender, a_native_receiver) = crate::native_bridge::native_input_channel();
         let (b_native_sender, b_native_receiver) = crate::native_bridge::native_input_channel();
         let (_a_safety_sender, a_safety_receiver) = crate::native_bridge::platform_safety_channel();
         let (_b_safety_sender, b_safety_receiver) = crate::native_bridge::platform_safety_channel();
+        let clipboard_content = Bytes::from_static(b"clipboard channel integration proof");
+        let (a_clipboard, _a_clipboard_observer) =
+            crate::clipboard_port::VirtualClipboardPort::with_local_text(1, &clipboard_content);
+        let (b_clipboard, b_clipboard_observer) =
+            crate::clipboard_port::VirtualClipboardPort::empty();
         let (_a_disconnect, a_disconnect) = watch::channel(0_u64);
         let (_b_disconnect, b_disconnect) = watch::channel(0_u64);
 
@@ -1355,6 +1645,7 @@ mod tests {
                 NativeSessionEvents {
                     input: a_native_receiver,
                     safety: a_safety_receiver,
+                    clipboard: Box::new(a_clipboard),
                 },
                 a_disconnect,
                 &a_status_task,
@@ -1379,6 +1670,7 @@ mod tests {
                 NativeSessionEvents {
                     input: b_native_receiver,
                     safety: b_safety_receiver,
+                    clipboard: Box::new(b_clipboard),
                 },
                 b_disconnect,
                 &b_status_task,
@@ -1386,6 +1678,14 @@ mod tests {
             )
             .await
         });
+
+        timeout(Duration::from_secs(2), async {
+            while b_clipboard_observer.applied_bytes() != clipboard_content {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clipboard content did not cross the dedicated session channel");
 
         let (ack, received) = oneshot::channel();
         a_commands
@@ -1399,8 +1699,32 @@ mod tests {
         wait_for_owner(&b_status, InputOwner::Remote).await;
         wait_for_focus(&a_status, AgentFocusState::ControllingPeer).await;
         wait_for_focus(&b_status, AgentFocusState::ControlledByPeer).await;
-        assert!(a_observer.snapshot().routing_to_peer);
+        timeout(Duration::from_secs(2), async {
+            while !a_observer.snapshot().routing_to_peer {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("routing started before reliable pointer-enter acknowledgement");
         assert!(!b_observer.snapshot().routing_to_peer);
+        assert!(b_observer.snapshot().injected.iter().any(|event| {
+            matches!(
+                event,
+                InputEvent::PointerMotion { position }
+                    if position.display() == nodavo_input::DisplayId::new(101)
+            )
+        }));
+        let relative = InputEvent::PointerDelta {
+            delta: PointerDelta::new(12, -5).unwrap(),
+        };
+        a_native_sender.send(relative).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while !b_observer.snapshot().injected.contains(&relative) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relative pointer delta did not follow reliable entry placement");
 
         let (ack, received) = oneshot::channel();
         a_commands
@@ -1434,7 +1758,16 @@ mod tests {
             })
             .unwrap();
         timeout(Duration::from_secs(2), async {
-            while a_observer.snapshot().injected.is_empty() {
+            while !a_observer.snapshot().injected.iter().any(|event| {
+                matches!(
+                    event,
+                    InputEvent::Key {
+                        usage,
+                        state: KeyState::Pressed,
+                        ..
+                    } if *usage == HidUsage::new(KEYBOARD_PAGE, 4)
+                )
+            }) {
                 tokio::task::yield_now().await;
             }
         })

@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 nodavo-input = { path = "../nodavo-input" }
 nodavo-protocol = { path = "../nodavo-protocol" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

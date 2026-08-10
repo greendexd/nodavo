@@ -1,4 +1,4 @@
-<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 9 -->
+<!-- doc-id: readme; lang: ru; translation-of: README.md; revision: 10 -->
 
 <div align="center">
   <img src="assets/logo.svg" width="132" alt="Логотип Nodavo">
@@ -19,7 +19,7 @@
 </div>
 
 > [!IMPORTANT]
-> Nodavo находится в активной разработке на стадии pre-alpha. Рабочей межкомпьютерной сборки и публичного релиза пока нет. Rust workspace и оболочка macOS компилируются для разработки, но исходники WinUI ещё не собирались на Windows, а полный путь macOS ↔ Windows, установщики и релизная проверка не готовы.
+> Nodavo находится в активной разработке на стадии pre-alpha. Поддерживаемой межкомпьютерной сборки и публичного релиза пока нет. Интегрированный Rust-агент, оболочка macOS и WinUI 3 x64 компилируются в CI, а репозиторий собирает явно помеченные development app/DMG для macOS, но реальная квалификация Mac ↔ PC, release signing, установщики и полный файловый/product UX ещё не готовы.
 
 ## Видение
 
@@ -40,33 +40,33 @@ Nodavo создаётся, чтобы Mac и Windows-компьютер ощущ
 
 | Возможность | Цель для 1.0 | Текущий статус pre-alpha |
 | --- | --- | --- |
-| Общая мышь и клавиатура | macOS ↔ Windows в обе стороны | Компилируются аутентифицированные двусторонние каналы сессии, focus leases, forced release, подключённый macOS capture/injection bridge и оба нативных runtime; нет Windows agent bridge и реального hardware-доказательства Mac ↔ PC |
-| Переход через край экрана | Разный масштаб DPI и несколько мониторов | Двустороннее переключение focus в том же соединении и renewal lease проходят virtual proof; в macOS есть ручное управление, но нет edge detection, authenticated display topology, mixed-DPI routing и редактора |
-| Буфер обмена | UTF-8 текст, HTML, PNG/BMP | Есть ограниченные контракты синхронизации и Windows-граница буфера; нет production-адаптера macOS и синхронизации между устройствами |
-| Файлы и папки | Копирование, очередь, возобновление, проверка целостности | Есть ограниченная FIFO-очередь и файловый staging; staging проверяет BLAKE3 каждого файла, возобновляет с точного offset, отбрасывает torn tail и завершает без перезаписи; нет peer-интеграции |
+| Общая мышь и клавиатура | macOS ↔ Windows в обе стороны | Оба native bridge подключены к аутентифицированным equal-peer sessions. Reliable pointer entry подтверждается до suppression; relative motion, HID/media keys, buttons, scroll, focus leases, forced release и lifecycle recovery проходят virtual/native-inert проверки. Реального hardware-доказательства Mac ↔ PC пока нет |
+| Переход через край экрана | Разный масштаб DPI и несколько мониторов | Подключены authenticated session-scoped topology, mixed-DPI transforms, явные edge routes, debounce/hysteresis, reliable entry и relative deltas. Нет layout editor, hot-plug refresh и физической multi-monitor проверки |
+| Буфер обмена | UTF-8 текст, HTML, PNG/BMP | Надёжный peer channel применяет независимые grants, bounded streaming, BLAKE3, loop prevention и cleanup. macOS поддерживает text/HTML/PNG/clear; Windows — text/HTML/PNG/clear и строгий subset BMP. Для Windows есть только compile/parser evidence |
+| Файлы и папки | Копирование, очередь, возобновление, проверка целостности | Есть безопасный receive staging, durable exact-offset resume, очередь и no-overwrite finalization. Capability-rooted outbound source отклоняет links/reparse points, sparse/special files, mutation, collisions и unsafe resume. Peer channels и native transfer UI ещё не подключены |
 | Обнаружение | mDNS и запасной вариант с ручным IP | Агент разрешает ограниченные записи mDNS и принимает ручные адреса; автоматического списка устройств в интерфейсе пока нет |
-| Сопряжение | Подтверждаемый пользователем короткий код и закреплённые идентификаторы устройств | Два агента могут привязать явные отдельные разрешения к одному коду, сохранить подписанное доверие, переподключиться с взаимно закреплённым TLS и отвергнуть отозванное устройство; оба нативных сценария есть в исходниках, но отсутствуют Windows runtime-проверка и изменение разрешений после сопряжения |
-| Транспорт | QUIC с TLS 1.3 | Через QUIC/TLS 1.3 работают реальное сопряжение, безопасное переподключение, negotiation, control, reliable input, datagrams и pointer fallback; peer-каналы буфера и файлов ещё не подключены |
-| Платформы | macOS 13+ и Windows 10 22H2/11, x64 и ARM64 | SwiftUI-оболочка macOS компилируется; исходники Windows Rust-агента cross-check для x64 с приватным named-pipe IPC и DPAPI-хранилищем, а двуязычный сценарий WinUI 3 проходит проверки XML/исходников, но runtime-доказательств Windows пока нет |
+| Сопряжение | Подтверждаемый пользователем короткий код и закреплённые идентификаторы устройств | Pairing-time grants, signed trust, pinned mutual TLS reconnect и revocation работают в smoke tests агентов. macOS по умолчанию использует Keychain, Windows — DPAPI; остаются signed/provisioned Keychain success, Windows runtime, trusted-device UI и post-pair изменения grants |
+| Транспорт | QUIC с TLS 1.3 | Через одно mutually authenticated соединение работают pairing, pinned reconnect, negotiation, topology, focus, reliable input, acknowledged entry, datagrams/fallback и clipboard. File peer channels ещё не подключены |
+| Платформы | macOS 13+ и Windows 10 22H2/11, x64 и ARM64 | SwiftUI и WinUI 3 x64 компилируются в CI; Rust проверяется для macOS arm64/x64 и Windows x64, также собирается universal development app/DMG macOS. Windows runtime/ARM64, Developer ID/notarization и release installers не доказаны |
 
 Трансляция экрана, сервер-посредник в интернете, мобильные клиенты, Linux и управление Windows Secure Desktop не входят в первоначальный объём 1.0.
 
 ### Что уже существует
 
 - Rust workspace с ограниченными компонентами протокола, идентификаторов, транспорта, сессии, обнаружения, буфера, передачи файлов, проверки обновлений и локального IPC.
-- Пользовательский Rust-агент с приватным локальным IPC, ручным/mDNS-сопряжением, явными разрешениями, подписанным доверием, закреплённым reconnect, отзывом, negotiation peer session, focus leases, bounded input channels, детерминированным safety recovery и emergency stop. Файловое хранилище macOS предназначено только для разработки.
+- Пользовательский Rust-агент с приватным локальным IPC, ручным/mDNS-сопряжением, явными grants, signed trust, pinned reconnect, revocation, negotiated peer sessions, authenticated topology, relative input, clipboard sync, deterministic safety recovery и emergency stop. macOS по умолчанию использует Keychain; файловое хранилище включается только явным insecure-development flag.
 - Двуязычная SwiftUI-оболочка macOS в строке меню, подключённая к приватному локальному сокету агента, включая ручной/ожидающий режим сопряжения и явное подтверждение кода.
-- Исходники двуязычной WinUI 3-оболочки с ограниченными запросами статуса, аварийного отключения, ручного/ожидающего сопряжения и явного подтверждения кода через named pipe. Она ещё не компилировалась и не запускалась на Windows.
-- Оригинальные owned input runtimes macOS/Windows с default-off suppression, отклонением synthetic events, lifecycle recovery, injection acknowledgements и display boundaries; macOS подключён к агенту, Windows agent bridge ещё отсутствует. Также есть clipboard, Keychain, DPAPI и protected pipe boundaries.
-- Ограниченная детерминированная transfer queue и приватный файловый staging с проверкой путей/размеров, durable-журналом offset, возобновлением, BLAKE3 и запретом перезаписи назначения.
-- Определение CI только для компиляционных проверок и небольшие программы проверки реализуемости. Это инфраструктура разработчика, а не распространяемое приложение.
+- Двуязычная WinUI 3-оболочка с ограниченными статусом, emergency stop, manual/listening pairing и подтверждением кода через protected named pipe. GitHub Actions компилирует Release x64; интерактивного запуска Windows пока не было.
+- Оригинальные macOS/Windows input и clipboard runtimes, подключённые к agent, с default-off suppression, injected-event rejection, bounded relative motion, lifecycle recovery, deterministic release и content-redacted failures.
+- Ограниченная transfer queue, durable private receiver staging и capability-rooted outbound filesystem source с exact hashes, resume evidence, mutation detection и no-follow paths. Network/file-selection orchestration ещё отсутствует.
+- Universal development app/DMG pipeline для macOS и fail-closed release path Developer ID/provisioning/notarization. Release credentials недоступны, поэтому собран только явно непригодный для распространения development artifact.
 
 ### Чего не хватает до рабочей сборки
 
-- Подключить Windows native input runtime, буфер и transfers к аутентифицированной peer session; добавить edge switching и authenticated mapping дисплеев; затем доказать реальный путь Mac ↔ PC.
-- Успешная Windows-проверка сборки/запуска интегрированных агента, DPAPI-хранилища, named pipe и WinUI, а также полные сценарии первоначальной настройки, разрешений, раскладки, диагностики и восстановления на обеих платформах.
-- Интеграция реализованной границы macOS Keychain как production-хранилища агента и provisioned access-group entitlement; peer orchestration очереди буфера/файлов, очистка устаревшего состояния и установка обновлений.
-- Подписанные установщики и полная программа проверок безопасности, фаззинга, нагрузки, совместимости, доступности, обновлений и реального оборудования для 1.0.
+- Реальная интерактивная Mac ↔ Windows проверка input, relative edge crossing, DPI, lifecycle, clipboard, DPAPI, named-pipe/WinUI flow и recovery; также отсутствует Windows ARM64 evidence.
+- File manifest/data channel orchestration, выбранные пользователем destinations, transfer queue UI, trusted-device и post-pair permission management, hot-plug layout editor, onboarding, diagnostics и updater installation.
+- Signed/provisioned запуск macOS, подтверждающий стабильность Keychain/TCC, а также Developer ID/notarization и Authenticode/MSIX/MSI credentials с clean install/upgrade/uninstall matrices.
+- Полные security, fuzz, stress, compatibility, accessibility, long-running beta, external-review, SBOM/provenance и real-hardware gates версии 1.0.
 
 ## Направление архитектуры
 

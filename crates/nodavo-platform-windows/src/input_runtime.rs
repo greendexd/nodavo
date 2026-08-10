@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use nodavo_input::{
     ButtonState, CONSUMER_PAGE, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState, Modifiers,
-    NormalizedAxis, NormalizedPosition, PointerButton, ScrollUnit,
+    NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, ScrollUnit,
 };
 
 use crate::DisplayGeometry;
@@ -70,6 +70,8 @@ pub(crate) enum NativeInputEvent {
     PointerMotion {
         x: i32,
         y: i32,
+        delta_x: i32,
+        delta_y: i32,
     },
     PointerButton {
         button: u8,
@@ -132,6 +134,7 @@ impl CaptureTranslator {
         &mut self,
         native: NativeInputEvent,
         displays: &[DisplayGeometry],
+        relative_pointer: bool,
     ) -> Option<WindowsInputCaptureEvent> {
         let event = match native {
             NativeInputEvent::Keyboard {
@@ -157,7 +160,12 @@ impl CaptureTranslator {
                     modifiers: self.modifiers,
                 }
             }
-            NativeInputEvent::PointerMotion { x, y } => InputEvent::PointerMotion {
+            NativeInputEvent::PointerMotion {
+                delta_x, delta_y, ..
+            } if relative_pointer => InputEvent::PointerDelta {
+                delta: PointerDelta::new(delta_x, delta_y).ok()?,
+            },
+            NativeInputEvent::PointerMotion { x, y, .. } => InputEvent::PointerMotion {
                 position: normalize_position(x, y, displays)?,
             },
             NativeInputEvent::PointerButton { button, pressed } => InputEvent::PointerButton {
@@ -466,6 +474,7 @@ mod tests {
                     pressed: true,
                 },
                 &[],
+                false,
             )
             .unwrap();
         assert!(matches!(
@@ -488,6 +497,7 @@ mod tests {
                     pressed: true,
                 },
                 &[],
+                false,
             )
             .unwrap();
         assert!(matches!(
@@ -506,8 +516,14 @@ mod tests {
         let mut translator = CaptureTranslator::new(NativeModifierState::default());
         let motion = translator
             .convert(
-                NativeInputEvent::PointerMotion { x: -1, y: 1_079 },
+                NativeInputEvent::PointerMotion {
+                    x: -1,
+                    y: 1_079,
+                    delta_x: 5,
+                    delta_y: -3,
+                },
                 &[display()],
+                false,
             )
             .unwrap();
         assert!(matches!(
@@ -518,8 +534,14 @@ mod tests {
         assert!(
             translator
                 .convert(
-                    NativeInputEvent::PointerMotion { x: 0, y: 1_080 },
+                    NativeInputEvent::PointerMotion {
+                        x: 0,
+                        y: 1_080,
+                        delta_x: 5,
+                        delta_y: -3,
+                    },
                     &[display()],
+                    false,
                 )
                 .is_none()
         );
@@ -533,6 +555,7 @@ mod tests {
                         vertical: delta,
                     },
                     &[],
+                    false,
                 )
                 .unwrap();
             assert!(matches!(
@@ -544,6 +567,26 @@ mod tests {
                 }) if vertical == semantic && actual == unit
             ));
         }
+    }
+
+    #[test]
+    fn routed_pointer_uses_relative_raw_input_without_display_identity() {
+        let mut translator = CaptureTranslator::new(NativeModifierState::default());
+        assert_eq!(
+            translator.convert(
+                NativeInputEvent::PointerMotion {
+                    x: -1_000,
+                    y: 500,
+                    delta_x: 17,
+                    delta_y: -9,
+                },
+                &[display()],
+                true,
+            ),
+            Some(WindowsInputCaptureEvent::Input(InputEvent::PointerDelta {
+                delta: PointerDelta::new(17, -9).unwrap(),
+            }))
+        );
     }
 
     #[test]

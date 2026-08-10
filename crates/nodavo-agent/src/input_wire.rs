@@ -2,18 +2,19 @@
 
 use nodavo_input::{
     ButtonState, DisplayId, HidUsage, InputEvent, KeyState, Modifiers, NormalizedAxis,
-    NormalizedPosition, PointerButton, ScrollUnit,
+    NormalizedPosition, PointerButton, PointerDelta, ScrollUnit,
 };
 use nodavo_protocol::{
     ButtonState as WireButtonState, EventMeta, InputMessage, KeyEvent, KeyState as WireKeyState,
-    PointerButtonEvent, PointerMotionEvent, ReleaseAllEvent, ScrollEvent,
-    ScrollUnit as WireScrollUnit,
+    PointerButtonEvent, PointerDeltaEvent, PointerEnterEvent, PointerMotionEvent, ReleaseAllEvent,
+    ScrollEvent, ScrollUnit as WireScrollUnit,
 };
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodedInput {
     Event(InputEvent),
+    PointerEnter(NormalizedPosition),
     ReleaseAll,
 }
 
@@ -66,6 +67,12 @@ pub(crate) fn encode_event(
                 lease_id,
             })
         }
+        InputEvent::PointerDelta { delta } => InputMessage::PointerDelta(PointerDeltaEvent {
+            meta,
+            delta_x: delta.horizontal(),
+            delta_y: delta.vertical(),
+            lease_id,
+        }),
         InputEvent::Scroll {
             horizontal,
             vertical,
@@ -86,6 +93,22 @@ pub(crate) fn encode_event(
 
 pub(crate) const fn encode_release_all(meta: EventMeta, lease_id: u64) -> InputMessage {
     InputMessage::ReleaseAll(ReleaseAllEvent { meta, lease_id })
+}
+
+pub(crate) fn encode_pointer_enter(
+    position: NormalizedPosition,
+    meta: EventMeta,
+    lease_id: u64,
+) -> Result<InputMessage, InputWireError> {
+    let display_id =
+        u32::try_from(position.display().get()).map_err(|_| InputWireError::UnsupportedValue)?;
+    Ok(InputMessage::PointerEnter(PointerEnterEvent {
+        meta,
+        display_id,
+        x: expand_axis(position.x()),
+        y: expand_axis(position.y()),
+        lease_id,
+    }))
 }
 
 pub(crate) fn decode_event(message: &InputMessage) -> Result<DecodedInput, InputWireError> {
@@ -114,6 +137,15 @@ pub(crate) fn decode_event(message: &InputMessage) -> Result<DecodedInput, Input
                 collapse_axis(event.y),
             ),
         }),
+        InputMessage::PointerDelta(event) => DecodedInput::Event(InputEvent::PointerDelta {
+            delta: PointerDelta::new(event.delta_x, event.delta_y)
+                .map_err(|_| InputWireError::UnsupportedValue)?,
+        }),
+        InputMessage::PointerEnter(event) => DecodedInput::PointerEnter(NormalizedPosition::new(
+            DisplayId::new(u64::from(event.display_id)),
+            collapse_axis(event.x),
+            collapse_axis(event.y),
+        )),
         InputMessage::Scroll(event) => DecodedInput::Event(InputEvent::Scroll {
             horizontal: event.delta_x,
             vertical: event.delta_y,
@@ -166,6 +198,9 @@ mod tests {
                     NormalizedAxis::from_bits(123),
                     NormalizedAxis::MAX,
                 ),
+            },
+            InputEvent::PointerDelta {
+                delta: PointerDelta::new(-17, 23).unwrap(),
             },
             InputEvent::Scroll {
                 horizontal: -2,

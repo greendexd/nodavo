@@ -3,7 +3,9 @@ use core::fmt;
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-use crate::{Capability, DeviceId, EventMeta, GrantEpoch, ProtocolVersion, SessionId};
+use crate::{
+    Capability, DeviceId, DisplayTopology, EventMeta, GrantEpoch, ProtocolVersion, SessionId,
+};
 
 /// Control-stream messages. Variant names describe protocol intent, not current
 /// product availability.
@@ -36,13 +38,30 @@ pub enum ControlMessage {
         meta: EventMeta,
         lease_id: u64,
         ttl_ms: u32,
+        pointer_enter_required: bool,
     },
     FocusLeaseGrant {
         meta: EventMeta,
         lease_id: u64,
         ttl_ms: u32,
+        pointer_enter_required: bool,
     },
     FocusLeaseRelease {
+        meta: EventMeta,
+        lease_id: u64,
+    },
+    /// Complete display snapshot. Display identifiers are opaque and scoped to
+    /// this authenticated session; they are never platform-native identifiers.
+    DisplayTopology {
+        meta: EventMeta,
+        topology: DisplayTopology,
+    },
+    /// Confirms that a topology revision was validated and installed.
+    DisplayTopologyAck {
+        meta: EventMeta,
+        revision: u64,
+    },
+    PointerEnterAck {
         meta: EventMeta,
         lease_id: u64,
     },
@@ -170,6 +189,46 @@ pub struct PointerMotionEvent {
     pub lease_id: u64,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[cbor(map)]
+pub struct PointerDeltaEvent {
+    #[n(0)]
+    pub meta: EventMeta,
+    #[n(1)]
+    pub delta_x: i32,
+    #[n(2)]
+    pub delta_y: i32,
+    #[n(3)]
+    pub lease_id: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
+#[cbor(map)]
+pub struct PointerEnterEvent {
+    #[n(0)]
+    pub meta: EventMeta,
+    #[n(1)]
+    pub display_id: u32,
+    #[n(2)]
+    pub x: u32,
+    #[n(3)]
+    pub y: u32,
+    #[n(4)]
+    pub lease_id: u64,
+}
+
+impl fmt::Debug for PointerEnterEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PointerEnterEvent([redacted])")
+    }
+}
+
+impl fmt::Debug for PointerDeltaEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PointerDeltaEvent([redacted])")
+    }
+}
+
 impl fmt::Debug for PointerMotionEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PointerMotionEvent([redacted])")
@@ -217,6 +276,8 @@ pub enum InputMessage {
     Key(KeyEvent),
     PointerButton(PointerButtonEvent),
     PointerMotion(PointerMotionEvent),
+    PointerDelta(PointerDeltaEvent),
+    PointerEnter(PointerEnterEvent),
     Scroll(ScrollEvent),
     ReleaseAll(ReleaseAllEvent),
 }
@@ -228,6 +289,8 @@ impl InputMessage {
             Self::Key(event) => &event.meta,
             Self::PointerButton(event) => &event.meta,
             Self::PointerMotion(event) => &event.meta,
+            Self::PointerDelta(event) => &event.meta,
+            Self::PointerEnter(event) => &event.meta,
             Self::Scroll(event) => &event.meta,
             Self::ReleaseAll(event) => &event.meta,
         }
@@ -239,6 +302,8 @@ impl InputMessage {
             Self::Key(event) => event.lease_id,
             Self::PointerButton(event) => event.lease_id,
             Self::PointerMotion(event) => event.lease_id,
+            Self::PointerDelta(event) => event.lease_id,
+            Self::PointerEnter(event) => event.lease_id,
             Self::Scroll(event) => event.lease_id,
             Self::ReleaseAll(event) => event.lease_id,
         }
@@ -251,6 +316,8 @@ impl fmt::Debug for InputMessage {
             Self::Key(_) => formatter.write_str("Key([redacted])"),
             Self::PointerButton(_) => formatter.write_str("PointerButton([redacted])"),
             Self::PointerMotion(_) => formatter.write_str("PointerMotion([redacted])"),
+            Self::PointerDelta(_) => formatter.write_str("PointerDelta([redacted])"),
+            Self::PointerEnter(_) => formatter.write_str("PointerEnter([redacted])"),
             Self::Scroll(_) => formatter.write_str("Scroll([redacted])"),
             Self::ReleaseAll(_) => formatter.write_str("ReleaseAll([redacted])"),
         }

@@ -8,33 +8,43 @@
 use std::sync::{Arc, Mutex};
 
 use nodavo_input::InputEvent;
+#[cfg(any(target_os = "macos", test))]
+use nodavo_protocol::DisplayRotation;
 use thiserror::Error;
+
+use crate::topology_runtime::NativeDisplaySnapshot;
 
 #[cfg(target_os = "macos")]
 use std::sync::mpsc as std_mpsc;
 #[cfg(target_os = "macos")]
 use std::thread::{self, JoinHandle};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
 
 #[cfg(target_os = "macos")]
 use nodavo_platform_macos::{
     MacInputCapture, MacInputCaptureEvent, MacInputInjector, MacInputLifecycleEvent,
-    MacPlatformError, accessibility_trusted,
+    MacPlatformError, accessibility_trusted, active_displays,
 };
 
 #[cfg(target_os = "macos")]
 use crate::native_bridge::{NativeInputSender, PlatformSafetyEvent, PlatformSafetySender};
 
+#[cfg(target_os = "macos")]
+const NATIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub(crate) enum PlatformPortError {
     #[error("native input integration is unavailable")]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     Unavailable,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[error("native input integration failed")]
     Native,
 }
 
 pub(crate) trait PlatformPort: Send {
+    fn display_snapshot(&self) -> Result<Vec<NativeDisplaySnapshot>, PlatformPortError>;
     fn start_capture(&mut self) -> Result<(), PlatformPortError>;
     fn set_routing_to_peer(&mut self, enabled: bool) -> Result<(), PlatformPortError>;
     fn inject(&mut self, event: InputEvent) -> Result<(), PlatformPortError>;
@@ -44,12 +54,16 @@ pub(crate) trait PlatformPort: Send {
 }
 
 /// Honest production placeholder until a reviewed native adapter is wired in.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug, Default)]
 pub(crate) struct UnavailablePlatformPort;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 impl PlatformPort for UnavailablePlatformPort {
+    fn display_snapshot(&self) -> Result<Vec<NativeDisplaySnapshot>, PlatformPortError> {
+        Err(PlatformPortError::Unavailable)
+    }
+
     fn start_capture(&mut self) -> Result<(), PlatformPortError> {
         Ok(())
     }
@@ -131,7 +145,7 @@ impl MacInjectorWorker {
                 let _ = injector.force_release_all();
             })
             .map_err(|_| PlatformPortError::Native)?;
-        if let Ok(true) = started.recv() {
+        if let Ok(true) = started.recv_timeout(NATIVE_ACK_TIMEOUT) {
             Ok(Self {
                 commands,
                 worker: Some(worker),
@@ -148,7 +162,7 @@ impl MacInjectorWorker {
             .send(MacInjectorCommand::Inject(event, acknowledgement))
             .map_err(|_| PlatformPortError::Native)?;
         received
-            .recv()
+            .recv_timeout(NATIVE_ACK_TIMEOUT)
             .map_err(|_| PlatformPortError::Native)?
             .map_err(|_| PlatformPortError::Native)
     }
@@ -159,7 +173,7 @@ impl MacInjectorWorker {
             .send(MacInjectorCommand::Release(acknowledgement))
             .map_err(|_| PlatformPortError::Native)?;
         received
-            .recv()
+            .recv_timeout(NATIVE_ACK_TIMEOUT)
             .map_err(|_| PlatformPortError::Native)?
             .map_err(|_| PlatformPortError::Native)
     }
@@ -172,7 +186,9 @@ impl MacInjectorWorker {
 
     fn stop(&mut self) {
         let _ = self.commands.send(MacInjectorCommand::Stop);
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.worker.take()
+            && worker.is_finished()
+        {
             let _ = worker.join();
         }
     }
@@ -189,7 +205,7 @@ impl Drop for MacInjectorWorker {
 impl MacPlatformPort {
     pub(crate) fn new(input: NativeInputSender, safety: &PlatformSafetySender) -> Self {
         let callback_safety = safety.clone();
-        let capture = MacInputCapture::new_routed_fallible(move |event| match event {
+        let capture = MacInputCapture::new_edge_routed_fallible(move |event| match event {
             MacInputCaptureEvent::Input(event) => input.send(event).map_err(|_| {
                 callback_safety.send(PlatformSafetyEvent::CaptureFailed);
                 MacPlatformError::CaptureCallbackFailed
@@ -235,6 +251,29 @@ const fn safety_event_for_lifecycle(
 
 #[cfg(target_os = "macos")]
 impl PlatformPort for MacPlatformPort {
+    fn display_snapshot(&self) -> Result<Vec<NativeDisplaySnapshot>, PlatformPortError> {
+        active_displays()
+            .map_err(|_| PlatformPortError::Native)?
+            .into_iter()
+            .map(|display| {
+                let pixel_width =
+                    u32::try_from(display.width_pixels).map_err(|_| PlatformPortError::Native)?;
+                let pixel_height =
+                    u32::try_from(display.height_pixels).map_err(|_| PlatformPortError::Native)?;
+                Ok(NativeDisplaySnapshot {
+                    native_id: display.id,
+                    origin_x_milli: logical_milli_i32(display.origin_x)?,
+                    origin_y_milli: logical_milli_i32(display.origin_y)?,
+                    pixel_width,
+                    pixel_height,
+                    scale_x_milli: scale_milli(display.width_pixels, display.width_points)?,
+                    scale_y_milli: scale_milli(display.height_pixels, display.height_points)?,
+                    rotation: DisplayRotation::Degrees0,
+                })
+            })
+            .collect()
+    }
+
     fn start_capture(&mut self) -> Result<(), PlatformPortError> {
         if self.injector.is_some() {
             return Err(PlatformPortError::Native);
@@ -319,6 +358,19 @@ impl VirtualPlatformPort {
 
 #[cfg(test)]
 impl PlatformPort for VirtualPlatformPort {
+    fn display_snapshot(&self) -> Result<Vec<NativeDisplaySnapshot>, PlatformPortError> {
+        Ok(vec![NativeDisplaySnapshot {
+            native_id: nodavo_input::DisplayId::new(101),
+            origin_x_milli: 0,
+            origin_y_milli: 0,
+            pixel_width: 1_920,
+            pixel_height: 1_080,
+            scale_x_milli: 1_000,
+            scale_y_milli: 1_000,
+            rotation: DisplayRotation::Degrees0,
+        }])
+    }
+
     fn start_capture(&mut self) -> Result<(), PlatformPortError> {
         Ok(())
     }
@@ -358,6 +410,27 @@ impl PlatformPort for VirtualPlatformPort {
     fn ensure_healthy(&self) -> Result<(), PlatformPortError> {
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn logical_milli_i32(value: f64) -> Result<i32, PlatformPortError> {
+    let value = value * 1_000.0;
+    if !value.is_finite() || value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+        return Err(PlatformPortError::Native);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(value.round() as i32)
+}
+
+#[cfg(target_os = "macos")]
+fn scale_milli(pixels: u64, points: f64) -> Result<u16, PlatformPortError> {
+    let pixels = u32::try_from(pixels).map_err(|_| PlatformPortError::Native)?;
+    let scale = f64::from(pixels) * 1_000.0 / points;
+    if !scale.is_finite() || scale <= 0.0 || scale > f64::from(u16::MAX) {
+        return Err(PlatformPortError::Native);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(scale.round() as u16)
 }
 
 #[cfg(all(test, target_os = "macos"))]

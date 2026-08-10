@@ -11,9 +11,17 @@ publish = false
 [dependencies]
 blake3.workspace = true
 bytes.workspace = true
+cap-fs-ext = "4.0.2"
+cap-std = "4.0.2"
 thiserror.workspace = true
 unicode-normalization.workspace = true
 uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tokio.workspace = true

@@ -16,7 +16,8 @@ use macos_accessibility_client::accessibility::{
 };
 use nodavo_input::{
     ButtonState, CONSUMER_PAGE, DisplayId, HidUsage, InputEvent, KEYBOARD_PAGE, KeyState,
-    Modifiers, NormalizedAxis, NormalizedPosition, PointerButton, PressedState, ScrollUnit,
+    Modifiers, NormalizedAxis, NormalizedPosition, PointerButton, PointerDelta, PressedState,
+    ScrollUnit,
 };
 
 use super::{DisplayGeometry, MacPlatformError, NODAVO_SYNTHETIC_EVENT_TAG};
@@ -145,7 +146,9 @@ impl MacInputInjector {
                 match release {
                     InputEvent::Key { .. } => released_keys += 1,
                     InputEvent::PointerButton { .. } => released_buttons += 1,
-                    InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. } => {}
+                    InputEvent::PointerMotion { .. }
+                    | InputEvent::PointerDelta { .. }
+                    | InputEvent::Scroll { .. } => {}
                 }
             }
         }
@@ -178,6 +181,7 @@ impl MacInputInjector {
                 modifiers,
             } => self.inject_key(usage, state, modifiers),
             InputEvent::PointerMotion { position } => self.inject_motion(position),
+            InputEvent::PointerDelta { delta } => self.inject_delta(delta),
             InputEvent::PointerButton { button, state } => self.inject_button(button, state),
             InputEvent::Scroll {
                 horizontal,
@@ -219,6 +223,25 @@ impl MacInputInjector {
         let point = CGPoint::new(
             display.origin_x + position.x().to_unit_f64() * display.width_points,
             display.origin_y + position.y().to_unit_f64() * display.height_points,
+        );
+        let event = CGEvent::new_mouse_event(
+            self.source.clone(),
+            CGEventType::MouseMoved,
+            point,
+            CGMouseButton::Left,
+        )
+        .map_err(|()| MacPlatformError::CoreGraphics)?;
+        post_tagged(&event);
+        Ok(())
+    }
+
+    fn inject_delta(&self, delta: PointerDelta) -> Result<(), MacPlatformError> {
+        let current = CGEvent::new(self.source.clone())
+            .map_err(|()| MacPlatformError::CoreGraphics)?
+            .location();
+        let point = CGPoint::new(
+            current.x + f64::from(delta.horizontal()),
+            current.y + f64::from(delta.vertical()),
         );
         let event = CGEvent::new_mouse_event(
             self.source.clone(),
@@ -302,7 +325,9 @@ fn pressed_equivalent(release: InputEvent) -> InputEvent {
             button,
             state: ButtonState::Pressed,
         },
-        InputEvent::PointerMotion { .. } | InputEvent::Scroll { .. } => release,
+        InputEvent::PointerMotion { .. }
+        | InputEvent::PointerDelta { .. }
+        | InputEvent::Scroll { .. } => release,
     }
 }
 
@@ -345,8 +370,15 @@ struct CaptureRuntime {
 pub struct MacInputCapture {
     callback: Arc<CaptureCallback>,
     routing_to_peer: Arc<AtomicBool>,
-    emit_input_only_while_routing: bool,
+    delivery: CaptureDelivery,
     runtime: Option<CaptureRuntime>,
+}
+
+#[derive(Clone, Copy)]
+enum CaptureDelivery {
+    AllAbsolute,
+    RoutedRelative,
+    LocalAbsolutePointerAndRoutedRelative,
 }
 
 impl fmt::Debug for MacInputCapture {
@@ -377,7 +409,7 @@ impl MacInputCapture {
     pub fn new_fallible(
         callback: impl Fn(MacInputCaptureEvent) -> Result<(), MacPlatformError> + Send + Sync + 'static,
     ) -> Self {
-        Self::with_callback(callback, false)
+        Self::with_callback(callback, CaptureDelivery::AllAbsolute)
     }
 
     /// Creates a fail-closed callback which receives physical input only while
@@ -386,17 +418,30 @@ impl MacInputCapture {
     pub fn new_routed_fallible(
         callback: impl Fn(MacInputCaptureEvent) -> Result<(), MacPlatformError> + Send + Sync + 'static,
     ) -> Self {
-        Self::with_callback(callback, true)
+        Self::with_callback(callback, CaptureDelivery::RoutedRelative)
+    }
+
+    /// Creates a fail-closed capture which emits absolute pointer positions
+    /// without suppression while focus is local, then all physical input with
+    /// relative pointer deltas while authenticated routing is active.
+    #[must_use]
+    pub fn new_edge_routed_fallible(
+        callback: impl Fn(MacInputCaptureEvent) -> Result<(), MacPlatformError> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_callback(
+            callback,
+            CaptureDelivery::LocalAbsolutePointerAndRoutedRelative,
+        )
     }
 
     fn with_callback(
         callback: impl Fn(MacInputCaptureEvent) -> Result<(), MacPlatformError> + Send + Sync + 'static,
-        emit_input_only_while_routing: bool,
+        delivery: CaptureDelivery,
     ) -> Self {
         Self {
             callback: Arc::new(callback),
             routing_to_peer: Arc::new(AtomicBool::new(false)),
-            emit_input_only_while_routing,
+            delivery,
             runtime: None,
         }
     }
@@ -418,7 +463,7 @@ impl MacInputCapture {
         let displays = active_displays()?;
         let callback = Arc::clone(&self.callback);
         let routing_to_peer = Arc::clone(&self.routing_to_peer);
-        let emit_input_only_while_routing = self.emit_input_only_while_routing;
+        let delivery = self.delivery;
         routing_to_peer.store(false, Ordering::Release);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
@@ -440,10 +485,35 @@ impl MacInputCapture {
                         }
                     }
                     native => {
-                        if emit_input_only_while_routing && !event_routing.load(Ordering::Acquire) {
+                        let routing = event_routing.load(Ordering::Acquire);
+                        let deliver = match delivery {
+                            CaptureDelivery::AllAbsolute => true,
+                            CaptureDelivery::RoutedRelative => routing,
+                            CaptureDelivery::LocalAbsolutePointerAndRoutedRelative => {
+                                routing
+                                    || matches!(native, ffi::NativeInputEvent::PointerMotion { .. })
+                            }
+                        };
+                        if !deliver {
                             return ffi::NativeCaptureDisposition::Keep;
                         }
-                        let Some(input) = convert_native_input(native, &displays) else {
+                        let relative_pointer =
+                            routing && !matches!(delivery, CaptureDelivery::AllAbsolute);
+                        if relative_pointer
+                            && let ffi::NativeInputEvent::PointerMotion {
+                                delta_x, delta_y, ..
+                            } = native
+                        {
+                            if delta_x == 0 && delta_y == 0 {
+                                return ffi::NativeCaptureDisposition::Suppress;
+                            }
+                            if PointerDelta::new(delta_x, delta_y).is_err() {
+                                event_routing.store(false, Ordering::Release);
+                                return ffi::NativeCaptureDisposition::Abort;
+                            }
+                        }
+                        let Some(input) = convert_native_input(native, &displays, relative_pointer)
+                        else {
                             return ffi::NativeCaptureDisposition::Keep;
                         };
                         if event_callback(MacInputCaptureEvent::Input(input)).is_err() {
@@ -674,6 +744,7 @@ fn lifecycle_requires_local_recovery(event: MacInputLifecycleEvent) -> bool {
 fn convert_native_input(
     native: ffi::NativeInputEvent,
     displays: &[DisplayGeometry],
+    relative_pointer: bool,
 ) -> Option<InputEvent> {
     match native {
         ffi::NativeInputEvent::Keyboard {
@@ -694,10 +765,17 @@ fn convert_native_input(
             state: key_state(pressed),
             modifiers: Modifiers::from_bits(modifier_bits)?,
         }),
-        ffi::NativeInputEvent::PointerMotion { x, y } => {
-            let position = normalize_position(CGPoint::new(x, y), displays)?;
-            Some(InputEvent::PointerMotion { position })
-        }
+        ffi::NativeInputEvent::PointerMotion {
+            x: _,
+            y: _,
+            delta_x,
+            delta_y,
+        } if relative_pointer => Some(InputEvent::PointerDelta {
+            delta: PointerDelta::new(delta_x, delta_y).ok()?,
+        }),
+        ffi::NativeInputEvent::PointerMotion { x, y, .. } => Some(InputEvent::PointerMotion {
+            position: normalize_position(CGPoint::new(x, y), displays)?,
+        }),
         ffi::NativeInputEvent::PointerButton { button, pressed } => {
             Some(InputEvent::PointerButton {
                 button: PointerButton::new(button).ok()?,
@@ -943,6 +1021,7 @@ mod tests {
                     modifier_bits: modifiers.bits(),
                 },
                 &[display()],
+                false,
             ),
             Some(InputEvent::Key {
                 usage: HidUsage::new(KEYBOARD_PAGE, 0x04),
@@ -958,6 +1037,7 @@ mod tests {
                     precise: true,
                 },
                 &[display()],
+                false,
             ),
             Some(InputEvent::Scroll {
                 horizontal: -7,
@@ -972,6 +1052,7 @@ mod tests {
                     pressed: false,
                 },
                 &[display()],
+                false,
             ),
             Some(InputEvent::PointerButton {
                 button: PointerButton::new(32).unwrap(),
@@ -1004,6 +1085,25 @@ mod tests {
                 NormalizedAxis::MAX,
                 NormalizedAxis::MAX,
             ))
+        );
+    }
+
+    #[test]
+    fn routed_pointer_conversion_uses_relative_delta_without_display_identity() {
+        assert_eq!(
+            convert_native_input(
+                ffi::NativeInputEvent::PointerMotion {
+                    x: -10_000.0,
+                    y: 8_000.0,
+                    delta_x: 15,
+                    delta_y: -6,
+                },
+                &[display()],
+                true,
+            ),
+            Some(InputEvent::PointerDelta {
+                delta: PointerDelta::new(15, -6).unwrap(),
+            })
         );
     }
 

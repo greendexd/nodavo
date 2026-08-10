@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 8 -->
+<!-- doc-id: changelog; lang: en; revision: 9 -->
 
 # Changelog
 
@@ -23,9 +23,13 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 - Windows agent startup source with a same-user/session validated named-pipe server and DPAPI-protected identity/trust persistence; it cross-checks for Windows x64 but still needs Windows runtime validation.
 - Bounded FIFO transfer scheduling with deterministic pause/resume/cancel effects, plus filesystem-backed private staging with durable progress journals, exact-offset restart resume, torn-tail truncation, per-file BLAKE3 verification, persisted-state discard, and no-overwrite finalization.
 - Compile-only repository checks for bilingual documentation, Rust formatting and macOS/Windows builds, the WinUI 3 x64 project, and macOS Swift packages.
+- Authenticated session-scoped display topology, mixed-DPI edge policy, relative pointer deltas, and a reliable pointer-entry acknowledgement gate before suppression.
+- End-to-end bounded clipboard channels: text/HTML/PNG/clear on macOS and Windows, plus a strict canonical BMP/DIB subset on Windows.
+- Production-default macOS Keychain storage with an explicit insecure-development file fallback, and a universal development app/DMG plus fail-closed Developer ID/notarization packaging path.
+- Capability-rooted outbound file scanning and streaming with no-follow traversal, deterministic manifests, BLAKE3, mutation detection, resume evidence, and safe receiver staging.
 
 ### Not yet available
 
-- A usable or released macOS ↔ Windows application. Pairing and reconnect run, but input, focus, clipboard, and files are not yet joined into an end-to-end peer session.
-- Proven Windows agent/WinUI build and runtime behavior; installers, signing, updater installation, macOS production credential-store integration, peer clipboard/file queue orchestration, stale-state cleanup, and ARM64 validation are also missing.
+- A usable or released macOS ↔ Windows application. Input/focus/clipboard are joined in the pre-alpha agent, but real two-machine runtime qualification and file peer-channel/UI integration remain.
+- Proven Windows agent/WinUI runtime behavior; release signing, updater installation, trusted-device/grant UX, hot-plug layout UX, file orchestration, and Windows ARM64 validation are also missing.
 - Full security, fuzz, stress, compatibility, upgrade, accessibility, and real-device test matrices; these remain release gates for feature-complete 1.0.

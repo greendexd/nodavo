@@ -1,9 +1,14 @@
+mod clipboard_port;
+mod clipboard_runtime;
 mod input_wire;
+#[cfg(target_os = "macos")]
+mod macos;
 mod native_bridge;
 mod platform_port;
 mod runtime;
 mod session_runtime;
 mod storage;
+mod topology_runtime;
 #[cfg(target_os = "windows")]
 mod windows;
 mod wire;
@@ -16,6 +21,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+#[cfg(target_os = "macos")]
+use self::macos::MacKeychainStorage;
 use nodavo_discovery::{DiscoveryRecord, MdnsRuntime};
 use nodavo_identity::{Capability as TrustedCapability, CapabilityGrants};
 use nodavo_local_ipc::{AgentEvent, CapabilityName, UiCommand, read_frame, write_frame};
@@ -115,6 +122,33 @@ fn configured_device_name() -> Result<String, String> {
     } else {
         Ok(value)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn configured_storage() -> Result<Arc<dyn DevelopmentStorage>, String> {
+    let allow_development = std::env::var_os("NODAVO_ALLOW_INSECURE_DEVELOPMENT_STORAGE")
+        .as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    if allow_development {
+        warn!(
+            code = "insecure_development_storage_enabled",
+            "explicit development-only file storage is enabled"
+        );
+        Ok(Arc::new(FileDevelopmentStorage::new(
+            default_state_directory().map_err(str::to_owned)?,
+        )))
+    } else {
+        Ok(Arc::new(
+            MacKeychainStorage::new().map_err(|error| error.to_string())?,
+        ))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn configured_storage() -> Result<Arc<dyn DevelopmentStorage>, String> {
+    Ok(Arc::new(FileDevelopmentStorage::new(
+        default_state_directory().map_err(str::to_owned)?,
+    )))
 }
 
 fn requested_grants(capabilities: &[CapabilityName]) -> CapabilityGrants {
@@ -304,15 +338,13 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
 
 #[cfg(unix)]
 async fn run_server() -> Result<(), String> {
+    let storage = configured_storage()?;
     let ipc_path = default_ipc_path().map_err(str::to_owned)?;
     let ipc_listener =
         nodavo_local_ipc::unix::bind_private(&ipc_path).map_err(|error| error.to_string())?;
     let ipc_owner_uid = std::fs::metadata(&ipc_path)
         .map_err(|_| "failed to validate the local IPC owner".to_owned())?
         .uid();
-    let storage = Arc::new(FileDevelopmentStorage::new(
-        default_state_directory().map_err(str::to_owned)?,
-    ));
     let (pairing_listener, runtime, mdns) = initialize_runtime(storage).await?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);

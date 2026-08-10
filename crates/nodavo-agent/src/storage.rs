@@ -1,8 +1,8 @@
 //! Persistent identity and trust serialization behind an explicit storage boundary.
 //!
-//! Unix currently uses a development-only private-file backend. Windows wraps
-//! the same bounded, versioned payloads with current-user DPAPI before any
-//! bytes reach persistent storage. Neither backend logs its contents.
+//! The private-file backend is development-only. Production platform adapters
+//! persist the same bounded semantic records through OS-protected storage.
+//! No backend logs identity, trust, or private-key contents.
 
 use std::collections::HashSet;
 #[cfg(unix)]
@@ -33,9 +33,9 @@ const IDENTITY_FILE: &str = "development-identity-v1.json";
 const TRUST_FILE: &str = "development-trust-v1.json";
 pub(crate) const MAX_STORAGE_FILE_BYTES: u64 = 512 * 1024;
 const MAX_PEERS: usize = 32;
-const MAX_PRIVATE_KEY_BYTES: usize = 16 * 1024;
-const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
-const MAX_SERVER_NAME_BYTES: usize = 253;
+pub(crate) const MAX_PRIVATE_KEY_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_CERTIFICATE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_SERVER_NAME_BYTES: usize = 253;
 
 pub(crate) struct DeviceMaterial {
     pub(crate) signer: SoftwareSigner,
@@ -43,6 +43,8 @@ pub(crate) struct DeviceMaterial {
     pub(crate) private_key_pkcs8_der: Zeroizing<Vec<u8>>,
     pub(crate) server_name: String,
 }
+
+pub(crate) type SplitIdentityPayloads = (DeviceMaterial, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
 impl DeviceMaterial {
     pub(crate) fn credentials(&self) -> Result<CertificateCredentials, StorageError> {
@@ -107,6 +109,12 @@ pub(crate) enum StorageError {
     #[cfg(target_os = "windows")]
     #[error("atomic persistent storage replacement failed")]
     AtomicReplace,
+    #[cfg(target_os = "macos")]
+    #[error("macOS Keychain access requires a signed Keychain entitlement")]
+    MissingEntitlement,
+    #[cfg(target_os = "macos")]
+    #[error("macOS Keychain storage failed")]
+    Keychain,
 }
 
 pub(crate) trait DevelopmentStorage: Send + Sync {
@@ -186,6 +194,22 @@ struct IdentityDisk {
     server_name: String,
 }
 
+#[derive(Deserialize, Serialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+struct SigningSeedDisk {
+    format_version: u16,
+    ed25519_seed: String,
+}
+
+#[derive(Deserialize, Serialize, Zeroize)]
+#[serde(deny_unknown_fields)]
+struct TlsIdentityDisk {
+    format_version: u16,
+    certificate_der: String,
+    private_key_pkcs8_der: String,
+    server_name: String,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TrustDisk {
@@ -249,6 +273,38 @@ impl PeerDisk {
 }
 
 pub(crate) fn create_identity() -> Result<(DeviceMaterial, Zeroizing<Vec<u8>>), StorageError> {
+    let (material, secret_seed) = generate_identity_material()?;
+    let disk = Zeroizing::new(IdentityDisk {
+        format_version: STORAGE_FORMAT_VERSION,
+        ed25519_seed: STANDARD.encode(*secret_seed),
+        certificate_der: STANDARD.encode(&material.certificate_der),
+        private_key_pkcs8_der: STANDARD.encode(&*material.private_key_pkcs8_der),
+        server_name: material.server_name.clone(),
+    });
+    let encoded = encode_sensitive(&*disk)?;
+    Ok((material, encoded))
+}
+
+pub(crate) fn create_split_identity() -> Result<SplitIdentityPayloads, StorageError> {
+    let (material, secret_seed) = generate_identity_material()?;
+    let signing = Zeroizing::new(SigningSeedDisk {
+        format_version: STORAGE_FORMAT_VERSION,
+        ed25519_seed: STANDARD.encode(*secret_seed),
+    });
+    let tls = Zeroizing::new(TlsIdentityDisk {
+        format_version: STORAGE_FORMAT_VERSION,
+        certificate_der: STANDARD.encode(&material.certificate_der),
+        private_key_pkcs8_der: STANDARD.encode(&*material.private_key_pkcs8_der),
+        server_name: material.server_name.clone(),
+    });
+    Ok((
+        material,
+        encode_sensitive(&*signing)?,
+        encode_sensitive(&*tls)?,
+    ))
+}
+
+fn generate_identity_material() -> Result<(DeviceMaterial, Zeroizing<[u8; 32]>), StorageError> {
     let secret_seed = Zeroizing::new(rand::random::<[u8; 32]>());
     let signer = SoftwareSigner::from_secret_seed(*secret_seed);
     let server_name = "agent.nodavo.invalid".to_owned();
@@ -256,18 +312,6 @@ pub(crate) fn create_identity() -> Result<(DeviceMaterial, Zeroizing<Vec<u8>>), 
         .map_err(|_| StorageError::InvalidData)?;
     let certificate_der = generated.cert.der().to_vec();
     let private_key_pkcs8_der = Zeroizing::new(generated.signing_key.serialize_der());
-    let disk = Zeroizing::new(IdentityDisk {
-        format_version: STORAGE_FORMAT_VERSION,
-        ed25519_seed: STANDARD.encode(*secret_seed),
-        certificate_der: STANDARD.encode(&certificate_der),
-        private_key_pkcs8_der: STANDARD.encode(&*private_key_pkcs8_der),
-        server_name: server_name.clone(),
-    });
-    let encoded =
-        Zeroizing::new(serde_json::to_vec(&*disk).map_err(|_| StorageError::InvalidData)?);
-    if encoded.len() as u64 > MAX_STORAGE_FILE_BYTES {
-        return Err(StorageError::InvalidData);
-    }
     Ok((
         DeviceMaterial {
             signer,
@@ -275,26 +319,74 @@ pub(crate) fn create_identity() -> Result<(DeviceMaterial, Zeroizing<Vec<u8>>), 
             private_key_pkcs8_der,
             server_name,
         },
-        encoded,
+        secret_seed,
     ))
 }
 
 pub(crate) fn decode_identity(bytes: &[u8]) -> Result<DeviceMaterial, StorageError> {
+    validate_payload_size(bytes)?;
     let disk = Zeroizing::new(
         serde_json::from_slice::<IdentityDisk>(bytes).map_err(|_| StorageError::InvalidData)?,
     );
     if disk.format_version != STORAGE_FORMAT_VERSION {
         return Err(StorageError::InvalidData);
     }
-    validate_server_name(&disk.server_name)?;
     let secret_seed = Zeroizing::new(decode_array::<32>(&disk.ed25519_seed)?);
     let certificate_der = decode_bounded(&disk.certificate_der, MAX_CERTIFICATE_BYTES)?;
-    TransportCertificate::from_der(certificate_der.clone())
-        .map_err(|_| StorageError::InvalidData)?;
     let private_key_pkcs8_der = Zeroizing::new(decode_bounded(
         &disk.private_key_pkcs8_der,
         MAX_PRIVATE_KEY_BYTES,
     )?);
+    restore_identity_material(
+        &secret_seed,
+        certificate_der,
+        private_key_pkcs8_der,
+        disk.server_name.clone(),
+    )
+}
+
+pub(crate) fn decode_split_identity(
+    signing_bytes: &[u8],
+    tls_bytes: &[u8],
+) -> Result<DeviceMaterial, StorageError> {
+    validate_payload_size(signing_bytes)?;
+    validate_payload_size(tls_bytes)?;
+    let signing = Zeroizing::new(
+        serde_json::from_slice::<SigningSeedDisk>(signing_bytes)
+            .map_err(|_| StorageError::InvalidData)?,
+    );
+    let tls = Zeroizing::new(
+        serde_json::from_slice::<TlsIdentityDisk>(tls_bytes)
+            .map_err(|_| StorageError::InvalidData)?,
+    );
+    if signing.format_version != STORAGE_FORMAT_VERSION
+        || tls.format_version != STORAGE_FORMAT_VERSION
+    {
+        return Err(StorageError::InvalidData);
+    }
+    let secret_seed = Zeroizing::new(decode_array::<32>(&signing.ed25519_seed)?);
+    let certificate_der = decode_bounded(&tls.certificate_der, MAX_CERTIFICATE_BYTES)?;
+    let private_key_pkcs8_der = Zeroizing::new(decode_bounded(
+        &tls.private_key_pkcs8_der,
+        MAX_PRIVATE_KEY_BYTES,
+    )?);
+    restore_identity_material(
+        &secret_seed,
+        certificate_der,
+        private_key_pkcs8_der,
+        tls.server_name.clone(),
+    )
+}
+
+fn restore_identity_material(
+    secret_seed: &[u8; 32],
+    certificate_der: Vec<u8>,
+    private_key_pkcs8_der: Zeroizing<Vec<u8>>,
+    server_name: String,
+) -> Result<DeviceMaterial, StorageError> {
+    validate_server_name(&server_name)?;
+    TransportCertificate::from_der(certificate_der.clone())
+        .map_err(|_| StorageError::InvalidData)?;
     CertificateCredentials::from_der(
         vec![certificate_der.clone()],
         private_key_pkcs8_der.to_vec(),
@@ -304,8 +396,25 @@ pub(crate) fn decode_identity(bytes: &[u8]) -> Result<DeviceMaterial, StorageErr
         signer: SoftwareSigner::from_secret_seed(*secret_seed),
         certificate_der,
         private_key_pkcs8_der,
-        server_name: disk.server_name.clone(),
+        server_name,
     })
+}
+
+fn encode_sensitive<T>(value: &T) -> Result<Zeroizing<Vec<u8>>, StorageError>
+where
+    T: Serialize,
+{
+    let encoded = Zeroizing::new(serde_json::to_vec(value).map_err(|_| StorageError::InvalidData)?);
+    validate_payload_size(&encoded)?;
+    Ok(encoded)
+}
+
+fn validate_payload_size(bytes: &[u8]) -> Result<(), StorageError> {
+    if bytes.is_empty() || bytes.len() as u64 > MAX_STORAGE_FILE_BYTES {
+        Err(StorageError::InvalidData)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn encode_peers(peers: &[PeerRecord]) -> Result<Vec<u8>, StorageError> {
@@ -499,6 +608,29 @@ mod tests {
             Err(StorageError::InvalidData)
         ));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn split_identity_codec_is_versioned_and_bounded() {
+        let (_, mut signing, tls) = create_split_identity().unwrap();
+        let marker = br#""format_version":1"#;
+        let version = signing
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap()
+            + marker.len()
+            - 1;
+        signing[version] = b'9';
+        assert!(matches!(
+            decode_split_identity(&signing, &tls),
+            Err(StorageError::InvalidData)
+        ));
+
+        let oversized = vec![0_u8; usize::try_from(MAX_STORAGE_FILE_BYTES).unwrap() + 1];
+        assert!(matches!(
+            decode_split_identity(&oversized, &tls),
+            Err(StorageError::InvalidData)
+        ));
     }
 
     #[test]
