@@ -5,6 +5,7 @@ mod input_wire;
 mod macos;
 mod native_bridge;
 mod platform_port;
+mod platform_readiness;
 mod runtime;
 mod session_runtime;
 mod storage;
@@ -367,7 +368,13 @@ where
 )]
 async fn dispatch_ui_command(command: UiCommand, runtime: Arc<AgentRuntime>) -> AgentEvent {
     match command {
-        UiCommand::GetStatus {} => AgentEvent::Status(runtime.status().await),
+        UiCommand::GetStatus {} => AgentEvent::Status(runtime.refresh_platform_readiness().await),
+        UiCommand::RequestAccessibilityPermission {} => {
+            match runtime.request_accessibility_permission().await {
+                Ok(status) => AgentEvent::Status(status),
+                Err(error) => readiness_error_event(error),
+            }
+        }
         UiCommand::ListTrustedPeers {} => AgentEvent::TrustedPeers {
             peers: runtime.trusted_peers().await,
         },
@@ -520,6 +527,7 @@ async fn initialize_runtime(
         pairing_address,
         configured_device_name()?,
     );
+    runtime.refresh_platform_readiness().await;
 
     let mut mdns = None;
     if std::env::var_os("NODAVO_DISABLE_MDNS").is_none() {
@@ -564,6 +572,18 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::FocusRejected => "focus_rejected",
         AgentError::SafetyRecoveryFailed => "safety_recovery_failed",
         AgentError::TransferFailed => "transfer_failed",
+    };
+    AgentEvent::Error {
+        code: code.to_owned(),
+        message: error.to_string(),
+    }
+}
+
+fn readiness_error_event(error: platform_readiness::ReadinessRequestError) -> AgentEvent {
+    let code = match error {
+        #[cfg(not(target_os = "macos"))]
+        platform_readiness::ReadinessRequestError::UnsupportedPlatform => "unsupported_platform",
+        platform_readiness::ReadinessRequestError::ProbeUnavailable => "readiness_unavailable",
     };
     AgentEvent::Error {
         code: code.to_owned(),

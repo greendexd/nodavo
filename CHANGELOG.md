@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: en; revision: 11 -->
+<!-- doc-id: changelog; lang: en; revision: 12 -->
 
 # Changelog
 
@@ -31,6 +31,7 @@ All notable changes to Nodavo will be documented here. The format follows Keep a
 - Authenticated bounded file channels with background workers, cooperative scan cancellation, same-process link-loss resume, completion ordering, process-wide staging leases, Windows birth-time owner-only DACLs, and conservative no-overwrite publication.
 - A fail-closed x64+ARM64 Windows development MSIXBundle pipeline, plus a signed-update state-machine core with bounded staging, consent, rollback-floor, and restart/health contracts.
 - An unconfigured-by-default, non-activating update slice with a compile-time pinned HTTPS manifest endpoint and Ed25519 public key, native platform TLS without redirects or decompression, signed-manifest and same-origin-artifact checks, exact offer-UUID consent, and resumable digest-verified private capability-root staging with a cross-process lease, quotas, retention, and fsync. The macOS Settings UI can check, refresh/poll progress, report up-to-date, consent or decline an exact offer, resume a paused download, and report verified staging in English and Russian without exposing a URL, path, or hash.
+- A strict content-free readiness contract and bilingual macOS/Windows presentation for agent reachability, input prerequisites, local displays, and authenticated peer-topology synchronization. macOS can request Accessibility from the agent identity and always rechecks actual trust; Windows reports blocked desktops without elevation. Probes never register native capture, race tests prevent cached or in-flight probes from overwriting a new session state, and safety recovery now has one fail-closed 20-second server budget with client deadlines above it.
 
 ### Not yet available
 

@@ -1,10 +1,10 @@
-<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 9 -->
+<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 10 -->
 
 # Nodavo для macOS
 
 [English](README.md) · [Русский](README.ru.md)
 
-Текущая SwiftUI-оболочка в строке меню подключается к пользовательскому Rust-агенту через signed XPC в release build. Упакованный LaunchAgent объявляет `dev.nodavo.agent.ipc`; агент проверяет точный signing requirement UI для каждого полученного сообщения, а UI применяет взаимный точный requirement helper. Оболочка показывает bounded summaries статуса/focus и доверенных устройств, предоставляет emergency stop и ручное управление focus, реализует pairing с явным выбором capabilities и шестизначным кодом, а также post-pair changes и подтверждённый revocation. Раздел «Передачи» ставит в очередь до 32 явно выбранных файлов/папок и показывает только сокращённую ссылку. Широкая cross-platform и signed-runtime validation ещё не выполнена.
+Текущая SwiftUI-оболочка в строке меню подключается к пользовательскому Rust-агенту через signed XPC в release build. Упакованный LaunchAgent объявляет `dev.nodavo.agent.ipc`; агент проверяет точный signing requirement UI для каждого полученного сообщения, а UI применяет взаимный точный requirement helper. Оболочка показывает bounded summaries статуса/focus и доверенных устройств, предоставляет emergency stop и ручное управление focus, реализует pairing с явным выбором capabilities и шестизначным кодом, а также post-pair changes и подтверждённый revocation. Экраны Overview и Settings раздельно показывают доступность агента, Accessibility trust, готовность локального ввода, локальные дисплеи и синхронизацию peer-топологии. Раздел «Передачи» ставит в очередь до 32 явно выбранных файлов/папок и показывает только сокращённую ссылку. Широкая cross-platform и signed-runtime validation ещё не выполнена.
 
 ```bash
 cargo run -p nodavo-agent --features development-unverified-local-ipc
@@ -15,6 +15,12 @@ swift run --package-path apps/macos \
 Указанные feature и Swift compile flag выбирают явный unsafe same-user UDS bypass только для source-tree разработки. Он несовместим с distribution. Default-сборка агента без встроенного Team ID или зарегистрированного Mach service завершается fail-closed и не имеет UDS fallback.
 
 Все разрешения при сопряжении по умолчанию выключены. Выбор привязывается к подтверждённому transcript сопряжения и подписанному доверию устройств. Переключатель после сопряжения меняется только после подтверждения агентом точной операции; разрешения отозванного устройства редактировать нельзя, его нужно сопрячь заново. Интерфейс не отправляет вычисленные пути файловой системы: принимаются только абсолютные пути, возвращённые явным выбором в локальном системном окне.
+
+## Готовность и Accessibility
+
+Readiness — строгий public snapshot из enum states, а не diagnostic dump. Оболочка отклоняет отсутствующие, неизвестные или повреждённые значения. За конечным deadline и коротким cache агент проверяет Accessibility trust, обнаружение локальных дисплеев и prerequisite injector без отправки events; вторая capture runtime не создаётся, ввод не suppress и не inject. Поэтому **Готов** означает текущую доступность локальных prerequisites, а не live capture proof. Подключённая сессия показывает peer topology как ready только после аутентифицированного обмена topology и совпадающего acknowledgement локальной revision.
+
+Кнопка **Разрешить универсальный доступ** запрашивает macOS от процесса агента, которому требуется permission, а затем выполняет свежую проверку. Возвращаемое prompt API значение не считается авторизацией, поэтому отмена prompt или отсутствие изменений в Системных настройках оставляет состояние **Требуется действие**. Это поведение source и focused prerequisite tests реализовано; полный TCC flow ещё не доказан на чистом Mac с signed, provisioned и notarized сборкой Nodavo.
 
 ## Обновления
 

@@ -25,7 +25,8 @@ use crate::windows_ipc_policy::{
 use crate::{
     ClipboardFormat, ClipboardMetadata, DisplayGeometry, EnvironmentCapabilities, MAX_DISPLAYS,
     MAX_PROTECTED_SECRET_BLOB_BYTES, MAX_PROTECTED_SECRET_BYTES, ProtectedSecretBlob,
-    WindowsInputCaptureEvent, WindowsInputLifecycleEvent, WindowsPlatformError,
+    WindowsInputCaptureEvent, WindowsInputLifecycleEvent, WindowsInputReadiness,
+    WindowsPlatformError, WindowsReadinessProbe,
 };
 
 pub use crate::windows_ipc_policy::compiled_windows_ui_auth_mode;
@@ -254,6 +255,44 @@ pub fn active_displays() -> Result<Vec<DisplayGeometry>, WindowsPlatformError> {
         return Err(WindowsPlatformError::InvalidDisplay);
     }
     Ok(displays)
+}
+
+/// Probes current-user input prerequisites without registering Raw Input,
+/// enabling routing, suppressing or injecting input, requesting elevation, or
+/// using a service.
+#[must_use]
+pub fn probe_readiness() -> WindowsReadinessProbe {
+    let environment = match probe_environment() {
+        Ok(environment) if environment.input_desktop_is_default => environment,
+        Ok(_) | Err(WindowsPlatformError::SecureDesktop) => {
+            return WindowsReadinessProbe {
+                input: WindowsInputReadiness::BlockedByDesktop,
+                local_topology_available: false,
+            };
+        }
+        Err(_) => {
+            return WindowsReadinessProbe {
+                input: WindowsInputReadiness::Unavailable,
+                local_topology_available: false,
+            };
+        }
+    };
+    let local_topology_available = active_displays().is_ok_and(|displays| !displays.is_empty());
+    let input = if environment.send_input && environment.raw_input_capture {
+        // Construction validates the default desktop and display graph but
+        // never calls SendInput or registers a process-wide capture runtime.
+        match WindowsInputInjector::new() {
+            Ok(_injector) => WindowsInputReadiness::Ready,
+            Err(WindowsPlatformError::SecureDesktop) => WindowsInputReadiness::BlockedByDesktop,
+            Err(_) => WindowsInputReadiness::Unavailable,
+        }
+    } else {
+        WindowsInputReadiness::Unavailable
+    };
+    WindowsReadinessProbe {
+        input,
+        local_topology_available,
+    }
 }
 
 /// Unprivileged `SendInput` adapter with pressed-state recovery.

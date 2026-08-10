@@ -1,13 +1,19 @@
 //! Symmetric authenticated peer-session orchestration over one transport connection.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use nodavo_clipboard::PeerClipboardGrants;
 use nodavo_identity::{Capability as TrustedCapability, CapabilityGrants};
 use nodavo_input::{InputEvent, NormalizedPosition};
-use nodavo_local_ipc::{AgentStatus, FocusState as AgentFocusState, InputOwner};
+#[cfg(test)]
+use nodavo_local_ipc::ReadinessSnapshot;
+use nodavo_local_ipc::{
+    AgentStatus, FocusState as AgentFocusState, InputOwner, SessionTopologyReadiness,
+};
 use nodavo_protocol::{
     Capability, ClipboardMessage, ControlMessage, DeviceId, EventMeta, GrantEpoch, ProtocolVersion,
     Sequence, SessionId, WireMessage, decode_clipboard, decode_control, decode_datagram,
@@ -172,6 +178,36 @@ pub(crate) struct NativeSessionEvents {
     pub(crate) clipboard: Box<dyn ClipboardPort>,
     pub(crate) transfer: FileSystemStagingArea,
     pub(crate) transfer_store: TransferStore,
+    pub(crate) session_safety: Arc<SessionSafetyState>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SessionSafetyState {
+    failure_latched: AtomicBool,
+    operation_active: AtomicBool,
+}
+
+impl SessionSafetyState {
+    pub(crate) fn failure_latched(&self) -> bool {
+        self.failure_latched.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn operation_active(&self) -> bool {
+        self.operation_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn blocks_ready(&self) -> bool {
+        self.failure_latched() || self.operation_active()
+    }
+
+    pub(crate) fn set_operation_active(&self, active: bool) {
+        self.operation_active.store(active, Ordering::Release);
+    }
+
+    pub(crate) fn latch_failure(&self) {
+        self.failure_latched.store(true, Ordering::Release);
+        self.operation_active.store(true, Ordering::Release);
+    }
 }
 
 struct Channels {
@@ -191,6 +227,7 @@ struct PeerSession<'a> {
     core: SessionCore,
     platform: &'a mut dyn PlatformPort,
     status: &'a RwLock<AgentStatus>,
+    session_safety: Arc<SessionSafetyState>,
     started: Instant,
     session_id: SessionId,
     control_sequence: u64,
@@ -210,7 +247,7 @@ pub(crate) async fn run_peer_session(
     mut connection: Box<dyn PeerConnection>,
     config: SessionConfig,
     mut commands: mpsc::Receiver<LocalSessionCommand>,
-    mut native_events: NativeSessionEvents,
+    native_events: NativeSessionEvents,
     mut disconnect: watch::Receiver<u64>,
     status: &RwLock<AgentStatus>,
     platform: &mut dyn PlatformPort,
@@ -218,6 +255,14 @@ pub(crate) async fn run_peer_session(
     let channels = establish_channels(connection.as_mut(), &config).await?;
     let (session_id, peer_grant) =
         negotiate_session(connection.as_mut(), &config, &channels).await?;
+    let NativeSessionEvents {
+        mut input,
+        mut safety,
+        clipboard: clipboard_port,
+        transfer: staging,
+        transfer_store,
+        session_safety,
+    } = native_events;
     let clipboard = PeerClipboardRuntime::new(
         config.local_device,
         config.peer_device,
@@ -226,13 +271,9 @@ pub(crate) async fn run_peer_session(
         peer_grant.epoch,
         clipboard_grants(config.local_grants_to_peer),
         peer_grant.capabilities,
-        native_events.clipboard,
+        clipboard_port,
     );
-    let transfer = TransferWorker::start(
-        config.peer_device,
-        new_transfer_runtime(&config, session_id, peer_grant, native_events.transfer),
-        native_events.transfer_store,
-    );
+    let transfer = start_transfer_worker(&config, session_id, peer_grant, staging, transfer_store)?;
     let mut core = SessionCore::default();
     let _ = core.handle(Event::ConnectStarted);
     let _ = core.handle(Event::TransportConnected);
@@ -256,6 +297,7 @@ pub(crate) async fn run_peer_session(
         core,
         platform,
         status,
+        session_safety,
         started: Instant::now(),
         session_id,
         control_sequence: 0,
@@ -291,14 +333,12 @@ pub(crate) async fn run_peer_session(
         }
         return Err(SessionRuntimeError::Platform);
     }
+    session
+        .set_session_topology_readiness(SessionTopologyReadiness::Ready)
+        .await?;
     session.update_status().await;
     let result = session
-        .event_loop(
-            &mut commands,
-            &mut native_events.input,
-            &mut native_events.safety,
-            &mut disconnect,
-        )
+        .event_loop(&mut commands, &mut input, &mut safety, &mut disconnect)
         .await;
     if result.is_err()
         && session.core.link_state() != LinkState::Down
@@ -310,6 +350,21 @@ pub(crate) async fn run_peer_session(
         return Err(SessionRuntimeError::SafetyRecoveryFailed);
     }
     result
+}
+
+fn start_transfer_worker(
+    config: &SessionConfig,
+    session_id: SessionId,
+    peer_grant: PeerGrantState,
+    staging: FileSystemStagingArea,
+    transfer_store: TransferStore,
+) -> Result<TransferWorker, SessionRuntimeError> {
+    TransferWorker::start(
+        config.peer_device,
+        new_transfer_runtime(config, session_id, peer_grant, staging),
+        transfer_store,
+    )
+    .map_err(|_| SessionRuntimeError::SafetyRecoveryFailed)
 }
 
 fn new_transfer_runtime(
@@ -1287,12 +1342,15 @@ impl PeerSession<'_> {
         let result = self.apply_remote_effects(effects).await;
         if result.is_ok() {
             self.update_status().await;
+            self.set_session_topology_readiness(SessionTopologyReadiness::NotConnected)
+                .await?;
             Ok(())
         } else {
             let mut status = self.status.write().await;
             status.input_owner = InputOwner::Local;
             status.focus_state = AgentFocusState::Local;
             status.phase = nodavo_local_ipc::AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
             Err(SessionRuntimeError::SafetyRecoveryFailed)
         }
     }
@@ -1333,6 +1391,29 @@ impl PeerSession<'_> {
             }
         };
     }
+
+    async fn set_session_topology_readiness(
+        &mut self,
+        readiness: SessionTopologyReadiness,
+    ) -> Result<(), SessionRuntimeError> {
+        publish_session_topology_readiness(self.status, self.session_safety.as_ref(), readiness)
+            .await
+    }
+}
+
+async fn publish_session_topology_readiness(
+    status: &RwLock<AgentStatus>,
+    session_safety: &SessionSafetyState,
+    readiness: SessionTopologyReadiness,
+) -> Result<(), SessionRuntimeError> {
+    let mut status = status.write().await;
+    if readiness == SessionTopologyReadiness::Ready && session_safety.blocks_ready() {
+        status.phase = nodavo_local_ipc::AgentPhase::Stopping;
+        status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        return Err(SessionRuntimeError::SafetyRecoveryFailed);
+    }
+    status.readiness.session_topology = readiness;
+    Ok(())
 }
 
 fn platform_safety_command(event: PlatformSafetyEvent) -> LocalSessionCommand {
@@ -1866,6 +1947,10 @@ mod tests {
             connected_peer: Some("test-peer".to_owned()),
             input_owner: InputOwner::Local,
             focus_state: AgentFocusState::Local,
+            readiness: ReadinessSnapshot {
+                session_topology: SessionTopologyReadiness::Synchronizing,
+                ..ReadinessSnapshot::default()
+            },
         }
     }
 
@@ -1902,6 +1987,45 @@ mod tests {
         })
         .await
         .expect("focus direction transition timed out");
+    }
+
+    #[tokio::test]
+    async fn safety_latch_refuses_late_topology_ready_publication() {
+        let status = RwLock::new(connected_status());
+        let session_safety = SessionSafetyState::default();
+        session_safety.latch_failure();
+        assert!(matches!(
+            publish_session_topology_readiness(
+                &status,
+                &session_safety,
+                SessionTopologyReadiness::Ready,
+            )
+            .await,
+            Err(SessionRuntimeError::SafetyRecoveryFailed)
+        ));
+        let status = status.read().await;
+        assert_eq!(status.phase, nodavo_local_ipc::AgentPhase::Stopping);
+        assert_eq!(
+            status.readiness.session_topology,
+            SessionTopologyReadiness::NotConnected
+        );
+
+        let status = RwLock::new(connected_status());
+        let session_safety = SessionSafetyState::default();
+        session_safety.set_operation_active(true);
+        assert!(matches!(
+            publish_session_topology_readiness(
+                &status,
+                &session_safety,
+                SessionTopologyReadiness::Ready,
+            )
+            .await,
+            Err(SessionRuntimeError::SafetyRecoveryFailed)
+        ));
+        assert_eq!(
+            status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::NotConnected
+        );
     }
 
     #[tokio::test]
@@ -1968,6 +2092,7 @@ mod tests {
                     clipboard: Box::new(a_clipboard),
                     transfer: a_transfer,
                     transfer_store: a_transfer_store,
+                    session_safety: Arc::new(SessionSafetyState::default()),
                 },
                 a_disconnect,
                 &a_status_task,
@@ -1997,6 +2122,7 @@ mod tests {
                     clipboard: Box::new(b_clipboard),
                     transfer: b_transfer,
                     transfer_store: b_transfer_store,
+                    session_safety: Arc::new(SessionSafetyState::default()),
                 },
                 b_disconnect,
                 &b_status_task,
@@ -2012,6 +2138,14 @@ mod tests {
         })
         .await
         .expect("clipboard content did not cross the dedicated session channel");
+        assert_eq!(
+            a_status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::Ready
+        );
+        assert_eq!(
+            b_status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::Ready
+        );
 
         let (transfer_ack, transfer_result) = oneshot::channel();
         a_commands
@@ -2160,6 +2294,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(b_result.is_ok(), "peer B failed: {b_result:?}");
+        assert_eq!(
+            a_status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::NotConnected
+        );
+        assert_eq!(
+            b_status.read().await.readiness.session_topology,
+            SessionTopologyReadiness::NotConnected
+        );
         fs::remove_dir_all(a_transfer_root).unwrap();
         fs::remove_dir_all(b_transfer_root).unwrap();
     }

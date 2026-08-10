@@ -36,6 +36,38 @@
             </Border>
 
             <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <StackPanel Spacing="16">
+                    <StackPanel Spacing="4">
+                        <TextBlock x:Uid="ReadinessHeading" FontWeight="SemiBold" />
+                        <TextBlock x:Uid="ReadinessSubtitle" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Grid ColumnSpacing="24" RowSpacing="10">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+                        <TextBlock x:Uid="AgentReachabilityLabel" FontWeight="SemiBold" />
+                        <TextBlock Grid.Column="1" Text="{Binding AgentReachabilityText}" TextWrapping="Wrap" />
+                        <TextBlock x:Uid="InputEnvironmentLabel" Grid.Row="1" FontWeight="SemiBold" />
+                        <StackPanel Grid.Row="1" Grid.Column="1" Spacing="4">
+                            <TextBlock Text="{Binding InputEnvironmentText}" TextWrapping="Wrap" />
+                            <TextBlock Text="{Binding InputEnvironmentGuidanceText}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <TextBlock x:Uid="LocalDisplaysLabel" Grid.Row="2" FontWeight="SemiBold" />
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding LocalDisplaysText}" TextWrapping="Wrap" />
+                        <TextBlock x:Uid="PeerTopologyLabel" Grid.Row="3" FontWeight="SemiBold" />
+                        <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding PeerTopologyText}" TextWrapping="Wrap" />
+                    </Grid>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="20" CornerRadius="12" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
                 <StackPanel Spacing="10">
                     <TextBlock x:Uid="AgentLifecycleHeading" Style="{StaticResource SubtitleTextBlockStyle}" />
                     <TextBlock Text="{x:Bind Lifecycle.AgentStateText, Mode=OneWay}" FontWeight="SemiBold" />

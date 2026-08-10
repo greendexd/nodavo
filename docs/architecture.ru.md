@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 7 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 8 -->
 
 # Архитектура
 
@@ -101,6 +101,12 @@ Finder ↔ Explorer drag/drop является M0 research gate. Если native
 ## Привилегии процессов
 
 Agent 1.0 по умолчанию работает в user session. Privileged Windows service исключён: управление login/UAC secure desktop значительно расширит attack surface. Будущий privileged component потребует отдельный threat model и capability boundary.
+
+## Локальные сигналы готовности
+
+Через аутентифицированный UI-протокол агент публикует один ограниченный snapshot готовности без пользовательского контента. Локальный ввод, обнаружение локальных дисплеев и синхронизация аутентифицированной peer-топологии — независимые сигналы: доступный дисплей не означает, что layout второго устройства готов. Peer-топология получает состояние `synchronizing` при установлении соединения и становится готовой только после установки точной удалённой topology и совпадающего acknowledgement локальной revision; любой teardown или recovery возвращает `not_connected`.
+
+Platform probes выполняются вне async dispatcher с конечным deadline и коротким cache. Они проверяют только trust/default-desktop state, обнаружение дисплеев, capability API и создание prerequisite injector, который не отправляет events; capture runtime не создаётся и не регистрируется, ввод не route, suppress или inject. Поэтому `ready` означает текущую доступность локальных prerequisites, а не выполненный live capture. Явное действие macOS запрашивает Accessibility от identity агента, игнорирует возвращаемое prompt API значение и сразу повторно проверяет фактический trust. В Windows нет Accessibility action: не-default или secure input desktop только обозначается как blocked, без предложения elevation или secure-desktop control. Public snapshot не содержит paths, process IDs, native display IDs, desktop names, peer identifiers или permission-prompt metadata.
 
 ## Доверие локальных процессов
 

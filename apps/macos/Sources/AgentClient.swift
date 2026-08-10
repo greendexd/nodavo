@@ -178,6 +178,7 @@ struct AgentResponse: Decodable {
     let receivedBytes: UInt64?
     let totalBytes: UInt64?
     let failure: String?
+    let readiness: AgentReadiness?
 
     enum CodingKeys: String, CodingKey {
         case event
@@ -200,6 +201,7 @@ struct AgentResponse: Decodable {
         case receivedBytes = "received_bytes"
         case totalBytes = "total_bytes"
         case failure
+        case readiness
     }
 }
 
@@ -208,6 +210,105 @@ struct AgentStatusResponse {
     let connectedPeer: String?
     let inputOwner: String
     let focusState: String
+    let readiness: AgentReadiness
+}
+
+enum AccessibilityReadiness: String, CaseIterable, Decodable {
+    case granted
+    case actionRequired = "action_required"
+    case notApplicable = "not_applicable"
+    case unavailable
+}
+
+enum InputReadiness: String, CaseIterable, Decodable {
+    case ready
+    case blockedByPermission = "blocked_by_permission"
+    case blockedByDesktop = "blocked_by_desktop"
+    case unavailable
+}
+
+enum LocalTopologyReadiness: String, CaseIterable, Decodable {
+    case available
+    case unavailable
+}
+
+enum SessionTopologyReadiness: String, CaseIterable, Decodable {
+    case notConnected = "not_connected"
+    case synchronizing
+    case ready
+}
+
+struct AgentReadiness: Equatable, Decodable {
+    let accessibility: AccessibilityReadiness
+    let input: InputReadiness
+    let localTopology: LocalTopologyReadiness
+    let sessionTopology: SessionTopologyReadiness
+
+    enum CodingKeys: String, CodingKey, CaseIterable {
+        case accessibility
+        case input
+        case localTopology = "local_topology"
+        case sessionTopology = "session_topology"
+    }
+
+    init(
+        accessibility: AccessibilityReadiness,
+        input: InputReadiness,
+        localTopology: LocalTopologyReadiness,
+        sessionTopology: SessionTopologyReadiness
+    ) {
+        self.accessibility = accessibility
+        self.input = input
+        self.localTopology = localTopology
+        self.sessionTopology = sessionTopology
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue)) == Set(CodingKeys.allCases.map(\.rawValue)) else {
+            throw DecodingError.dataCorrupted(
+                .init(codingPath: decoder.codingPath, debugDescription: "Unexpected readiness fields")
+            )
+        }
+        accessibility = try container.decode(
+            AccessibilityReadiness.self,
+            forKey: AnyCodingKey("accessibility")
+        )
+        input = try container.decode(InputReadiness.self, forKey: AnyCodingKey("input"))
+        localTopology = try container.decode(
+            LocalTopologyReadiness.self,
+            forKey: AnyCodingKey("local_topology")
+        )
+        sessionTopology = try container.decode(
+            SessionTopologyReadiness.self,
+            forKey: AnyCodingKey("session_topology")
+        )
+    }
+
+    static let unavailable = Self(
+        accessibility: .unavailable,
+        input: .unavailable,
+        localTopology: .unavailable,
+        sessionTopology: .notConnected
+    )
+}
+
+private struct AnyCodingKey: CodingKey, Hashable {
+    let stringValue: String
+    let intValue: Int?
+
+    init(_ stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(stringValue: String) {
+        self.init(stringValue)
+    }
+
+    init?(intValue: Int) {
+        return nil
+    }
 }
 
 struct PairingPrompt: Equatable {
@@ -325,6 +426,31 @@ enum AgentResponseDecoder {
                 localGrants: Set(peer.localGrants)
             )
         }
+    }
+
+    static func status(_ response: AgentResponse) throws -> AgentStatusResponse {
+        let validPhases = ["starting", "ready", "pairing", "connected", "stopping"]
+        let validFocusStates = ["local", "controlling_peer", "controlled_by_peer"]
+        let focusState = response.focusState ?? "local"
+        guard response.event == "status",
+              let phase = response.phase,
+              validPhases.contains(phase),
+              let inputOwner = response.inputOwner,
+              inputOwner == "local" || inputOwner == "remote",
+              validFocusStates.contains(focusState),
+              response.connectedPeer?.utf8.count ?? 0 <= 256,
+              response.connectedPeer.map(containsControlCharacter) != true,
+              let readiness = response.readiness
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        return AgentStatusResponse(
+            phase: phase,
+            connectedPeer: response.connectedPeer,
+            inputOwner: inputOwner,
+            focusState: focusState,
+            readiness: readiness
+        )
     }
 
     static func transferReference(_ response: AgentResponse) throws -> QueuedTransferReference {
@@ -518,6 +644,10 @@ actor AgentClient {
         try decodeStatus(request(AgentCommand.simple("get_status")))
     }
 
+    func requestAccessibilityPermission() throws -> AgentStatusResponse {
+        try decodeStatus(request(AgentCommand.simple("request_accessibility_permission")))
+    }
+
     func emergencyStop() throws -> AgentStatusResponse {
         try decodeStatus(request(AgentCommand.simple("emergency_stop")))
     }
@@ -666,26 +796,7 @@ actor AgentClient {
     }
 
     private func decodeStatus(_ response: AgentResponse) throws -> AgentStatusResponse {
-        let validPhases = ["starting", "ready", "pairing", "connected", "stopping"]
-        let validFocusStates = ["local", "controlling_peer", "controlled_by_peer"]
-        let focusState = response.focusState ?? "local"
-        guard response.event == "status",
-              let phase = response.phase,
-              validPhases.contains(phase),
-              let inputOwner = response.inputOwner,
-              inputOwner == "local" || inputOwner == "remote",
-              validFocusStates.contains(focusState),
-              response.connectedPeer?.utf8.count ?? 0 <= 256,
-              response.connectedPeer.map(containsControlCharacter) != true
-        else {
-            throw AgentClientError.invalidResponse
-        }
-        return AgentStatusResponse(
-            phase: phase,
-            connectedPeer: response.connectedPeer,
-            inputOwner: inputOwner,
-            focusState: focusState
-        )
+        try AgentResponseDecoder.status(response)
     }
 
     private func validatePeerID(_ peerID: String) throws {

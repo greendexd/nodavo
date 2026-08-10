@@ -20,7 +20,7 @@ use nodavo_input::{
     ScrollUnit,
 };
 
-use super::{DisplayGeometry, MacPlatformError, NODAVO_SYNTHETIC_EVENT_TAG};
+use super::{DisplayGeometry, MacPlatformError, MacReadinessProbe, NODAVO_SYNTHETIC_EVENT_TAG};
 
 #[path = "macos/ffi.rs"]
 mod ffi;
@@ -81,6 +81,26 @@ pub fn active_displays() -> Result<Vec<DisplayGeometry>, MacPlatformError> {
             })
         })
         .collect()
+}
+
+/// Probes current-user prerequisites without registering capture, routing,
+/// suppressing or injecting input, and without showing a permission prompt.
+#[must_use]
+pub fn probe_readiness() -> MacReadinessProbe {
+    let initially_trusted = accessibility_trusted();
+    let local_topology_available = active_displays().is_ok_and(|displays| !displays.is_empty());
+    // Construction creates an event source and validates displays but never
+    // posts an event or installs a process-wide event tap.
+    let input_prerequisites_available = initially_trusted && MacInputInjector::new().is_ok();
+    // Permission may be revoked while prerequisites are checked. The final
+    // observation is authoritative so a missing permission never leaks through
+    // as a generic input failure.
+    let accessibility_trusted = accessibility_trusted();
+    MacReadinessProbe {
+        accessibility_trusted,
+        input_prerequisites_available,
+        local_topology_available,
+    }
 }
 
 pub struct MacInputInjector {

@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 7 -->
+<!-- doc-id: architecture; lang: en; revision: 8 -->
 
 # Architecture
 
@@ -101,6 +101,12 @@ Finder ↔ Explorer drag/drop is an M0 research gate. If native drag APIs cannot
 ## Process privilege
 
 The default 1.0 agent runs in the user session. A privileged Windows service is excluded because login/UAC secure-desktop control would significantly increase the attack surface. Any future privileged component requires a separate threat model and capability boundary.
+
+## Local readiness projection
+
+The agent exposes one bounded, content-free readiness snapshot through the authenticated UI protocol. Local input, local display discovery, and authenticated peer-topology synchronization are separate signals: an available display never implies that a peer layout is ready. Peer topology is `synchronizing` from connection establishment until the exact remote topology and matching local revision acknowledgement are installed; every teardown and recovery returns it to `not_connected`.
+
+Platform probes run outside the async dispatcher behind a finite deadline and a short cache. They check only trust/default-desktop state, display discovery, API capability, and construction of a non-posting injector prerequisite; they never create or register a capture runtime, route, suppress, or inject input. Consequently `ready` means that local prerequisites are currently available, not that live capture has been exercised. On macOS the explicit permission action asks for Accessibility in the agent identity, ignores the prompt API's return value, and immediately rechecks actual trust. Windows exposes no Accessibility action and reports a non-default or secure input desktop only as blocked; it never offers elevation or secure-desktop control. The public snapshot contains no paths, process IDs, native display IDs, desktop names, peer identifiers, or permission-prompt metadata.
 
 ## Local process trust
 

@@ -1,7 +1,8 @@
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nodavo_discovery::{DiscoveryLocation, DiscoveryRuntimeEvent, MdnsRuntime};
@@ -11,7 +12,8 @@ use nodavo_identity::{
 };
 use nodavo_local_ipc::{
     AgentPhase, AgentStatus, CapabilityName, FocusState, InputOwner, MAX_SELECTED_PATH_BYTES,
-    MAX_SELECTED_PATHS, TrustedPeerState, TrustedPeerSummary,
+    MAX_SELECTED_PATHS, ReadinessSnapshot, SessionTopologyReadiness, TrustedPeerState,
+    TrustedPeerSummary,
 };
 use nodavo_protocol::{Capability as ProtocolCapability, GrantEpoch};
 use nodavo_transfer::{FileSystemStagingArea, TransferId};
@@ -34,9 +36,10 @@ use crate::native_bridge::{native_input_channel, platform_safety_channel};
 use crate::platform_port::MacPlatformPort;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use crate::platform_port::UnavailablePlatformPort;
+use crate::platform_readiness::{self, LocalPlatformReadiness, ReadinessRequestError};
 use crate::session_runtime::{
     LocalSessionCommand, NativeSessionEvents, SessionConfig, SessionRole, SessionRuntimeError,
-    command_channel, run_peer_session,
+    SessionSafetyState, command_channel, run_peer_session,
 };
 use crate::storage::{DevelopmentStorage, DeviceMaterial, PeerRecord, device_id_text};
 use crate::transfer_worker::{TransferCleanupState, TransferStore};
@@ -53,7 +56,11 @@ const NETWORK_DEADLINE: Duration = Duration::from_secs(10);
 const CONFIRMATION_DEADLINE: Duration = Duration::from_mins(2);
 const MDNS_LOOKUP_DEADLINE: Duration = Duration::from_secs(5);
 const SAFETY_RECOVERY_DEADLINE: Duration = Duration::from_secs(5);
+/// One end-to-end ceiling for stop delivery, acknowledgement, and all staged
+/// peer cleanup before the agent latches a fail-closed stopping state.
+const SAFETY_OPERATION_DEADLINE: Duration = Duration::from_secs(20);
 const TRANSFER_PREPARATION_DEADLINE: Duration = Duration::from_mins(5);
+const LOCAL_READINESS_CACHE_TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Error)]
 pub(crate) enum AgentError {
@@ -137,6 +144,10 @@ struct PreparedPairing {
 
 pub(crate) struct AgentRuntime {
     status: RwLock<AgentStatus>,
+    readiness_probe_gate: Mutex<()>,
+    readiness_cache_completed_at: Mutex<Option<Instant>>,
+    readiness_transition_epoch: AtomicU64,
+    session_safety: Arc<SessionSafetyState>,
     storage: Arc<dyn DevelopmentStorage>,
     material: Arc<DeviceMaterial>,
     peers: Mutex<Vec<PeerRecord>>,
@@ -165,7 +176,12 @@ impl AgentRuntime {
                 connected_peer: None,
                 input_owner: InputOwner::Local,
                 focus_state: FocusState::Local,
+                readiness: ReadinessSnapshot::default(),
             }),
+            readiness_probe_gate: Mutex::new(()),
+            readiness_cache_completed_at: Mutex::new(None),
+            readiness_transition_epoch: AtomicU64::new(0),
+            session_safety: Arc::new(SessionSafetyState::default()),
             storage,
             material: Arc::new(material),
             peers: Mutex::new(peers),
@@ -182,6 +198,98 @@ impl AgentRuntime {
 
     pub(crate) async fn status(&self) -> AgentStatus {
         self.status.read().await.clone()
+    }
+
+    async fn begin_session_operation(&self) -> Result<(), AgentError> {
+        let _status = self.status.write().await;
+        if self.session_safety.failure_latched() {
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
+        if self.session_safety.operation_active() {
+            return Err(AgentError::Busy);
+        }
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| AgentError::Busy)
+    }
+
+    async fn publish_connected_if_safety_allows(&self, peer_id: String) -> Result<(), AgentError> {
+        let mut status = self.status.write().await;
+        if self.session_safety.failure_latched() {
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
+        if self.session_safety.operation_active() {
+            return Err(AgentError::Busy);
+        }
+        status.phase = AgentPhase::Connected;
+        status.connected_peer = Some(peer_id);
+        status.input_owner = InputOwner::Local;
+        status.focus_state = FocusState::Local;
+        status.readiness.session_topology = SessionTopologyReadiness::Synchronizing;
+        self.record_readiness_transition();
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_platform_readiness(&self) -> AgentStatus {
+        self.refresh_platform_readiness_with(platform_readiness::probe(), std::future::ready(()))
+            .await
+    }
+
+    async fn refresh_platform_readiness_with(
+        &self,
+        probe: impl Future<Output = LocalPlatformReadiness>,
+        after_eligibility: impl Future<Output = ()>,
+    ) -> AgentStatus {
+        // A dedicated gate coalesces followers behind the active probe. Cache
+        // timestamps therefore describe completed accepted probes only and are
+        // never overloaded as an in-flight marker.
+        let _probe_guard = self.readiness_probe_gate.lock().await;
+        // Session start publishes Synchronizing before advancing this epoch.
+        // Reading the epoch first therefore cannot pair a new generation with
+        // an old NotConnected snapshot.
+        let observed_transition_epoch = self.readiness_transition_epoch.load(Ordering::Acquire);
+        if self.status.read().await.readiness.session_topology
+            != SessionTopologyReadiness::NotConnected
+        {
+            return self.status().await;
+        }
+        after_eligibility.await;
+        let now = Instant::now();
+        if self
+            .readiness_cache_completed_at
+            .lock()
+            .await
+            .is_some_and(|completed| now.duration_since(completed) < LOCAL_READINESS_CACHE_TTL)
+        {
+            return self.status().await;
+        }
+        let local = probe.await;
+        let mut status = self.status.write().await;
+        let accepted = self.readiness_transition_epoch.load(Ordering::Acquire)
+            == observed_transition_epoch
+            && status.readiness.session_topology == SessionTopologyReadiness::NotConnected;
+        if accepted {
+            status.readiness = local.snapshot(SessionTopologyReadiness::NotConnected);
+        }
+        drop(status);
+        if accepted {
+            *self.readiness_cache_completed_at.lock().await = Some(Instant::now());
+        }
+        self.status().await
+    }
+
+    pub(crate) async fn request_accessibility_permission(
+        &self,
+    ) -> Result<AgentStatus, ReadinessRequestError> {
+        let _probe_guard = self.readiness_probe_gate.lock().await;
+        let local = platform_readiness::request_accessibility_permission().await?;
+        let mut status = self.status.write().await;
+        let session_topology = status.readiness.session_topology;
+        status.readiness = local.snapshot(session_topology);
+        drop(status);
+        *self.readiness_cache_completed_at.lock().await = Some(Instant::now());
+        Ok(self.status().await)
     }
 
     pub(crate) async fn trusted_peers(&self) -> Vec<TrustedPeerSummary> {
@@ -326,11 +434,12 @@ impl AgentRuntime {
         self: &Arc<Self>,
         request: &str,
     ) -> Result<AgentStatus, AgentError> {
+        if self.session_safety.failure_latched() {
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
         let mode = parse_reconnect_request(request)?;
-        self.busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| AgentError::Busy)?;
-        let disconnect = self.disconnect.subscribe();
+        self.begin_session_operation().await?;
+        let mut disconnect = self.disconnect.subscribe();
         let peer_id = mode.peer_id().to_owned();
         let peer = match self.active_peer(&peer_id).await {
             Ok(peer) => peer,
@@ -344,39 +453,42 @@ impl AgentRuntime {
             ReconnectMode::Listen { .. } => SessionRole::Acceptor,
             ReconnectMode::Connect { .. } => SessionRole::Opener,
         };
-        let connected: Result<Box<dyn PeerConnection>, AgentError> = match mode {
-            ReconnectMode::Listen { .. } => self.prepare_pinned_responder(&peer).await,
-            ReconnectMode::Connect { endpoint, .. } => {
-                async {
-                    let address = match endpoint {
-                        Some(value) => resolve_endpoint(&value).await?,
-                        None => peer.last_endpoint.ok_or(AgentError::InvalidEndpoint)?,
-                    };
-                    let mut connection = self.prepare_pinned_initiator(&peer, address).await?;
-                    if let Err(error) = self.update_peer_endpoint(&peer_id, address).await {
-                        close_emergency(connection.as_mut()).await;
-                        return Err(error);
+        let connected: Result<Box<dyn PeerConnection>, AgentError> = tokio::select! {
+            result = async {
+                match mode {
+                    ReconnectMode::Listen { .. } => self.prepare_pinned_responder(&peer).await,
+                    ReconnectMode::Connect { endpoint, .. } => {
+                        let address = match endpoint {
+                            Some(value) => resolve_endpoint(&value).await?,
+                            None => peer.last_endpoint.ok_or(AgentError::InvalidEndpoint)?,
+                        };
+                        let mut connection = self.prepare_pinned_initiator(&peer, address).await?;
+                        if let Err(error) = self.update_peer_endpoint(&peer_id, address).await {
+                            close_emergency(connection.as_mut()).await;
+                            return Err(error);
+                        }
+                        Ok(connection)
                     }
-                    Ok(connection)
                 }
-                .await
+            } => result,
+            changed = disconnect.changed() => {
+                let _ = changed;
+                Err(AgentError::SafetyRecoveryFailed)
             }
         };
-        let connection = match connected {
+        let mut connection = match connected {
             Ok(connection) => connection,
             Err(error) => {
-                self.busy.store(false, Ordering::Release);
                 self.inbound_waiter.lock().await.take();
+                self.busy.store(false, Ordering::Release);
                 return Err(error);
             }
         };
 
-        {
-            let mut status = self.status.write().await;
-            status.phase = AgentPhase::Connected;
-            status.connected_peer = Some(peer_id);
-            status.input_owner = InputOwner::Local;
-            status.focus_state = FocusState::Local;
+        if let Err(error) = self.publish_connected_if_safety_allows(peer_id).await {
+            close_emergency(connection.as_mut()).await;
+            self.busy.store(false, Ordering::Release);
+            return Err(error);
         }
         let result = self.status().await;
         let (session_tx, session_rx) = command_channel();
@@ -399,20 +511,18 @@ impl AgentRuntime {
                 session_rx,
                 disconnect,
                 &runtime.status,
+                Arc::clone(&runtime.session_safety),
                 runtime.transfer_store.clone(),
             )
             .await;
             runtime.session_commands.lock().await.take();
+            runtime
+                .publish_session_finished_status(matches!(
+                    result,
+                    Err(SessionRuntimeError::SafetyRecoveryFailed)
+                ))
+                .await;
             runtime.busy.store(false, Ordering::Release);
-            if matches!(result, Err(SessionRuntimeError::SafetyRecoveryFailed)) {
-                runtime.status.write().await.phase = AgentPhase::Stopping;
-                return;
-            }
-            let mut status = runtime.status.write().await;
-            status.phase = AgentPhase::Ready;
-            status.connected_peer = None;
-            status.input_owner = InputOwner::Local;
-            status.focus_state = FocusState::Local;
         });
         Ok(result)
     }
@@ -428,15 +538,22 @@ impl AgentRuntime {
         endpoint: String,
         local_grants: CapabilityGrants,
     ) -> Result<PairingStarted, AgentError> {
-        self.busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| AgentError::Busy)?;
+        self.begin_session_operation().await?;
         {
             let mut status = self.status.write().await;
+            if self.session_safety.failure_latched() {
+                self.busy.store(false, Ordering::Release);
+                return Err(AgentError::SafetyRecoveryFailed);
+            }
+            if self.session_safety.operation_active() {
+                self.busy.store(false, Ordering::Release);
+                return Err(AgentError::Busy);
+            }
             status.phase = AgentPhase::Pairing;
             status.connected_peer = None;
             status.input_owner = InputOwner::Local;
             status.focus_state = FocusState::Local;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
         }
 
         let mut disconnect = self.disconnect.subscribe();
@@ -456,9 +573,24 @@ impl AgentRuntime {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.busy.store(false, Ordering::Release);
-                self.status.write().await.phase = AgentPhase::Ready;
+                let mut status = self.status.write().await;
+                let safety_blocked = self.session_safety.blocks_ready();
+                status.phase = if safety_blocked {
+                    AgentPhase::Stopping
+                } else {
+                    AgentPhase::Ready
+                };
+                status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+                let error = if self.session_safety.failure_latched() {
+                    AgentError::SafetyRecoveryFailed
+                } else if self.session_safety.operation_active() {
+                    AgentError::Busy
+                } else {
+                    error
+                };
+                drop(status);
                 self.inbound_waiter.lock().await.take();
+                self.busy.store(false, Ordering::Release);
                 return Err(error);
             }
         };
@@ -477,7 +609,7 @@ impl AgentRuntime {
         let runtime = Arc::clone(self);
         tokio::spawn(async move {
             runtime
-                .run_pairing(prepared, confirmation_rx, outcome_tx)
+                .run_pairing(prepared, confirmation_rx, outcome_tx, disconnect)
                 .await;
         });
 
@@ -537,6 +669,8 @@ impl AgentRuntime {
 
         if self.session_commands.lock().await.is_some() {
             self.disconnect_all();
+            self.status.write().await.readiness.session_topology =
+                SessionTopologyReadiness::NotConnected;
         }
         self.wait_transfer_cleanup(revoked_peer).await?;
         Ok(())
@@ -563,6 +697,28 @@ impl AgentRuntime {
         })
         .await
         .map_err(|_| AgentError::TransferFailed)?
+    }
+
+    async fn enroll_all_inbound_cleanup_after_workers_stop(
+        &self,
+    ) -> Result<Vec<nodavo_protocol::DeviceId>, AgentError> {
+        loop {
+            let store = self.transfer_store.clone();
+            let enrolled =
+                tokio::task::spawn_blocking(move || store.require_all_inbound_discard_if_idle())
+                    .await
+                    .map_err(|_| AgentError::SafetyRecoveryFailed)?;
+            if let Some(peers) = enrolled {
+                return Ok(peers);
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_session_operation_idle(&self) {
+        while self.busy.load(Ordering::Acquire) {
+            sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub(crate) async fn emergency_stop(&self) -> Result<AgentStatus, AgentError> {
@@ -642,35 +798,97 @@ impl AgentRuntime {
     }
 
     async fn handle_safety_stop(&self, reason: SessionStop) -> Result<AgentStatus, AgentError> {
-        let cleanup_peers = self.transfer_store.require_all_inbound_discard();
-        let result = match self.stop_session(reason).await {
-            Ok(true) => Ok(self.ready_status().await),
-            Ok(false) if self.status.read().await.phase != AgentPhase::Connected => {
-                self.disconnect_all();
-                Ok(self.ready_status().await)
-            }
-            Ok(false) | Err(_) => {
-                self.disconnect_all();
-                self.status.write().await.phase = AgentPhase::Stopping;
-                Err(AgentError::SafetyRecoveryFailed)
-            }
-        };
-        for peer in cleanup_peers {
-            if self.wait_transfer_cleanup(peer).await.is_err() {
-                self.status.write().await.phase = AgentPhase::Stopping;
-                return Err(AgentError::SafetyRecoveryFailed);
-            }
-        }
-        result
+        self.handle_safety_stop_with_deadline(reason, SAFETY_OPERATION_DEADLINE)
+            .await
     }
 
-    async fn ready_status(&self) -> AgentStatus {
+    async fn handle_safety_stop_with_deadline(
+        &self,
+        reason: SessionStop,
+        deadline: Duration,
+    ) -> Result<AgentStatus, AgentError> {
+        {
+            let mut status = self.status.write().await;
+            if self.session_safety.failure_latched() {
+                return Err(AgentError::SafetyRecoveryFailed);
+            }
+            if self.session_safety.operation_active() {
+                return Err(AgentError::Busy);
+            }
+            self.transfer_store.close_worker_admission_for_safety();
+            self.session_safety.set_operation_active(true);
+            status.phase = AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        }
+        let operation = timeout(deadline, self.handle_safety_stop_inner(reason)).await;
+        if let Ok(Ok(())) = operation {
+            self.finish_safety_stop_success().await
+        } else {
+            self.fail_closed_safety_stop().await;
+            Err(AgentError::SafetyRecoveryFailed)
+        }
+    }
+
+    async fn handle_safety_stop_inner(&self, reason: SessionStop) -> Result<(), AgentError> {
+        match self.stop_session(reason).await {
+            Ok(true) => {}
+            Ok(false) => self.disconnect_all(),
+            Err(_) => return Err(AgentError::SafetyRecoveryFailed),
+        }
+        self.wait_for_session_operation_idle().await;
+        let cleanup_peers = self.enroll_all_inbound_cleanup_after_workers_stop().await?;
+        for peer in cleanup_peers {
+            self.wait_transfer_cleanup(peer)
+                .await
+                .map_err(|_| AgentError::SafetyRecoveryFailed)?;
+        }
+        Ok(())
+    }
+
+    async fn finish_safety_stop_success(&self) -> Result<AgentStatus, AgentError> {
         let mut status = self.status.write().await;
+        if self.session_safety.failure_latched() {
+            status.phase = AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
+        self.transfer_store.reopen_worker_admission_after_safety();
+        self.session_safety.set_operation_active(false);
         status.input_owner = InputOwner::Local;
         status.focus_state = FocusState::Local;
         status.connected_peer = None;
         status.phase = AgentPhase::Ready;
-        status.clone()
+        status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        Ok(status.clone())
+    }
+
+    async fn fail_closed_safety_stop(&self) {
+        let mut status = self.status.write().await;
+        self.session_safety.latch_failure();
+        self.disconnect_all();
+        status.input_owner = InputOwner::Local;
+        status.focus_state = FocusState::Local;
+        status.connected_peer = None;
+        status.phase = AgentPhase::Stopping;
+        status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+    }
+
+    async fn publish_session_finished_status(&self, session_safety_failed: bool) {
+        let mut status = self.status.write().await;
+        status.input_owner = InputOwner::Local;
+        status.focus_state = FocusState::Local;
+        status.connected_peer = None;
+        status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        status.phase = if session_safety_failed || self.session_safety.blocks_ready() {
+            AgentPhase::Stopping
+        } else {
+            AgentPhase::Ready
+        };
+    }
+
+    fn record_readiness_transition(&self) {
+        self.readiness_transition_epoch
+            .fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn disconnect_all(&self) {
@@ -929,24 +1147,20 @@ impl AgentRuntime {
         prepared: PreparedPairing,
         confirmation_rx: oneshot::Receiver<bool>,
         outcome: watch::Sender<PairingOutcome>,
+        mut disconnect: watch::Receiver<u64>,
     ) {
-        let mut disconnect = self.disconnect.subscribe();
         let result = self
             .complete_pairing(prepared, confirmation_rx, &mut disconnect, &outcome)
             .await;
         if result.is_err() {
             let _ = outcome.send(PairingOutcome::Failed);
         }
+        self.publish_session_finished_status(matches!(
+            result,
+            Err(AgentError::SafetyRecoveryFailed)
+        ))
+        .await;
         self.busy.store(false, Ordering::Release);
-        let mut status = self.status.write().await;
-        if matches!(&result, Err(AgentError::SafetyRecoveryFailed)) {
-            status.phase = AgentPhase::Stopping;
-            return;
-        }
-        status.phase = AgentPhase::Ready;
-        status.connected_peer = None;
-        status.input_owner = InputOwner::Local;
-        status.focus_state = FocusState::Local;
     }
 
     // Keeping the signed two-party transition linear makes its security order
@@ -1082,12 +1296,9 @@ impl AgentRuntime {
             None => return Ok(()),
         }
 
-        {
-            let mut status = self.status.write().await;
-            status.phase = AgentPhase::Connected;
-            status.connected_peer = Some(peer_id);
-            status.input_owner = InputOwner::Local;
-            status.focus_state = FocusState::Local;
+        if let Err(error) = self.publish_connected_if_safety_allows(peer_id).await {
+            close_emergency(prepared.connection.as_mut()).await;
+            return Err(error);
         }
         let _ = outcome.send(PairingOutcome::Finished(true));
         let (session_tx, session_rx) = command_channel();
@@ -1111,6 +1322,7 @@ impl AgentRuntime {
             session_rx,
             disconnect.clone(),
             &self.status,
+            Arc::clone(&self.session_safety),
             self.transfer_store.clone(),
         )
         .await;
@@ -1173,6 +1385,7 @@ async fn run_platform_session(
     commands: mpsc::Receiver<LocalSessionCommand>,
     disconnect: watch::Receiver<u64>,
     status: &RwLock<AgentStatus>,
+    session_safety: Arc<SessionSafetyState>,
     transfer_store: TransferStore,
 ) -> Result<(), SessionRuntimeError> {
     let (native_sender, native_receiver) = native_input_channel();
@@ -1201,6 +1414,7 @@ async fn run_platform_session(
             clipboard,
             transfer,
             transfer_store,
+            session_safety,
         },
         disconnect,
         status,
@@ -1477,6 +1691,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use bytes::Bytes;
+    use nodavo_local_ipc::{AccessibilityReadiness, InputReadiness, LocalTopologyReadiness};
     use nodavo_transfer::{
         ContentHash, EntryKind, ManifestEntry, RelativePath, ResumableStagingArea, StagingArea,
         TransferChunk, TransferManifest,
@@ -1506,6 +1721,295 @@ mod tests {
             *self.peers.lock().unwrap() = peers.to_vec();
             Ok(())
         }
+    }
+
+    fn readiness_runtime() -> Arc<AgentRuntime> {
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(Vec::new()),
+            fail_store: AtomicBool::new(false),
+        });
+        AgentRuntime::new(
+            storage,
+            create_identity().unwrap().0,
+            Vec::new(),
+            "127.0.0.1:0".parse().unwrap(),
+            "Readiness test".to_owned(),
+        )
+    }
+
+    async fn publish_synchronizing_test_session(runtime: &AgentRuntime) {
+        {
+            let mut status = runtime.status.write().await;
+            status.phase = AgentPhase::Connected;
+            status.connected_peer = Some("test-peer".to_owned());
+            status.readiness.session_topology = SessionTopologyReadiness::Synchronizing;
+        }
+        runtime.record_readiness_transition();
+    }
+
+    #[tokio::test]
+    async fn readiness_cache_hit_returns_latest_concurrent_session_state() {
+        let runtime = readiness_runtime();
+        {
+            let mut status = runtime.status.write().await;
+            status.readiness.accessibility = AccessibilityReadiness::Granted;
+            status.readiness.input = InputReadiness::Ready;
+            status.readiness.local_topology = LocalTopologyReadiness::Available;
+        }
+        *runtime.readiness_cache_completed_at.lock().await = Some(Instant::now());
+
+        let (eligibility_checked, checked) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let probe_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&probe_called);
+        let task_runtime = Arc::clone(&runtime);
+        let refresh = tokio::spawn(async move {
+            task_runtime
+                .refresh_platform_readiness_with(
+                    async move {
+                        called.store(true, Ordering::Release);
+                        LocalPlatformReadiness::default()
+                    },
+                    async move {
+                        let _ = eligibility_checked.send(());
+                        let _ = resumed.await;
+                    },
+                )
+                .await
+        });
+
+        checked.await.unwrap();
+        publish_synchronizing_test_session(&runtime).await;
+        resume.send(()).unwrap();
+        let refreshed = refresh.await.unwrap();
+
+        assert!(!probe_called.load(Ordering::Acquire));
+        assert_eq!(refreshed.phase, AgentPhase::Connected);
+        assert_eq!(refreshed.connected_peer.as_deref(), Some("test-peer"));
+        assert_eq!(
+            refreshed.readiness.session_topology,
+            SessionTopologyReadiness::Synchronizing
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_readiness_follower_waits_for_completed_probe() {
+        let runtime = readiness_runtime();
+        runtime.status.write().await.readiness.accessibility = AccessibilityReadiness::Granted;
+
+        let (probe_started, started) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let leader_runtime = Arc::clone(&runtime);
+        let leader = tokio::spawn(async move {
+            leader_runtime
+                .refresh_platform_readiness_with(
+                    async move {
+                        let _ = probe_started.send(());
+                        let _ = resumed.await;
+                        LocalPlatformReadiness::default()
+                    },
+                    std::future::ready(()),
+                )
+                .await
+        });
+        started.await.unwrap();
+
+        let follower_probe_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&follower_probe_called);
+        let (follower_started, follower_entered) = oneshot::channel();
+        let follower_runtime = Arc::clone(&runtime);
+        let mut follower = tokio::spawn(async move {
+            let _ = follower_started.send(());
+            follower_runtime
+                .refresh_platform_readiness_with(
+                    async move {
+                        called.store(true, Ordering::Release);
+                        LocalPlatformReadiness::default()
+                    },
+                    std::future::ready(()),
+                )
+                .await
+        });
+        follower_entered.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(50), &mut follower)
+                .await
+                .is_err(),
+            "follower returned stale readiness while the leader was in flight"
+        );
+
+        resume.send(()).unwrap();
+        let leader_status = leader.await.unwrap();
+        let follower_status = follower.await.unwrap();
+        assert_eq!(
+            leader_status.readiness.accessibility,
+            AccessibilityReadiness::Unavailable
+        );
+        assert_eq!(follower_status, leader_status);
+        assert!(!follower_probe_called.load(Ordering::Acquire));
+        assert!(runtime.readiness_cache_completed_at.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn invalidated_readiness_probe_neither_publishes_nor_populates_cache() {
+        let runtime = readiness_runtime();
+        {
+            let mut status = runtime.status.write().await;
+            status.readiness.accessibility = AccessibilityReadiness::Granted;
+            status.readiness.input = InputReadiness::Ready;
+            status.readiness.local_topology = LocalTopologyReadiness::Available;
+        }
+
+        let (probe_started, started) = oneshot::channel();
+        let (resume, resumed) = oneshot::channel();
+        let task_runtime = Arc::clone(&runtime);
+        let refresh = tokio::spawn(async move {
+            task_runtime
+                .refresh_platform_readiness_with(
+                    async move {
+                        let _ = probe_started.send(());
+                        let _ = resumed.await;
+                        LocalPlatformReadiness::default()
+                    },
+                    std::future::ready(()),
+                )
+                .await
+        });
+
+        started.await.unwrap();
+        publish_synchronizing_test_session(&runtime).await;
+        resume.send(()).unwrap();
+        let refreshed = refresh.await.unwrap();
+
+        assert_eq!(refreshed.phase, AgentPhase::Connected);
+        assert_eq!(
+            refreshed.readiness.session_topology,
+            SessionTopologyReadiness::Synchronizing
+        );
+        assert_eq!(
+            refreshed.readiness.accessibility,
+            AccessibilityReadiness::Granted
+        );
+        assert_eq!(refreshed.readiness.input, InputReadiness::Ready);
+        assert_eq!(
+            refreshed.readiness.local_topology,
+            LocalTopologyReadiness::Available
+        );
+        assert!(runtime.readiness_cache_completed_at.lock().await.is_none());
+
+        {
+            let mut status = runtime.status.write().await;
+            status.phase = AgentPhase::Ready;
+            status.connected_peer = None;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        }
+        let retry_called = Arc::new(AtomicBool::new(false));
+        let called = Arc::clone(&retry_called);
+        let retried = runtime
+            .refresh_platform_readiness_with(
+                async move {
+                    called.store(true, Ordering::Release);
+                    LocalPlatformReadiness::default()
+                },
+                std::future::ready(()),
+            )
+            .await;
+        assert!(retry_called.load(Ordering::Acquire));
+        assert_eq!(
+            retried.readiness.accessibility,
+            AccessibilityReadiness::Unavailable
+        );
+        assert!(runtime.readiness_cache_completed_at.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn overall_safety_deadline_latches_stopping_before_ready() {
+        let runtime = readiness_runtime();
+        {
+            let mut status = runtime.status.write().await;
+            status.phase = AgentPhase::Connected;
+            status.connected_peer = Some("test-peer".to_owned());
+            status.readiness.session_topology = SessionTopologyReadiness::Ready;
+        }
+        let (commands, _unserviced_commands) = command_channel();
+        *runtime.session_commands.lock().await = Some(commands);
+        let disconnect_observer = runtime.disconnect.subscribe();
+        let disconnect_before = *disconnect_observer.borrow();
+
+        assert!(matches!(
+            runtime
+                .handle_safety_stop_with_deadline(SessionStop::Emergency, Duration::ZERO)
+                .await,
+            Err(AgentError::SafetyRecoveryFailed)
+        ));
+
+        assert!(runtime.session_safety.failure_latched());
+        assert_ne!(*disconnect_observer.borrow(), disconnect_before);
+        let status = runtime.status().await;
+        assert_eq!(status.phase, AgentPhase::Stopping);
+        assert_eq!(status.connected_peer, None);
+        assert_eq!(status.input_owner, InputOwner::Local);
+        assert_eq!(status.focus_state, FocusState::Local);
+        assert_eq!(
+            status.readiness.session_topology,
+            SessionTopologyReadiness::NotConnected
+        );
+        runtime.publish_session_finished_status(false).await;
+        assert_eq!(runtime.status().await.phase, AgentPhase::Stopping);
+        assert!(matches!(
+            runtime.reconnect("reconnect:ignored").await,
+            Err(AgentError::SafetyRecoveryFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn safety_operation_owns_ready_after_session_finalizer_and_cleanup() {
+        let runtime = readiness_runtime();
+        {
+            let mut status = runtime.status.write().await;
+            status.phase = AgentPhase::Connected;
+            status.connected_peer = Some("test-peer".to_owned());
+            runtime.session_safety.set_operation_active(true);
+        }
+
+        runtime.publish_session_finished_status(false).await;
+        assert_eq!(runtime.status().await.phase, AgentPhase::Stopping);
+        assert!(runtime.session_safety.operation_active());
+
+        let completed = runtime.finish_safety_stop_success().await.unwrap();
+        assert_eq!(completed.phase, AgentPhase::Ready);
+        assert_eq!(completed.connected_peer, None);
+        assert!(!runtime.session_safety.operation_active());
+    }
+
+    #[tokio::test]
+    async fn safety_waits_for_preexisting_handshake_generation_before_ready() {
+        let runtime = readiness_runtime();
+        runtime.busy.store(true, Ordering::Release);
+        let task_runtime = Arc::clone(&runtime);
+        let safety = tokio::spawn(async move {
+            task_runtime
+                .handle_safety_stop_with_deadline(SessionStop::Emergency, Duration::from_secs(1))
+                .await
+        });
+
+        while !runtime.session_safety.operation_active() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(runtime.status().await.phase, AgentPhase::Stopping);
+        assert!(!safety.is_finished());
+        assert!(matches!(
+            runtime
+                .publish_connected_if_safety_allows("stale-peer".to_owned())
+                .await,
+            Err(AgentError::Busy)
+        ));
+
+        runtime.busy.store(false, Ordering::Release);
+        let status = safety.await.unwrap().unwrap();
+        assert_eq!(status.phase, AgentPhase::Ready);
+        assert!(!runtime.session_safety.operation_active());
+        assert!(!runtime.session_safety.failure_latched());
     }
 
     #[tokio::test]

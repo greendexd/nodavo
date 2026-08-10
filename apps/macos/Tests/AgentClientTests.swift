@@ -393,6 +393,137 @@ import Testing
     #expect(stoppedPhase == nil)
 }
 
+@Test func readinessDecoderAcceptsEveryKnownEnumValue() throws {
+    for accessibility in AccessibilityReadiness.allCases {
+        for input in InputReadiness.allCases {
+            for localTopology in LocalTopologyReadiness.allCases {
+                for sessionTopology in SessionTopologyReadiness.allCases {
+                    let response = try readinessStatusResponse(
+                        accessibility: accessibility.rawValue,
+                        input: input.rawValue,
+                        localTopology: localTopology.rawValue,
+                        sessionTopology: sessionTopology.rawValue
+                    )
+                    let status = try AgentResponseDecoder.status(response)
+                    #expect(status.readiness.accessibility == accessibility)
+                    #expect(status.readiness.input == input)
+                    #expect(status.readiness.localTopology == localTopology)
+                    #expect(status.readiness.sessionTopology == sessionTopology)
+                }
+            }
+        }
+    }
+}
+
+@Test func readinessDecoderRejectsMissingMalformedAndUnexpectedFields() throws {
+    let invalidPayloads = [
+        #"{"event":"status","phase":"ready","input_owner":"local"}"#,
+        #"{"event":"status","phase":"ready","input_owner":"local","readiness":null}"#,
+        #"{"event":"status","phase":"ready","input_owner":"local","readiness":"granted"}"#,
+        #"{"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"unknown","input":"ready","local_topology":"available","session_topology":"ready"}}"#,
+        #"{"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready","pairing_code":"123456"}}"#,
+        #"{"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available"}}"#,
+    ]
+
+    for payload in invalidPayloads {
+        let response: AgentResponse?
+        do {
+            response = try decodeAgentResponse(payload)
+        } catch {
+            continue
+        }
+        if let response {
+            #expect(throws: AgentClientError.self) {
+                try AgentResponseDecoder.status(response)
+            }
+        }
+    }
+}
+
+@Test func accessibilityPermissionCommandUsesExactWireName() throws {
+    let object = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(AgentCommand.simple("request_accessibility_permission"))
+        ) as? [String: Any]
+    )
+    #expect(object.count == 1)
+    #expect(object["command"] as? String == "request_accessibility_permission")
+}
+
+@Test func accessibilityPromptResponseDoesNotImplyGrantedPermission() throws {
+    let response = try readinessStatusResponse(
+        accessibility: AccessibilityReadiness.actionRequired.rawValue,
+        input: InputReadiness.blockedByPermission.rawValue,
+        localTopology: LocalTopologyReadiness.available.rawValue,
+        sessionTopology: SessionTopologyReadiness.notConnected.rawValue
+    )
+    let status = try AgentResponseDecoder.status(response)
+    #expect(status.readiness.accessibility == .actionRequired)
+    #expect(status.readiness.accessibility != .granted)
+    #expect(ReadinessRequestPolicy.allowsAccessibilityPrompt(for: status.readiness))
+}
+
+@Test func readinessRequestGenerationKeepsTheNewestResponseOwner() throws {
+    var owner = ReadinessRequestOwner()
+    let first = owner.begin()
+    let second = owner.begin()
+    #expect(second != first)
+    let staleFinished = owner.finish(first)
+    #expect(!staleFinished)
+    #expect(owner.isRequestInProgress)
+    let latestFinished = owner.finish(second)
+    #expect(latestFinished)
+    #expect(!owner.isRequestInProgress)
+}
+
+@Test func readinessPromptPolicyOnlyAllowsActionRequired() {
+    for accessibility in AccessibilityReadiness.allCases {
+        let readiness = AgentReadiness(
+            accessibility: accessibility,
+            input: .ready,
+            localTopology: .available,
+            sessionTopology: .notConnected
+        )
+        #expect(
+            ReadinessRequestPolicy.allowsAccessibilityPrompt(for: readiness)
+                == (accessibility == .actionRequired)
+        )
+    }
+}
+
+@Test func emergencyStatusApplicationReplacesCachedReadinessWithoutInferringGrant() throws {
+    let cached = AgentReadiness(
+        accessibility: .granted,
+        input: .ready,
+        localTopology: .available,
+        sessionTopology: .ready
+    )
+    let response = try AgentResponseDecoder.status(readinessStatusResponse(
+        accessibility: AccessibilityReadiness.actionRequired.rawValue,
+        input: InputReadiness.blockedByPermission.rawValue,
+        localTopology: LocalTopologyReadiness.available.rawValue,
+        sessionTopology: SessionTopologyReadiness.notConnected.rawValue
+    ))
+
+    let applied = AuthoritativeAgentStatus(response)
+    #expect(applied.readiness != cached)
+    #expect(applied.readiness == response.readiness)
+    #expect(applied.readiness.accessibility == .actionRequired)
+    #expect(applied.readiness.accessibility != .granted)
+    #expect(applied.readiness.sessionTopology == .notConnected)
+}
+
+private func readinessStatusResponse(
+    accessibility: String,
+    input: String,
+    localTopology: String,
+    sessionTopology: String
+) throws -> AgentResponse {
+    try decodeAgentResponse("""
+    {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"\(accessibility)","input":"\(input)","local_topology":"\(localTopology)","session_topology":"\(sessionTopology)"}}
+    """)
+}
+
 private func decodeAgentResponse(_ json: String) throws -> AgentResponse {
     try JSONDecoder().decode(AgentResponse.self, from: Data(json.utf8))
 }

@@ -1,4 +1,4 @@
-<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 11 -->
+<!-- doc-id: changelog; lang: ru; translation-of: CHANGELOG.md; revision: 12 -->
 
 # История изменений
 
@@ -31,6 +31,7 @@
 - Authenticated bounded file channels с background workers, cooperative scan cancellation, same-process resume после потери связи, completion ordering, process-wide staging leases, Windows owner-only DACL при создании и консервативной no-overwrite publication.
 - Fail-closed Windows x64+ARM64 development MSIXBundle pipeline и core state machine подписанных updates с bounded staging, consent, rollback floor и restart/health contracts.
 - Выключенный по умолчанию, не активирующий обновления slice с закреплёнными при компиляции HTTPS endpoint манифеста и публичным ключом Ed25519, нативным платформенным TLS без redirects и decompression, проверкой подписи манифеста и same-origin артефакта, согласием на точный UUID предложения и возобновляемым private capability-root staging с проверкой digest, межпроцессной арендой, квотами, retention и fsync. Раздел Settings macOS умеет проверять, обновлять/опрашивать прогресс, показывать up-to-date, принимать или отклонять точное предложение, возобновлять приостановленную загрузку и сообщать о проверенном staging на английском и русском, не раскрывая URL, путь или hash.
+- Строгий не содержащий контента readiness contract и двуязычное представление в macOS/Windows для доступности агента, input prerequisites, локальных дисплеев и синхронизации аутентифицированной peer-топологии. macOS может запросить Accessibility от identity агента и всегда повторно проверяет фактический trust; Windows сообщает о blocked desktop без elevation. Probes никогда не регистрируют native capture, race tests не позволяют cached или in-flight probe перезаписать состояние новой сессии, а safety recovery теперь имеет единый fail-closed server budget 20 секунд с более длинными client deadlines.
 
 ### Пока недоступно
 

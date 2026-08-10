@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using Nodavo.Windows.Models;
 using Nodavo.Windows.Services;
 
@@ -11,13 +13,229 @@ internal static class LifecycleTests
     {
         AgentServerAuthPolicyAcceptsExactDevelopmentAndRelease();
         AgentServerAuthPolicyRejectsIncompleteOrAlteredMetadata();
+        StatusReadinessDecoderIsStrictAndRedacted();
+        ReadinessReducerKeepsSignalsIndependent();
+        ClientDeadlinesExceedServerBudgetsAndRemainDistinct();
+        OverviewXamlHasBilingualReadinessResourcesAndNoAccessibilityAction();
         StartupReducerCoversEveryState();
         LaunchReducerIsFailClosed();
         await ConcurrentStartsLaunchOnlyOnceAsync();
         await MissingAgentReachesBoundedTimeoutAsync();
         await ExternalCancellationPreventsLaunchAsync();
         Console.WriteLine(
-            "Windows agent auth policy, lifecycle reducer, race, and timeout tests passed.");
+            "Windows agent status, readiness, lifecycle, race, and timeout tests passed.");
+    }
+
+    private static void StatusReadinessDecoderIsStrictAndRedacted()
+    {
+        AgentStatusSnapshot snapshot = DecodeStatus(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"blocked_by_desktop","local_topology":"available","session_topology":"synchronizing"}}
+            """);
+        Assert(snapshot.Readiness.Accessibility == "not_applicable", "Windows accessibility must be not applicable");
+        Assert(snapshot.Readiness.Input == "blocked_by_desktop", "input readiness must decode exactly");
+        Assert(snapshot.Readiness.LocalTopology == "available", "local topology must decode exactly");
+        Assert(snapshot.Readiness.SessionTopology == "synchronizing", "session topology must decode exactly");
+
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available"}}
+            """,
+            "missing readiness fields must fail closed",
+            "not_applicable");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready","peer_secret":"do-not-expose"}}
+            """,
+            "unknown readiness fields must fail closed",
+            "do-not-expose");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"future_input_state","local_topology":"available","session_topology":"ready"}}
+            """,
+            "unknown readiness values must fail closed",
+            "future_input_state");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "Windows must reject a non-applicable accessibility state",
+            "granted");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}
+            """,
+            "malformed status JSON must fail closed",
+            "session_topology");
+    }
+
+    private static void ReadinessReducerKeepsSignalsIndependent()
+    {
+        AgentReadinessPresentation desktopBlocked = AgentReadinessReducer.Reduce(
+            new AgentReadinessSnapshot(
+                "not_applicable",
+                "blocked_by_desktop",
+                "available",
+                "not_connected"));
+        Assert(
+            desktopBlocked.InputEnvironment == InputEnvironmentState.BlockedByDesktop &&
+            desktopBlocked.InputGuidance == InputEnvironmentGuidance.RefreshAfterNormalDesktop,
+            "desktop blocking must use only normal-desktop refresh guidance");
+        Assert(
+            desktopBlocked.LocalDisplays == LocalDisplaysState.Available &&
+            desktopBlocked.PeerTopology == PeerTopologyState.NotConnected,
+            "local displays available must not imply that peer topology is ready");
+
+        AgentReadinessPresentation synchronizing = AgentReadinessReducer.Reduce(
+            new AgentReadinessSnapshot(
+                "not_applicable",
+                "ready",
+                "unavailable",
+                "synchronizing"));
+        Assert(
+            synchronizing.InputEnvironment == InputEnvironmentState.Ready &&
+            synchronizing.LocalDisplays == LocalDisplaysState.Unavailable &&
+            synchronizing.PeerTopology == PeerTopologyState.Synchronizing,
+            "input, displays, and peer topology must remain separate signals");
+    }
+
+    private static void ClientDeadlinesExceedServerBudgetsAndRemainDistinct()
+    {
+        const int serverReadinessBudgetSeconds = 3;
+        const int serverEmergencyBudgetSeconds = 20;
+        string repository = FindRepositoryRoot();
+        string client = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Services/AgentClient.cs"));
+        Match statusTimeout = Regex.Match(
+            client,
+            @"StatusRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Match emergencyTimeout = Regex.Match(
+            client,
+            @"EmergencyRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Assert(
+            statusTimeout.Success && emergencyTimeout.Success,
+            "status and emergency client timeouts must remain explicit and statically testable");
+        int statusSeconds = int.Parse(statusTimeout.Groups[1].Value);
+        int emergencySeconds = int.Parse(emergencyTimeout.Groups[1].Value);
+        Assert(
+            statusSeconds > serverReadinessBudgetSeconds,
+            "status and lifecycle readiness must outlive the server's three-second probe budget");
+        Assert(
+            emergencySeconds > serverEmergencyBudgetSeconds && emergencySeconds != statusSeconds,
+            "emergency stop must have a distinct deadline beyond the server's twenty-second safety budget");
+        Assert(
+            Regex.IsMatch(
+                client,
+                @"CommandEnvelope\(\""get_status\""\),\s*StatusRequestTimeout") &&
+            Regex.IsMatch(
+                client,
+                @"CommandEnvelope\(\""emergency_stop\""\),\s*EmergencyRequestTimeout"),
+            "get-status and emergency-stop must use their dedicated client deadlines");
+    }
+
+    private static void OverviewXamlHasBilingualReadinessResourcesAndNoAccessibilityAction()
+    {
+        string repository = FindRepositoryRoot();
+        string overview = Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Views/OverviewView.xaml");
+        string xaml = File.ReadAllText(overview);
+        Assert(
+            xaml.Contains("AgentReachabilityText", StringComparison.Ordinal) &&
+            xaml.Contains("InputEnvironmentText", StringComparison.Ordinal) &&
+            xaml.Contains("LocalDisplaysText", StringComparison.Ordinal) &&
+            xaml.Contains("PeerTopologyText", StringComparison.Ordinal),
+            "overview must present the four independent readiness signals");
+        Assert(
+            xaml.Contains("StatusText", StringComparison.Ordinal) &&
+            xaml.Contains("PeerText", StringComparison.Ordinal) &&
+            xaml.Contains("InputOwnerText", StringComparison.Ordinal),
+            "overview must retain session status, connected peer, and input owner");
+        string viewModel = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/ViewModels/AgentViewModel.cs"));
+        int unavailableStart = viewModel.IndexOf(
+            "private Task SetUnavailableAsync",
+            StringComparison.Ordinal);
+        int checkingStart = viewModel.IndexOf("private void SetChecking", StringComparison.Ordinal);
+        Assert(
+            unavailableStart >= 0 && checkingStart > unavailableStart,
+            "view model must centralize the status failure transition");
+        string unavailableTransition = viewModel[unavailableStart..checkingStart];
+        Assert(
+            unavailableTransition.Contains(
+                "PeerText = _resources.GetString(\"NoPeer\")",
+                StringComparison.Ordinal) &&
+            unavailableTransition.Contains(
+                "InputOwnerText = _resources.GetString(\"InputOwnerLocal\")",
+                StringComparison.Ordinal),
+            "failed refresh and emergency operations must clear stale peer and input owner state");
+        Assert(
+            !xaml.Contains("RequestAccessibility", StringComparison.Ordinal) &&
+            !xaml.Contains("request_accessibility", StringComparison.Ordinal),
+            "Windows overview must not expose an accessibility request action");
+
+        HashSet<string> english = ReadResourceNames(
+            Path.Combine(repository, "apps/windows/src/Nodavo.Windows/Strings/en-US/Resources.resw"));
+        HashSet<string> russian = ReadResourceNames(
+            Path.Combine(repository, "apps/windows/src/Nodavo.Windows/Strings/ru-RU/Resources.resw"));
+        foreach (Match uid in Regex.Matches(xaml, "x:Uid=\\\"([^\\\"]+)\\\""))
+        {
+            string resourcePrefix = $"{uid.Groups[1].Value}.";
+            Assert(
+                english.Any(name => name.StartsWith(resourcePrefix, StringComparison.Ordinal)),
+                $"missing English XAML resource: {resourcePrefix}");
+            Assert(
+                russian.Any(name => name.StartsWith(resourcePrefix, StringComparison.Ordinal)),
+                $"missing Russian XAML resource: {resourcePrefix}");
+        }
+    }
+
+    private static AgentStatusSnapshot DecodeStatus(string json) =>
+        AgentStatusDecoder.DecodeStatus(Encoding.UTF8.GetBytes(json));
+
+    private static void AssertStatusRejected(string json, string message, string redactedDetail)
+    {
+        try
+        {
+            _ = DecodeStatus(json);
+        }
+        catch (InvalidDataException exception)
+        {
+            Assert(
+                exception.Message == "Invalid agent status response." &&
+                !exception.Message.Contains(redactedDetail, StringComparison.Ordinal),
+                "invalid status details must be redacted");
+            return;
+        }
+        throw new InvalidOperationException(message);
+    }
+
+    private static HashSet<string> ReadResourceNames(string path) =>
+        XDocument.Load(path)
+            .Root!
+            .Elements("data")
+            .Select(element => element.Attribute("name")?.Value)
+            .OfType<string>()
+            .ToHashSet(StringComparer.Ordinal);
+
+    private static string FindRepositoryRoot()
+    {
+        foreach (string startingPath in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+        {
+            for (DirectoryInfo? directory = new(startingPath); directory is not null;
+                 directory = directory.Parent)
+            {
+                if (File.Exists(Path.Combine(
+                    directory.FullName,
+                    "apps/windows/src/Nodavo.Windows/Views/OverviewView.xaml")))
+                {
+                    return directory.FullName;
+                }
+            }
+        }
+        throw new InvalidOperationException("Unable to locate the Nodavo repository root.");
     }
 
     private static void AgentServerAuthPolicyAcceptsExactDevelopmentAndRelease()

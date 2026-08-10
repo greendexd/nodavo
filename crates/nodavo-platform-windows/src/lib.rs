@@ -142,6 +142,24 @@ pub struct EnvironmentCapabilities {
     pub clipboard: bool,
 }
 
+/// Content-free readiness of current unprivileged Windows input prerequisites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowsInputReadiness {
+    /// Default-desktop prerequisites and unprivileged injector construction
+    /// succeeded. Live Raw Input capture is verified only by a peer session.
+    Ready,
+    BlockedByDesktop,
+    Unavailable,
+}
+
+/// Public platform readiness observations without session, process, desktop,
+/// display, or filesystem identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowsReadinessProbe {
+    pub input: WindowsInputReadiness,
+    pub local_topology_available: bool,
+}
+
 /// A monitor in Windows virtual-desktop pixel coordinates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DisplayGeometry {
@@ -293,7 +311,7 @@ mod windows;
 pub use self::windows::{
     AuthorizedWindowsUi, WindowsClipboard, WindowsInputCapture, WindowsInputInjector,
     active_displays, authorize_named_pipe_client, compiled_windows_ui_auth_mode,
-    create_private_named_pipe, current_user_agent_pipe_name, probe_environment,
+    create_private_named_pipe, current_user_agent_pipe_name, probe_environment, probe_readiness,
     protect_current_user_secret, replace_file_atomic, run_input_capture,
     unprotect_current_user_secret, validate_compiled_windows_ui_auth_policy,
 };
@@ -316,6 +334,16 @@ pub const fn probe_environment() -> Result<EnvironmentCapabilities, WindowsPlatf
 #[cfg(not(target_os = "windows"))]
 pub const fn active_displays() -> Result<Vec<DisplayGeometry>, WindowsPlatformError> {
     Err(WindowsPlatformError::Unavailable)
+}
+
+/// Returns an honest unavailable probe off Windows.
+#[must_use]
+#[cfg(not(target_os = "windows"))]
+pub const fn probe_readiness() -> WindowsReadinessProbe {
+    WindowsReadinessProbe {
+        input: WindowsInputReadiness::Unavailable,
+        local_topology_available: false,
+    }
 }
 
 #[cfg(test)]

@@ -42,7 +42,12 @@ internal sealed class AgentClient : IAgentReadinessProbe
         "safety_recovery_failed",
         "transfer_failed",
     };
-    private static readonly TimeSpan StatusRequestTimeout = TimeSpan.FromSeconds(3);
+    // The agent may use its full three-second platform-readiness probe budget.
+    // Leave additional time for pipe connection, mutual authentication, IPC, and scheduling.
+    private static readonly TimeSpan StatusRequestTimeout = TimeSpan.FromSeconds(8);
+    // Emergency stop may use the server's full twenty-second fail-closed safety window.
+    // Keep this independent from ordinary status polling and leave transport margin.
+    private static readonly TimeSpan EmergencyRequestTimeout = TimeSpan.FromSeconds(25);
     // The agent may spend two sequential five-second safety windows applying a grant.
     private static readonly TimeSpan MutationRequestTimeout = TimeSpan.FromSeconds(15);
     // The agent owns a five-minute bounded preparation window after command delivery.
@@ -70,7 +75,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         RequestAsync(
             new CommandEnvelope("get_status"),
             StatusRequestTimeout,
-            DecodeStatus,
+            AgentStatusDecoder.DecodeStatus,
             cancellationToken);
 
     async Task<bool> IAgentReadinessProbe.IsAgentReachableAsync(
@@ -97,8 +102,8 @@ internal sealed class AgentClient : IAgentReadinessProbe
         CancellationToken cancellationToken = default) =>
         RequestAsync(
             new CommandEnvelope("emergency_stop"),
-            StatusRequestTimeout,
-            DecodeStatus,
+            EmergencyRequestTimeout,
+            AgentStatusDecoder.DecodeStatus,
             cancellationToken);
 
     internal Task<PairingCodeSnapshot> BeginPairingAsync(
@@ -172,7 +177,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         return RequestAsync(
             new RevokePeerEnvelope("revoke_peer", peerId),
             MutationRequestTimeout,
-            DecodeStatus,
+            AgentStatusDecoder.DecodeStatus,
             cancellationToken);
     }
 
@@ -287,29 +292,6 @@ internal sealed class AgentClient : IAgentReadinessProbe
             }
             offset += count;
         }
-    }
-
-    private static AgentStatusSnapshot DecodeStatus(byte[] payload)
-    {
-        using JsonDocument document = ParseResponse(payload);
-        JsonElement root = document.RootElement;
-        RequireEvent(root, "status");
-
-        string phase = ReadRequiredEnum(root, "phase", "starting", "ready", "pairing", "connected", "stopping");
-        string inputOwner = ReadRequiredEnum(root, "input_owner", "local", "remote");
-        string? connectedPeer = null;
-        if (root.TryGetProperty("connected_peer", out JsonElement peer) &&
-            peer.ValueKind != JsonValueKind.Null)
-        {
-            connectedPeer = peer.GetString();
-            if (connectedPeer is null || connectedPeer.Length is 0 or > 256 ||
-                connectedPeer.Any(char.IsControl))
-            {
-                throw new InvalidDataException("Invalid peer display name.");
-            }
-        }
-
-        return new AgentStatusSnapshot(phase, connectedPeer, inputOwner);
     }
 
     private static PairingCodeSnapshot DecodePairingCode(byte[] payload)

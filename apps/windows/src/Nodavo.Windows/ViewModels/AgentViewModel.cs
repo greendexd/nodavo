@@ -16,6 +16,11 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
     private bool _requestInProgress;
     private bool _emergencyInProgress;
     private long _requestGeneration;
+    private string _agentReachabilityText;
+    private string _inputEnvironmentText;
+    private string _inputEnvironmentGuidanceText;
+    private string _localDisplaysText;
+    private string _peerTopologyText;
     private string _statusText;
     private string _peerText;
     private string _inputOwnerText;
@@ -26,6 +31,11 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
         _client = client;
         _resources = resources;
         _dispatcher = DispatcherQueue.GetForCurrentThread();
+        _agentReachabilityText = resources.GetString("ReadinessChecking");
+        _inputEnvironmentText = resources.GetString("ReadinessChecking");
+        _inputEnvironmentGuidanceText = string.Empty;
+        _localDisplaysText = resources.GetString("ReadinessChecking");
+        _peerTopologyText = resources.GetString("ReadinessChecking");
         _statusText = resources.GetString("StatusChecking");
         _peerText = resources.GetString("NoPeer");
         _inputOwnerText = resources.GetString("InputOwnerLocal");
@@ -33,9 +43,44 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
+    public string AgentReachabilityText
+    {
+        get => _agentReachabilityText;
+        private set => SetField(ref _agentReachabilityText, value);
+    }
+
+    public string InputEnvironmentText
+    {
+        get => _inputEnvironmentText;
+        private set => SetField(ref _inputEnvironmentText, value);
+    }
+
+    public string InputEnvironmentGuidanceText
+    {
+        get => _inputEnvironmentGuidanceText;
+        private set => SetField(ref _inputEnvironmentGuidanceText, value);
+    }
+
+    public string LocalDisplaysText
+    {
+        get => _localDisplaysText;
+        private set => SetField(ref _localDisplaysText, value);
+    }
+
+    public string PeerTopologyText
+    {
+        get => _peerTopologyText;
+        private set => SetField(ref _peerTopologyText, value);
+    }
+
     public string StatusText { get => _statusText; private set => SetField(ref _statusText, value); }
     public string PeerText { get => _peerText; private set => SetField(ref _peerText, value); }
-    public string InputOwnerText { get => _inputOwnerText; private set => SetField(ref _inputOwnerText, value); }
+    public string InputOwnerText
+    {
+        get => _inputOwnerText;
+        private set => SetField(ref _inputOwnerText, value);
+    }
+
     public string StatusGlyph { get => _statusGlyph; private set => SetField(ref _statusGlyph, value); }
     public bool IsRequestInProgress { get => _requestInProgress; private set => SetField(ref _requestInProgress, value); }
 
@@ -48,7 +93,7 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
 
         long generation = Interlocked.Increment(ref _requestGeneration);
         IsRequestInProgress = true;
-        StatusText = _resources.GetString("StatusChecking");
+        SetChecking();
         StatusGlyph = "\uE823";
         try
         {
@@ -176,17 +221,63 @@ internal sealed class AgentViewModel : INotifyPropertyChanged
                 _ => "\uE930",
             };
             PeerText = status.ConnectedPeer ?? _resources.GetString("NoPeer");
-            InputOwnerText = _resources.GetString(status.InputOwner == "remote" ? "InputOwnerRemote" : "InputOwnerLocal");
+            InputOwnerText = _resources.GetString(
+                status.InputOwner == "remote" ? "InputOwnerRemote" : "InputOwnerLocal");
+            AgentReachabilityText = _resources.GetString("ReadinessAgentReachable");
+
+            AgentReadinessPresentation readiness = AgentReadinessReducer.Reduce(status.Readiness);
+            InputEnvironmentText = _resources.GetString(readiness.InputEnvironment switch
+            {
+                InputEnvironmentState.Ready => "ReadinessInputReady",
+                InputEnvironmentState.ActionRequired => "ReadinessInputActionRequired",
+                InputEnvironmentState.BlockedByDesktop => "ReadinessInputBlockedByDesktop",
+                _ => "ReadinessUnavailable",
+            });
+            InputEnvironmentGuidanceText = readiness.InputGuidance switch
+            {
+                InputEnvironmentGuidance.RefreshAfterNormalDesktop =>
+                    _resources.GetString("ReadinessInputBlockedByDesktopHelp"),
+                _ => string.Empty,
+            };
+            LocalDisplaysText = _resources.GetString(readiness.LocalDisplays switch
+            {
+                LocalDisplaysState.Available => "ReadinessLocalDisplaysAvailable",
+                _ => "ReadinessUnavailable",
+            });
+            PeerTopologyText = _resources.GetString(readiness.PeerTopology switch
+            {
+                PeerTopologyState.NotConnected => "ReadinessPeerTopologyNotConnected",
+                PeerTopologyState.Synchronizing => "ReadinessPeerTopologySynchronizing",
+                PeerTopologyState.Ready => "ReadinessPeerTopologyReady",
+                _ => "ReadinessUnavailable",
+            });
         }, generation);
 
     private Task SetUnavailableAsync(string resourceKey, long generation) =>
         RunOnUiAsync(() =>
         {
             StatusText = _resources.GetString(resourceKey);
+            AgentReachabilityText = _resources.GetString(resourceKey);
             StatusGlyph = "\uE783";
             PeerText = _resources.GetString("NoPeer");
             InputOwnerText = _resources.GetString("InputOwnerLocal");
+            InputEnvironmentText = _resources.GetString("ReadinessUnavailable");
+            InputEnvironmentGuidanceText = string.Empty;
+            LocalDisplaysText = _resources.GetString("ReadinessUnavailable");
+            PeerTopologyText = _resources.GetString("ReadinessUnavailable");
         }, generation);
+
+    private void SetChecking()
+    {
+        StatusText = _resources.GetString("StatusChecking");
+        AgentReachabilityText = _resources.GetString("ReadinessChecking");
+        PeerText = _resources.GetString("NoPeer");
+        InputOwnerText = _resources.GetString("InputOwnerLocal");
+        InputEnvironmentText = _resources.GetString("ReadinessChecking");
+        InputEnvironmentGuidanceText = string.Empty;
+        LocalDisplaysText = _resources.GetString("ReadinessChecking");
+        PeerTopologyText = _resources.GetString("ReadinessChecking");
+    }
 
     private Task RunOnUiAsync(Action action, long generation)
     {

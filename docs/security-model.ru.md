@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 13 -->
+<!-- doc-id: security-model; lang: ru; translation-of: security-model.md; revision: 14 -->
 
 # Модель безопасности
 
@@ -59,13 +59,18 @@ Private keys по возможности non-exportable и хранятся че
 
 - Native capture запускается без подавления. Suppression разрешается только при активной аутентифицированной и разрешённой focus lease, которая действительно маршрутизирует локальный ввод на peer.
 - macOS требует выданное пользователем Accessibility trust. Windows остаётся внутри default input desktop интерактивного текущего пользователя; login, Session 0, UAC secure desktop и privileged unattended control отклоняются.
+- Readiness probes не содержат пользовательского контента, ограничены, кратко кэшируются и выполняются вне async command dispatcher. Они никогда не создают или регистрируют capture runtime: проверяются только permission/default-desktop state, обнаружение дисплеев, capability API и prerequisite injector без отправки events. Поэтому `ready` означает готовность prerequisites, а не live capture proof. Timeout или platform error возвращает unavailable, а не выводит готовность косвенно.
+- Команда разрешения macOS выполняется только от аутентифицированной identity агента. Показ системного prompt не является авторизацией: его возвращаемое значение игнорируется, а UI получает только результат новой проверки trust и prerequisites. В Windows нет соответствующей permission command, elevation path или обхода secure desktop.
+- Готовность session topology независима от обнаружения локальных дисплеев. Она становится ready только после аутентифицированного обмена topology и точного acknowledgement revision и сбрасывается при disconnect, recovery, revoke или failure.
 - Инъекция Nodavo использует приватную process tag, если платформа это поддерживает. Capture отклоняет эту tag и все события, отмеченные OS как injected, предотвращая synthetic feedback loop.
 - Keyboard usages, modifiers, media keys, pointer buttons, normalized motion и line/precise scrolling проверяются до injection. Native codes не передаются напрямую через peer protocol.
 - Edge transition использует critical reliable pointer-entry message. Native suppression и relative deltas остаются закрыты gate, пока receiver не проверит lease/session/grant, не разрешит session display token, не inject начальную позицию и не вернёт аутентифицированный acknowledgement. Это не позволяет потерянному или переупорядоченному entry datagram применить deltas к stale cursor.
 - Routed motion использует ограниченные ненулевые relative deltas без display identity. Coalescing callback queue сохраняет точную сумму только пока она остаётся в пределах; иначе события остаются раздельными или запускают явное recovery вместо тихого обрезания physical motion.
 - Injector отслеживает каждое принятое нажатие key/button. Emergency stop, потеря focus, lock, sleep, отключение tap/hook, timeout и transport failure синхронно запрашивают детерминированное освобождение и возврат local ownership до успешного acknowledgement.
+- Одна safety operation имеет общий 20-секундный ceiling для приёма команды, acknowledgement освобождения, quiescence ранее начатых session/workers, а также authoritative enrollment и cleanup входящих transfers. Пока операция активна, stale handshake generations не могут публиковать `connected`/`ready`, а admission новых transfer workers закрыт. При успехе admission открывается и `ready` публикуется только после cleanup под тем же status lock. Timeout или любая частичная ошибка фиксирует agent в `stopping`, закрывает сессии, отклоняет последующие reconnect/pairing в этом процессе, сохраняет worker admission закрытым и никогда не сообщает `ready`; после remediation требуется restart. Native UI используют более длинный ограниченный deadline ответа и не сообщают timeout, пока server budget ещё допустим.
 - Отключённый или просроченный capture hook работает fail-closed: suppression прекращается, local ownership возвращается, а remote session не может незаметно продолжиться.
 - Input payloads и pairing codes не попадают в logs, crash metadata или telemetry.
+- Readiness response содержит только enum states; в нём нет native display или desktop identifiers, process data, paths, peer identities, prompt details и input content.
 - Ревизия топологии должна быть установлена и подтверждена до переноса фокуса в соответствующем направлении. Координаты layout от peer только описательные и никогда не создают adjacency. Edge routes задаются явной локальной политикой, отключены при пустой конфигурации и всё равно проходят обычные проверки focus lease, debounce, hysteresis и cooldown.
 - Relative capture через macOS CGEvent и Windows Raw Input вместе с native relative injection реализованы и compile-tested. Поведение на реальных устройствах, различия acceleration, extreme hardware deltas, mixed-DPI hardware и drift долгих сессий остаются release-validation gates.
 

@@ -13,6 +13,12 @@
   <data name="NavigationSettings.Content" xml:space="preserve"><value>Settings</value></data>
   <data name="OverviewTitle.Text" xml:space="preserve"><value>Local workspace</value></data>
   <data name="OverviewSubtitle.Text" xml:space="preserve"><value>Current status of the per-user Nodavo agent on this PC.</value></data>
+  <data name="ReadinessHeading.Text" xml:space="preserve"><value>Readiness</value></data>
+  <data name="ReadinessSubtitle.Text" xml:space="preserve"><value>Each signal is reported independently by the mutually authenticated local agent.</value></data>
+  <data name="AgentReachabilityLabel.Text" xml:space="preserve"><value>Agent reachable</value></data>
+  <data name="InputEnvironmentLabel.Text" xml:space="preserve"><value>Input environment</value></data>
+  <data name="LocalDisplaysLabel.Text" xml:space="preserve"><value>Local displays</value></data>
+  <data name="PeerTopologyLabel.Text" xml:space="preserve"><value>Peer topology</value></data>
   <data name="ConnectionHeading.Text" xml:space="preserve"><value>Connection</value></data>
   <data name="PeerLabel.Text" xml:space="preserve"><value>Peer</value></data>
   <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Input owner</value></data>
@@ -213,6 +219,17 @@
   <data name="StatusAgentTimeout" xml:space="preserve"><value>Agent did not respond</value></data>
   <data name="StatusAgentAccessDenied" xml:space="preserve"><value>Agent access denied</value></data>
   <data name="StatusFailed" xml:space="preserve"><value>Invalid agent response</value></data>
+  <data name="ReadinessChecking" xml:space="preserve"><value>Checking…</value></data>
+  <data name="ReadinessAgentReachable" xml:space="preserve"><value>Reachable</value></data>
+  <data name="ReadinessUnavailable" xml:space="preserve"><value>Unavailable</value></data>
+  <data name="ReadinessInputReady" xml:space="preserve"><value>Ready</value></data>
+  <data name="ReadinessInputActionRequired" xml:space="preserve"><value>Input permission is required</value></data>
+  <data name="ReadinessInputBlockedByDesktop" xml:space="preserve"><value>Blocked by the current desktop</value></data>
+  <data name="ReadinessInputBlockedByDesktopHelp" xml:space="preserve"><value>Unlock the PC or return to the normal desktop, then refresh.</value></data>
+  <data name="ReadinessLocalDisplaysAvailable" xml:space="preserve"><value>Available on this PC</value></data>
+  <data name="ReadinessPeerTopologyNotConnected" xml:space="preserve"><value>Not connected</value></data>
+  <data name="ReadinessPeerTopologySynchronizing" xml:space="preserve"><value>Synchronizing</value></data>
+  <data name="ReadinessPeerTopologyReady" xml:space="preserve"><value>Ready</value></data>
   <data name="NoPeer" xml:space="preserve"><value>No peer connected</value></data>
   <data name="InputOwnerLocal" xml:space="preserve"><value>This PC</value></data>
   <data name="InputOwnerRemote" xml:space="preserve"><value>Remote peer</value></data>

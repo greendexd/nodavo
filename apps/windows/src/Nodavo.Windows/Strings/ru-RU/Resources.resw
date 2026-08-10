@@ -13,6 +13,12 @@
   <data name="NavigationSettings.Content" xml:space="preserve"><value>Настройки</value></data>
   <data name="OverviewTitle.Text" xml:space="preserve"><value>Локальное рабочее пространство</value></data>
   <data name="OverviewSubtitle.Text" xml:space="preserve"><value>Текущее состояние пользовательского агента Nodavo на этом ПК.</value></data>
+  <data name="ReadinessHeading.Text" xml:space="preserve"><value>Готовность</value></data>
+  <data name="ReadinessSubtitle.Text" xml:space="preserve"><value>Каждый сигнал независимо сообщает взаимно аутентифицированный локальный агент.</value></data>
+  <data name="AgentReachabilityLabel.Text" xml:space="preserve"><value>Доступность агента</value></data>
+  <data name="InputEnvironmentLabel.Text" xml:space="preserve"><value>Среда ввода</value></data>
+  <data name="LocalDisplaysLabel.Text" xml:space="preserve"><value>Локальные дисплеи</value></data>
+  <data name="PeerTopologyLabel.Text" xml:space="preserve"><value>Топология устройства</value></data>
   <data name="ConnectionHeading.Text" xml:space="preserve"><value>Подключение</value></data>
   <data name="PeerLabel.Text" xml:space="preserve"><value>Устройство</value></data>
   <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Источник ввода</value></data>
@@ -213,6 +219,17 @@
   <data name="StatusAgentTimeout" xml:space="preserve"><value>Агент не ответил</value></data>
   <data name="StatusAgentAccessDenied" xml:space="preserve"><value>Доступ к агенту запрещён</value></data>
   <data name="StatusFailed" xml:space="preserve"><value>Некорректный ответ агента</value></data>
+  <data name="ReadinessChecking" xml:space="preserve"><value>Проверка…</value></data>
+  <data name="ReadinessAgentReachable" xml:space="preserve"><value>Доступен</value></data>
+  <data name="ReadinessUnavailable" xml:space="preserve"><value>Недоступно</value></data>
+  <data name="ReadinessInputReady" xml:space="preserve"><value>Готово</value></data>
+  <data name="ReadinessInputActionRequired" xml:space="preserve"><value>Требуется разрешение на ввод</value></data>
+  <data name="ReadinessInputBlockedByDesktop" xml:space="preserve"><value>Заблокировано текущим рабочим столом</value></data>
+  <data name="ReadinessInputBlockedByDesktopHelp" xml:space="preserve"><value>Разблокируйте ПК или вернитесь к обычному рабочему столу, затем обновите статус.</value></data>
+  <data name="ReadinessLocalDisplaysAvailable" xml:space="preserve"><value>Доступны на этом ПК</value></data>
+  <data name="ReadinessPeerTopologyNotConnected" xml:space="preserve"><value>Не подключено</value></data>
+  <data name="ReadinessPeerTopologySynchronizing" xml:space="preserve"><value>Синхронизация</value></data>
+  <data name="ReadinessPeerTopologyReady" xml:space="preserve"><value>Готово</value></data>
   <data name="NoPeer" xml:space="preserve"><value>Нет подключённого устройства</value></data>
   <data name="InputOwnerLocal" xml:space="preserve"><value>Этот ПК</value></data>
   <data name="InputOwnerRemote" xml:space="preserve"><value>Удалённое устройство</value></data>

@@ -24,6 +24,9 @@ pub const MAX_UPDATE_VERSION_BYTES: usize = 128;
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum UiCommand {
     GetStatus {},
+    /// Prompts for macOS Accessibility access in the agent process and then
+    /// returns a freshly checked status. Other platforms reject this command.
+    RequestAccessibilityPermission {},
     ListTrustedPeers {},
     BeginPairing {
         endpoint: String,
@@ -141,6 +144,71 @@ pub struct AgentStatus {
     /// peer still owns no input on behalf of the remote device.
     #[serde(default)]
     pub focus_state: FocusState,
+    /// Public, content-free readiness of the local platform and peer session.
+    ///
+    /// Legacy agents omitted this field. Such payloads deserialize to a
+    /// deliberately unavailable local snapshot and never infer readiness.
+    #[serde(default)]
+    pub readiness: ReadinessSnapshot,
+}
+
+/// Public readiness exposed to the native UI.
+///
+/// This contains no paths, process or display identifiers, permission prompt
+/// state, or other stable machine metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessSnapshot {
+    pub accessibility: AccessibilityReadiness,
+    pub input: InputReadiness,
+    pub local_topology: LocalTopologyReadiness,
+    pub session_topology: SessionTopologyReadiness,
+}
+
+impl Default for ReadinessSnapshot {
+    fn default() -> Self {
+        Self {
+            accessibility: AccessibilityReadiness::Unavailable,
+            input: InputReadiness::Unavailable,
+            local_topology: LocalTopologyReadiness::Unavailable,
+            session_topology: SessionTopologyReadiness::NotConnected,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessibilityReadiness {
+    Granted,
+    ActionRequired,
+    NotApplicable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputReadiness {
+    /// Platform prerequisites and the injection API are available. A live
+    /// capture runtime is verified only inside an authenticated peer session.
+    Ready,
+    BlockedByPermission,
+    BlockedByDesktop,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalTopologyReadiness {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionTopologyReadiness {
+    NotConnected,
+    Synchronizing,
+    Ready,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,9 +563,10 @@ pub mod unix {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentEvent, CapabilityName, IpcError, MAX_IPC_MESSAGE_SIZE, MAX_TRUSTED_PEERS,
-        MAX_UPDATE_VERSION_BYTES, TrustedPeerState, TrustedPeerSummary, UiCommand,
-        UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
+        AccessibilityReadiness, AgentEvent, CapabilityName, InputReadiness, IpcError,
+        LocalTopologyReadiness, MAX_IPC_MESSAGE_SIZE, MAX_TRUSTED_PEERS, MAX_UPDATE_VERSION_BYTES,
+        ReadinessSnapshot, SessionTopologyReadiness, TrustedPeerState, TrustedPeerSummary,
+        UiCommand, UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
         write_frame,
     };
 
@@ -592,6 +661,67 @@ mod tests {
     }
 
     #[test]
+    fn accessibility_command_and_readiness_have_exact_stable_wire_names() {
+        assert_eq!(
+            serde_json::from_str::<UiCommand>(r#"{"command":"request_accessibility_permission"}"#)
+                .unwrap(),
+            UiCommand::RequestAccessibilityPermission {}
+        );
+        assert!(
+            serde_json::from_str::<UiCommand>(
+                r#"{"command":"request_accessibility_permission","prompt":true}"#
+            )
+            .is_err()
+        );
+
+        let snapshot = ReadinessSnapshot {
+            accessibility: AccessibilityReadiness::ActionRequired,
+            input: InputReadiness::BlockedByPermission,
+            local_topology: LocalTopologyReadiness::Available,
+            session_topology: SessionTopologyReadiness::Synchronizing,
+        };
+        let encoded = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(encoded["accessibility"], "action_required");
+        assert_eq!(encoded["input"], "blocked_by_permission");
+        assert_eq!(encoded["local_topology"], "available");
+        assert_eq!(encoded["session_topology"], "synchronizing");
+        assert_eq!(
+            serde_json::from_value::<ReadinessSnapshot>(encoded).unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn readiness_snapshot_is_bounded_public_data_and_rejects_unknown_fields() {
+        let snapshot = ReadinessSnapshot {
+            accessibility: AccessibilityReadiness::Granted,
+            input: InputReadiness::Ready,
+            local_topology: LocalTopologyReadiness::Available,
+            session_topology: SessionTopologyReadiness::Ready,
+        };
+        let encoded = serde_json::to_value(snapshot).unwrap();
+        assert!(serde_json::to_vec(&encoded).unwrap().len() < MAX_IPC_MESSAGE_SIZE);
+        for private_field in [
+            "path",
+            "pid",
+            "process_id",
+            "display_id",
+            "desktop_name",
+            "pairing_code",
+        ] {
+            assert!(encoded.get(private_field).is_none());
+        }
+        assert!(
+            serde_json::from_str::<ReadinessSnapshot>(
+                r#"{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready","pid":7}"#
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<AccessibilityReadiness>(r#""unknown""#).is_err());
+        assert!(serde_json::from_str::<InputReadiness>(r#""unknown""#).is_err());
+    }
+
+    #[test]
     fn trusted_peer_response_is_bounded_and_contains_only_public_local_fields() {
         let peers = (0..MAX_TRUSTED_PEERS)
             .map(|index| TrustedPeerSummary {
@@ -647,9 +777,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.focus_state, super::FocusState::Local);
+        assert_eq!(status.readiness, ReadinessSnapshot::default());
 
         let encoded = serde_json::to_value(status).unwrap();
         assert_eq!(encoded["focus_state"], "local");
+        assert_eq!(encoded["readiness"]["accessibility"], "unavailable");
+        assert_eq!(encoded["readiness"]["input"], "unavailable");
+        assert_eq!(encoded["readiness"]["local_topology"], "unavailable");
+        assert_eq!(encoded["readiness"]["session_topology"], "not_connected");
     }
 
     #[test]

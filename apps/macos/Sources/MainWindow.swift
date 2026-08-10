@@ -439,8 +439,9 @@ private struct OverviewView: View {
                 LabeledContent("focus_state") { Text(model.focusStatusText) }
             }
 
+            ReadinessCard(model: model)
+
             HStack {
-                Button("refresh_status") { model.refresh() }
                 Button("control_peer") { model.requestRemoteFocus() }
                     .disabled(model.connectedPeer == nil || model.focusState != "local")
                 Button("return_focus") { model.releaseFocus() }
@@ -475,6 +476,9 @@ private struct SettingsView: View {
                     Label("agent_registration_help", systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
+            }
+            Section("readiness") {
+                ReadinessCard(model: model)
             }
             Section("software_update") {
                 Label(model.updateStatusText, systemImage: model.updateStatusSymbol)
@@ -562,7 +566,116 @@ private struct SettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle("section_settings")
-        .onAppear { model.refreshUpdateStatus() }
+        .onAppear {
+            model.refreshReadiness()
+            model.refreshUpdateStatus()
+        }
+    }
+}
+
+private struct ReadinessCard: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        GroupBox("readiness") {
+            VStack(alignment: .leading, spacing: 8) {
+                LabeledContent("readiness_agent_reachable") {
+                    Text(model.reachabilityText)
+                }
+                LabeledContent("readiness_accessibility") {
+                    Text(model.readiness.accessibility.localizedKey)
+                }
+                LabeledContent("readiness_input") {
+                    Text(model.readiness.input.localizedKey)
+                }
+                LabeledContent("readiness_local_displays") {
+                    Text(model.readiness.localTopology.localizedKey)
+                }
+                LabeledContent("readiness_peer_topology") {
+                    Text(model.readiness.sessionTopology.localizedKey)
+                }
+
+                if model.readinessRequestInProgress {
+                    ProgressView("readiness_request_in_progress")
+                        .controlSize(.small)
+                }
+
+                Button("refresh_status") {
+                    model.refreshReadiness()
+                }
+                .disabled(model.readinessRequestInProgress)
+
+                if model.readinessCanRequestAccessibilityPermission {
+                    Text("readiness_accessibility_action_required_help")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("readiness_allow_accessibility") {
+                        model.requestAccessibilityPermission()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text("readiness_accessibility_refresh_help")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if model.connectionState == .unavailable {
+                    Label("agent_registration_help", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+}
+
+private extension AppModel {
+    var reachabilityText: LocalizedStringKey {
+        switch connectionState {
+        case .checking: "readiness_reachability_checking"
+        case .ready, .connected: "readiness_reachability_reachable"
+        case .unavailable, .failed: "readiness_reachability_unavailable"
+        }
+    }
+}
+
+private extension AccessibilityReadiness {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .granted: "readiness_accessibility_granted"
+        case .actionRequired: "readiness_accessibility_action_required"
+        case .notApplicable: "readiness_accessibility_not_applicable"
+        case .unavailable: "readiness_unavailable"
+        }
+    }
+}
+
+private extension InputReadiness {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .ready: "readiness_input_ready"
+        case .blockedByPermission: "readiness_input_blocked_by_permission"
+        case .blockedByDesktop: "readiness_input_blocked_by_desktop"
+        case .unavailable: "readiness_unavailable"
+        }
+    }
+}
+
+private extension LocalTopologyReadiness {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .available: "readiness_local_topology_available"
+        case .unavailable: "readiness_unavailable"
+        }
+    }
+}
+
+private extension SessionTopologyReadiness {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .notConnected: "readiness_session_not_connected"
+        case .synchronizing: "readiness_session_synchronizing"
+        case .ready: "readiness_session_ready"
+        }
     }
 }
 

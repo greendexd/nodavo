@@ -27,6 +27,47 @@ struct UpdatePollingOwner {
     }
 }
 
+struct ReadinessRequestOwner {
+    private(set) var generation: UInt64 = 0
+    private(set) var isRequestInProgress = false
+
+    mutating func begin() -> UInt64 {
+        generation &+= 1
+        isRequestInProgress = true
+        return generation
+    }
+
+    func owns(_ candidate: UInt64) -> Bool {
+        candidate == generation
+    }
+
+    mutating func finish(_ candidate: UInt64) -> Bool {
+        guard owns(candidate) else { return false }
+        isRequestInProgress = false
+        return true
+    }
+}
+
+enum ReadinessRequestPolicy {
+    static func allowsAccessibilityPrompt(for readiness: AgentReadiness) -> Bool {
+        readiness.accessibility == .actionRequired
+    }
+}
+
+struct AuthoritativeAgentStatus: Equatable {
+    let connectedPeer: String?
+    let inputOwner: String
+    let focusState: String
+    let readiness: AgentReadiness
+
+    init(_ response: AgentStatusResponse) {
+        connectedPeer = response.connectedPeer
+        inputOwner = response.inputOwner
+        focusState = response.focusState
+        readiness = response.readiness
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum ConnectionState {
@@ -59,6 +100,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var connectedPeer: String?
     @Published private(set) var inputOwner = "local"
     @Published private(set) var focusState = "local"
+    @Published private(set) var readiness = AgentReadiness.unavailable
+    @Published private(set) var readinessRequestInProgress = false
     @Published private(set) var pairingState: PairingState = .idle
     @Published private(set) var pairingPrompt: PairingPrompt?
     @Published private(set) var trustedPeersState: TrustedPeersState = .idle
@@ -73,7 +116,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var updateOperationInProgress = false
     @Published private(set) var updateClientErrorKey: String?
 
-    private let statusClient = AgentClient()
+    private let readinessClient = AgentClient()
     private let safetyClient = AgentClient()
     private let pairingClient = AgentClient()
     private let focusClient = AgentClient()
@@ -81,6 +124,7 @@ final class AppModel: ObservableObject {
     private let transferClient = AgentClient()
     private let updateClient = AgentClient()
     private let updatePollingClient = AgentClient()
+    private var readinessRequestOwner = ReadinessRequestOwner()
     private var updateRequestGeneration: UInt64 = 0
     private var updatePollingOwner = UpdatePollingOwner()
     private var updatePollingTask: Task<Void, Never>?
@@ -170,6 +214,15 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var readinessCanRequestAccessibilityPermission: Bool {
+        #if os(macOS)
+        ReadinessRequestPolicy.allowsAccessibilityPrompt(for: readiness)
+            && !readinessRequestInProgress
+        #else
+        false
+        #endif
+    }
+
     var updateStatusText: LocalizedStringKey {
         switch updateStatus.phase {
         case .idle: "update_status_idle"
@@ -251,22 +304,33 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
+        refreshReadiness()
+    }
+
+    func refreshReadiness() {
+        let generation = beginReadinessRequest()
         connectionState = .checking
         Task {
             do {
-                let response = try await statusClient.status()
-                connectedPeer = response.connectedPeer
-                inputOwner = response.inputOwner
-                focusState = response.focusState
-                connectionState = response.connectedPeer == nil ? .ready : .connected
-            } catch AgentClientError.agentUnavailable {
-                connectedPeer = nil
-                focusState = "local"
-                connectionState = .unavailable
+                let response = try await readinessClient.status()
+                finishReadinessRequest(response, generation: generation)
             } catch {
-                connectedPeer = nil
-                focusState = "local"
-                connectionState = .failed
+                failReadinessRequest(generation: generation)
+            }
+        }
+    }
+
+    func requestAccessibilityPermission() {
+        guard readinessCanRequestAccessibilityPermission else { return }
+        let generation = beginReadinessRequest()
+        Task {
+            do {
+                // The agent returns a fresh status after requesting the system prompt.
+                // We apply that status verbatim; requesting the prompt is not a grant.
+                let response = try await readinessClient.requestAccessibilityPermission()
+                finishReadinessRequest(response, generation: generation)
+            } catch {
+                failReadinessRequest(generation: generation)
             }
         }
     }
@@ -275,10 +339,7 @@ final class AppModel: ObservableObject {
         Task {
             do {
                 let response = try await safetyClient.emergencyStop()
-                connectedPeer = response.connectedPeer
-                inputOwner = response.inputOwner
-                focusState = response.focusState
-                connectionState = .ready
+                applyStatus(response)
             } catch AgentClientError.agentUnavailable {
                 connectionState = .unavailable
                 focusState = "local"
@@ -555,10 +616,34 @@ final class AppModel: ObservableObject {
     }
 
     private func applyStatus(_ response: AgentStatusResponse) {
-        connectedPeer = response.connectedPeer
-        inputOwner = response.inputOwner
-        focusState = response.focusState
-        connectionState = response.connectedPeer == nil ? .ready : .connected
+        let status = AuthoritativeAgentStatus(response)
+        connectedPeer = status.connectedPeer
+        inputOwner = status.inputOwner
+        focusState = status.focusState
+        readiness = status.readiness
+        connectionState = status.connectedPeer == nil ? .ready : .connected
+    }
+
+    private func beginReadinessRequest() -> UInt64 {
+        let generation = readinessRequestOwner.begin()
+        readinessRequestInProgress = true
+        return generation
+    }
+
+    private func finishReadinessRequest(_ response: AgentStatusResponse, generation: UInt64) {
+        guard readinessRequestOwner.finish(generation) else { return }
+        readinessRequestInProgress = false
+        applyStatus(response)
+    }
+
+    private func failReadinessRequest(generation: UInt64) {
+        guard readinessRequestOwner.finish(generation) else { return }
+        readinessRequestInProgress = false
+        connectedPeer = nil
+        inputOwner = "local"
+        focusState = "local"
+        readiness = .unavailable
+        connectionState = .unavailable
     }
 
     private func beginUpdateRequest() -> UInt64? {

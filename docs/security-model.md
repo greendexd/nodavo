@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 13 -->
+<!-- doc-id: security-model; lang: en; revision: 14 -->
 
 # Security model
 
@@ -59,13 +59,18 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 
 - Native capture starts in non-suppressing mode. Suppression is permitted only while an authenticated, authorized focus lease is actively routing local input to the peer.
 - macOS requires the user-granted Accessibility trust boundary. Windows remains inside the current interactive user's default input desktop; login, Session 0, UAC secure desktop, and privileged unattended control are rejected.
+- Readiness probes are content-free, bounded, cached briefly, and run off the async command dispatcher. They never construct or register a capture runtime; only permission/default-desktop state, display discovery, API capability, and a non-posting injector prerequisite are checked. `ready` is therefore a prerequisite signal, not live capture proof. A timeout or platform error reports unavailable rather than inferring success.
+- The macOS permission command executes only in the authenticated agent identity. Displaying the system prompt is not authorization: its return value is ignored and the UI receives only the result of a new trust and prerequisite probe. Windows has no corresponding permission command, elevation path, or secure-desktop workaround.
+- Session-topology readiness is independent of local display discovery. It becomes ready only after authenticated topology exchange and the exact revision acknowledgement, and resets on disconnect, recovery, revoke, or failure.
 - Nodavo injection carries a private process tag where the platform supports one. Capture rejects that tag and every event the OS reports as injected, preventing synthetic feedback loops.
 - Keyboard usages, modifiers, media keys, pointer buttons, normalized motion, and line/precise scrolling are validated before injection. Native codes never cross the peer protocol directly.
 - An edge transition uses a critical reliable pointer-entry message. Native suppression and relative deltas remain gated until the receiver validates the lease/session/grant, resolves the session display token, injects the entry position, and returns an authenticated acknowledgement. This prevents a lost or reordered entry datagram from applying deltas at a stale cursor.
 - Routed motion uses bounded nonzero relative deltas with no display identity. Callback-queue coalescing preserves the exact sum only while it remains in range; otherwise events stay separate or fail back to explicit recovery instead of silently truncating physical motion.
 - The injector tracks every accepted key/button press. Emergency stop, focus loss, lock, sleep, tap/hook disable, timeout, and transport failure synchronously request deterministic release and local-ownership restoration before successful acknowledgement.
+- One safety operation has a 20-second end-to-end ceiling covering command admission, release acknowledgement, pre-existing session/worker quiescence, and authoritative enrollment and cleanup of inbound transfers. While it is active, stale handshake generations cannot publish `connected`/`ready` and new transfer-worker admission is closed. Success reopens admission and publishes `ready` only after cleanup under the same status lock. Timeout or any partial failure latches the agent in `stopping`, closes sessions, rejects later reconnect/pairing in that process, keeps worker admission closed, and never reports `ready`; restart is required after remediation. Native UIs use a longer bounded response deadline so they do not report timeout while this server budget is still valid.
 - A disabled or timed-out capture hook fails closed: suppression stops, local ownership is restored, and the remote session cannot continue silently.
 - Input payloads and pairing codes are excluded from logs, crash metadata, and telemetry.
+- The readiness response contains enum states only; it excludes native display and desktop identifiers, process data, paths, peer identities, prompt details, and input content.
 - A topology revision must be installed and acknowledged before focus can move in the corresponding direction. Peer layout coordinates are descriptive only and never create adjacency. Edge routes are explicit local policy, disabled when empty, and still pass through the ordinary focus lease, debounce, hysteresis, and cooldown checks.
 - macOS CGEvent and Windows Raw Input relative capture plus native relative injection are implemented and compile-tested. Real-device behavior, acceleration differences, extreme hardware deltas, mixed-DPI hardware, and long-session drift remain release-validation gates.
 

@@ -66,6 +66,7 @@ struct StoreInner {
     discard_required: HashMap<DeviceId, HashSet<TransferId>>,
     staging_root: Option<PathBuf>,
     active_workers: usize,
+    worker_admission_closed: bool,
     cleanup_in_progress: bool,
     directory_entry_crash_durable: bool,
 }
@@ -93,7 +94,24 @@ pub(crate) enum TransferCleanupState {
     Pending,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TransferWorkerAdmissionClosed;
+
 impl TransferStore {
+    pub(crate) fn close_worker_admission_for_safety(&self) {
+        self.inner
+            .lock()
+            .expect("transfer store mutex poisoned")
+            .worker_admission_closed = true;
+    }
+
+    pub(crate) fn reopen_worker_admission_after_safety(&self) {
+        self.inner
+            .lock()
+            .expect("transfer store mutex poisoned")
+            .worker_admission_closed = false;
+    }
+
     fn reserve_outbound(&self) -> Result<(), TransferError> {
         if self.is_poisoned() {
             return Err(TransferError::Platform);
@@ -195,8 +213,13 @@ impl TransferStore {
             .extend(transfers);
     }
 
-    pub(crate) fn require_all_inbound_discard(&self) -> Vec<DeviceId> {
+    /// Atomically enrolls every known inbound transfer only after all session
+    /// workers have stopped publishing new staging state.
+    pub(crate) fn require_all_inbound_discard_if_idle(&self) -> Option<Vec<DeviceId>> {
         let mut inner = self.inner.lock().expect("transfer store mutex poisoned");
+        if inner.active_workers != 0 || inner.cleanup_in_progress {
+            return None;
+        }
         let peers = inner.inbound.keys().copied().collect::<Vec<_>>();
         for peer in &peers {
             let transfers = inner.inbound.get(peer).cloned().unwrap_or_default();
@@ -206,12 +229,16 @@ impl TransferStore {
                 .or_default()
                 .extend(transfers);
         }
-        peers
+        Some(peers)
     }
 
-    fn worker_started(&self) {
+    fn worker_started(&self) -> Result<(), TransferWorkerAdmissionClosed> {
         let mut inner = self.inner.lock().expect("transfer store mutex poisoned");
+        if inner.worker_admission_closed {
+            return Err(TransferWorkerAdmissionClosed);
+        }
         inner.active_workers = inner.active_workers.saturating_add(1);
+        Ok(())
     }
 
     fn worker_finished(&self, peer: DeviceId) {
@@ -361,7 +388,7 @@ impl TransferWorker {
         peer: DeviceId,
         mut runtime: PeerTransferRuntime<FileSystemStagingArea>,
         store: TransferStore,
-    ) -> Self {
+    ) -> Result<Self, TransferWorkerAdmissionClosed> {
         runtime.remember_completed_inbound(&store.completed_for(peer));
         let (known_persisted, allow_untracked) = store.resume_configuration(peer);
         runtime.configure_persisted_resume(&known_persisted, allow_untracked);
@@ -375,7 +402,7 @@ impl TransferWorker {
         let thread_scan_active = Arc::clone(&scan_active);
         let thread_store = store.clone();
         let handle = Handle::current();
-        store.worker_started();
+        store.worker_started()?;
         std::thread::Builder::new()
             .name("nodavo-transfer".to_owned())
             .spawn(move || {
@@ -396,14 +423,14 @@ impl TransferWorker {
                 thread_store.worker_finished(peer);
             })
             .expect("the bounded transfer worker thread must start");
-        Self {
+        Ok(Self {
             commands: command_tx,
             events: event_rx,
             stop,
             store,
             #[cfg(test)]
             scan_active,
-        }
+        })
     }
 
     pub(crate) fn try_receive_manifest(&self, frame: Vec<u8>) -> Result<(), TransferRuntimeError> {
@@ -953,6 +980,7 @@ mod tests {
             ),
             store,
         )
+        .unwrap()
     }
 
     async fn next_event(worker: &mut TransferWorker) -> TransferWorkerEvent {
@@ -1066,6 +1094,53 @@ mod tests {
         );
         assert!(store.is_poisoned());
         assert_eq!(store.reserve_outbound(), Err(TransferError::Platform));
+    }
+
+    #[test]
+    fn global_cleanup_enrollment_waits_for_late_worker_publication() {
+        let store = TransferStore::default();
+        let transfer = TransferId::from_bytes([32; 16]);
+        store.worker_started().unwrap();
+        assert_eq!(store.require_all_inbound_discard_if_idle(), None);
+
+        // A live worker may publish Started after safety shutdown begins.
+        store.remember_inbound(PEER, transfer);
+        assert_eq!(store.require_all_inbound_discard_if_idle(), None);
+        store
+            .inner
+            .lock()
+            .expect("transfer store mutex poisoned")
+            .active_workers = 0;
+
+        assert_eq!(
+            store.require_all_inbound_discard_if_idle(),
+            Some(vec![PEER])
+        );
+        assert!(
+            store
+                .inner
+                .lock()
+                .expect("transfer store mutex poisoned")
+                .discard_required
+                .get(&PEER)
+                .is_some_and(|transfers| transfers.contains(&transfer))
+        );
+    }
+
+    #[test]
+    fn global_cleanup_barrier_rejects_post_enrollment_worker() {
+        let store = TransferStore::default();
+        store.close_worker_admission_for_safety();
+
+        assert_eq!(
+            store.require_all_inbound_discard_if_idle(),
+            Some(Vec::new())
+        );
+        assert_eq!(store.worker_started(), Err(TransferWorkerAdmissionClosed));
+
+        store.reopen_worker_admission_after_safety();
+        assert_eq!(store.worker_started(), Ok(()));
+        store.worker_finished(PEER);
     }
 
     #[tokio::test(flavor = "multi_thread")]

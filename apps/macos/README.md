@@ -1,10 +1,10 @@
-<!-- doc-id: macos-app; lang: en; revision: 9 -->
+<!-- doc-id: macos-app; lang: en; revision: 10 -->
 
 # Nodavo for macOS
 
 [English](README.md) · [Русский](README.ru.md)
 
-The current SwiftUI menu-bar shell connects to the per-user Rust agent through signed XPC in a release build. The packaged LaunchAgent advertises `dev.nodavo.agent.ipc`; the agent verifies the exact UI signing requirement on every received message and the UI applies the reciprocal exact helper requirement. The shell displays bounded status/focus and trusted-device summaries, exposes local emergency stop and manual focus controls, implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation, and supports transactional post-pair grant changes plus confirmed trust revocation. The Transfers page queues up to 32 explicitly selected files/folders and displays only a redacted queue reference. Broad cross-platform and signed-runtime validation remain under implementation.
+The current SwiftUI menu-bar shell connects to the per-user Rust agent through signed XPC in a release build. The packaged LaunchAgent advertises `dev.nodavo.agent.ipc`; the agent verifies the exact UI signing requirement on every received message and the UI applies the reciprocal exact helper requirement. The shell displays bounded status/focus and trusted-device summaries, exposes local emergency stop and manual focus controls, implements listening/manual pairing with explicit per-capability selection and six-digit code confirmation, and supports transactional post-pair grant changes plus confirmed trust revocation. The Overview and Settings screens separately show agent reachability, Accessibility trust, local input readiness, local displays, and peer-topology synchronization. The Transfers page queues up to 32 explicitly selected files/folders and displays only a redacted queue reference. Broad cross-platform and signed-runtime validation remain under implementation.
 
 ```bash
 cargo run -p nodavo-agent --features development-unverified-local-ipc
@@ -15,6 +15,12 @@ swift run --package-path apps/macos \
 The feature and Swift compile flag above select an explicit unsafe same-user UDS bypass for source-tree development only. It is incompatible with distribution. A default agent build without an embedded Team ID or registered Mach service fails closed and has no UDS fallback.
 
 All pairing permissions default to off. The selected permissions are bound to the confirmed pairing transcript and signed device trust. Post-pair switches update only after the agent acknowledges the exact change; revoked devices cannot be edited and must be paired again. The UI never sends inferred filesystem paths: only absolute paths returned by an explicit local picker selection are accepted.
+
+## Readiness and Accessibility
+
+Readiness is a strict public enum snapshot, not a diagnostic dump. The shell rejects missing, unknown, or malformed readiness values. Behind a finite deadline and short cache, the agent checks Accessibility trust, local display discovery, and a non-posting injector prerequisite; it never constructs a second capture runtime, suppresses, or injects input. **Ready** therefore describes current local prerequisites, not live capture proof. A connected session reports peer topology as ready only after the authenticated topology exchange and matching local revision acknowledgement.
+
+**Allow Accessibility** asks macOS from the agent process that needs the permission and then performs a fresh probe. The prompt API's return value is not treated as authorization, so cancelling the prompt or leaving System Settings unchanged remains **Action required**. This source behavior and focused prerequisite tests are implemented; a signed, provisioned, notarized Nodavo build has not yet proved the complete TCC flow on a clean Mac.
 
 ## Updates
 

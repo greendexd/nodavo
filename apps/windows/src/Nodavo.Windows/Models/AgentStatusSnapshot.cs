@@ -3,7 +3,14 @@ namespace Nodavo.Windows.Models;
 internal sealed record AgentStatusSnapshot(
     string Phase,
     string? ConnectedPeer,
-    string InputOwner);
+    string InputOwner,
+    AgentReadinessSnapshot Readiness);
+
+internal sealed record AgentReadinessSnapshot(
+    string Accessibility,
+    string Input,
+    string LocalTopology,
+    string SessionTopology);
 
 internal sealed record PairingCodeSnapshot(
     string PairingId,

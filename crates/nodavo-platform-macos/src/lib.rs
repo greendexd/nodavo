@@ -68,6 +68,19 @@ pub struct DisplayGeometry {
     pub height_pixels: u64,
 }
 
+/// Content-free readiness observations for the current agent identity.
+///
+/// No native process, display, path, or permission-prompt identifiers cross
+/// this boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MacReadinessProbe {
+    pub accessibility_trusted: bool,
+    /// Required permission, display discovery, and event-source construction
+    /// succeeded. Live capture is verified only by an authenticated session.
+    pub input_prerequisites_available: bool,
+    pub local_topology_available: bool,
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -79,7 +92,7 @@ pub use macos::{
     MacLocalIpcAuthMode, MacXpcError, MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply,
     MacXpcRequest, NODAVO_AGENT_MACH_SERVICE, XPC_REPLY_DEADLINE_MILLISECONDS,
     accessibility_trusted, active_displays, local_ipc_auth_mode, mac_xpc_peer_requirement,
-    request_accessibility, run_input_capture,
+    probe_readiness, request_accessibility, run_input_capture,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -95,4 +108,15 @@ pub fn request_accessibility() -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn active_displays() -> Result<Vec<DisplayGeometry>, MacPlatformError> {
     Err(MacPlatformError::Unavailable)
+}
+
+/// Returns an honest unavailable probe off macOS.
+#[must_use]
+#[cfg(not(target_os = "macos"))]
+pub const fn probe_readiness() -> MacReadinessProbe {
+    MacReadinessProbe {
+        accessibility_trusted: false,
+        input_prerequisites_available: false,
+        local_topology_available: false,
+    }
 }
