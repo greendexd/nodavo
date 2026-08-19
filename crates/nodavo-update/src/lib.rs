@@ -5,10 +5,14 @@
 //! persistence, and platform installation remain behind contracts so policy
 //! and crash recovery can be tested without executing downloaded content.
 
+mod handoff;
 mod runtime;
+#[cfg(any(feature = "supervisor-host", test))]
 mod supervision;
 
+pub use handoff::*;
 pub use runtime::*;
+#[cfg(any(feature = "supervisor-host", test))]
 pub use supervision::*;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -308,6 +312,7 @@ impl ReleaseVerifier {
             artifact_sha256: digest,
             install_identity: self.policy.install_identity.clone(),
             installed_version: self.policy.installed_version.clone(),
+            signed_manifest_envelope: envelope_json.to_vec(),
         })
     }
 
@@ -339,12 +344,24 @@ impl ReleaseVerifier {
 }
 
 /// Authenticated release metadata returned by [`ReleaseVerifier`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub struct VerifiedRelease {
     manifest: ReleaseManifest,
     artifact_sha256: [u8; 32],
     install_identity: String,
     installed_version: Version,
+    signed_manifest_envelope: Vec<u8>,
+}
+
+impl std::fmt::Debug for VerifiedRelease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedRelease")
+            .field("version", &self.manifest.version)
+            .field("platform", &self.manifest.platform)
+            .field("arch", &self.manifest.arch)
+            .finish_non_exhaustive()
+    }
 }
 
 impl VerifiedRelease {
@@ -368,6 +385,10 @@ impl VerifiedRelease {
     #[must_use]
     pub const fn installed_version(&self) -> &Version {
         &self.installed_version
+    }
+
+    pub(crate) fn signed_manifest_envelope(&self) -> &[u8] {
+        &self.signed_manifest_envelope
     }
 
     /// Creates a bounded streaming verifier for bytes downloaded by the host.
@@ -661,8 +682,15 @@ mod tests {
         let verifier = ReleaseVerifier::new(key, policy);
         let state = RollbackState::new(7, Version::parse("1.5.0").unwrap());
 
-        let accepted = verifier.verify_json(manifest_json(SIGNATURE, 1_024).as_bytes(), &state);
-        assert!(accepted.is_ok());
+        let exact_envelope = manifest_json(SIGNATURE, 1_024);
+        let accepted = verifier
+            .verify_json(exact_envelope.as_bytes(), &state)
+            .unwrap();
+        assert_eq!(
+            accepted.signed_manifest_envelope(),
+            exact_envelope.as_bytes()
+        );
+        assert!(!format!("{accepted:?}").contains(SIGNATURE));
         assert_eq!(
             verifier.verify_json(manifest_json(SIGNATURE, 1_025).as_bytes(), &state),
             Err(UpdateError::InvalidSignature)

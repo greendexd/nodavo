@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ArtifactVerifier, AttemptId, MAX_ARTIFACT_BYTES, MAX_VERSION_BYTES, RollbackState,
-    SupervisionJournal, SupervisionPolicy, SupervisionTransactionLock, TransactionId, UpdateError,
-    VerifiedRelease, validate_https_url,
+    ArtifactVerifier, InstallAndRestartHandoff, InstallRequestId, MAX_ARTIFACT_BYTES,
+    MAX_VERSION_BYTES, RollbackState, UpdateError, VerifiedRelease, validate_https_url,
 };
 
 /// Largest chunk requested from a downloader or staging adapter (256 KiB).
@@ -260,7 +259,7 @@ pub enum UserConsent {
     ///
     /// A distinct [`InstallConsent`] is still required before any installation
     /// or restart effect.
-    ApproveDownloadAndInstall,
+    ApproveDownloadAndStage,
     Decline,
 }
 
@@ -342,6 +341,10 @@ impl InstallTarget {
             Self::WindowsPackage { package_identity } => package_identity,
         }
     }
+
+    pub(crate) fn validate(&self) -> Result<(), UpdateRuntimeError> {
+        validate_install_identifier(self.identifier())
+    }
 }
 
 /// Immutable transaction plan passed to platform installers.
@@ -404,10 +407,7 @@ impl InstallPlan {
         if self.artifact.size == 0 || self.artifact.size > MAX_ARTIFACT_BYTES {
             return Err(UpdateRuntimeError::CorruptPersistentState);
         }
-        validate_install_identifier(match &self.target {
-            InstallTarget::MacOsAppBundle { bundle_identifier } => bundle_identifier,
-            InstallTarget::WindowsPackage { package_identity } => package_identity,
-        })?;
+        self.target.validate()?;
         if self.version.to_string().len() > MAX_VERSION_BYTES
             || self
                 .rollback_floor_after_install
@@ -714,8 +714,12 @@ pub enum UpdateRuntimeError {
     ArtifactVerificationFailed,
     #[error("the install target does not match the signed platform")]
     InstallTargetMismatch,
+    #[error("the authenticated current install does not match supervisor verification policy")]
+    AuthenticatedInstalledTargetMismatch,
     #[error("the recovery journal effect failed")]
     JournalFailed,
+    #[error("the initial supervision commit may have reached protected storage")]
+    SupervisionCommitOutcomeUnknown,
     #[error("the anti-rollback persistence effect failed")]
     RollbackStateFailed,
     #[error("the platform installer effect failed")]
@@ -735,6 +739,13 @@ impl From<UpdateError> for UpdateRuntimeError {
 /// One explicitly consented update attempt.
 pub struct UpdateSession {
     release: VerifiedRelease,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "retained for the legacy test-only installer model"
+        )
+    )]
     rollback_before: RollbackState,
     status: UpdateStatus,
     #[cfg(test)]
@@ -784,7 +795,7 @@ impl UpdateSession {
             return Err(UpdateRuntimeError::InvalidTransition);
         }
         self.status = match decision {
-            UserConsent::ApproveDownloadAndInstall => UpdateStatus::ReadyToDownload,
+            UserConsent::ApproveDownloadAndStage => UpdateStatus::ReadyToDownload,
             UserConsent::Decline => UpdateStatus::Declined,
         };
         Ok(())
@@ -809,6 +820,42 @@ impl UpdateSession {
         Ok(())
     }
 
+    /// Consumes this exact staged session into a one-shot stable-supervisor
+    /// handoff after distinct install/restart consent.
+    ///
+    /// The exact original bounded signed envelope verified for this session is
+    /// retained in the handoff. No caller can substitute raw metadata through
+    /// this API. Because `self` is consumed, both success and failure retire
+    /// this session and its consent state.
+    ///
+    /// ```compile_fail
+    /// fn consume_twice(
+    ///     session: nodavo_update::UpdateSession,
+    ///     request: nodavo_update::InstallRequestId,
+    /// ) {
+    ///     let _first = session.into_install_and_restart_handoff(request);
+    ///     let _second = session.into_install_and_restart_handoff(request);
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the exact session is staged and has recorded
+    /// [`InstallConsent::InstallAndRestart`].
+    pub fn into_install_and_restart_handoff(
+        self,
+        request_id: InstallRequestId,
+    ) -> Result<InstallAndRestartHandoff, UpdateRuntimeError> {
+        if self.status != UpdateStatus::ReadyToInstall {
+            return Err(if self.status == UpdateStatus::AwaitingConsent {
+                UpdateRuntimeError::ConsentRequired
+            } else {
+                UpdateRuntimeError::InvalidTransition
+            });
+        }
+        InstallAndRestartHandoff::new(request_id, self.release.signed_manifest_envelope().to_vec())
+    }
+
     /// Creates an immutable installation plan without executing an install
     /// effect. The caller must load the authenticated current rollback floor
     /// immediately before calling this method.
@@ -817,6 +864,7 @@ impl UpdateSession {
     ///
     /// Rejects missing install/restart consent, a mismatched target, or a
     /// release below the supplied durable rollback floor.
+    #[cfg(test)]
     pub(crate) fn plan_install(
         &self,
         target: InstallTarget,
@@ -829,14 +877,6 @@ impl UpdateSession {
                 UpdateRuntimeError::InvalidTransition
             });
         }
-        if target.platform() != self.release.manifest().platform()
-            || target.identifier() != self.release.install_identity()
-        {
-            return Err(UpdateRuntimeError::InstallTargetMismatch);
-        }
-        if release_is_below_floor(&self.release, current_floor) {
-            return Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected));
-        }
         let effective_floor = RollbackState::new(
             self.rollback_before
                 .minimum_epoch()
@@ -846,72 +886,7 @@ impl UpdateSession {
                 .clone()
                 .max(current_floor.minimum_version().clone()),
         );
-        let plan = InstallPlan {
-            artifact: self.artifact_id(),
-            target,
-            version: self.release.manifest().version().clone(),
-            rollback_epoch: self.release.manifest().rollback_epoch(),
-            rollback_floor_after_install: RollbackStateDisk::from(
-                &self.release.rollback_state_after_install(&effective_floor),
-            ),
-        };
-        plan.validate()?;
-        Ok(plan)
-    }
-
-    /// Consumes the one-shot install/restart authorization while an external
-    /// stable supervisor holds its exclusive transaction lock.
-    ///
-    /// The rollback floor is loaded inside the locked operation immediately
-    /// before the immutable plan is derived. The returned initial journal must
-    /// be atomically authenticated and persisted before its `Prepare` action is
-    /// executed. A public, deserialized, cloned, or previously returned
-    /// [`InstallPlan`] cannot create a new supervision transaction.
-    ///
-    /// # Errors
-    ///
-    /// Rejects missing/consumed authorization, absent lock ownership, stale
-    /// rollback state, target mismatch, or invalid transaction policy. Any
-    /// failure after lock validation consumes this session fail closed.
-    pub fn begin_supervision<L, R>(
-        &mut self,
-        transaction: TransactionId,
-        old_process_exit_attempt: AttemptId,
-        target: InstallTarget,
-        policy: SupervisionPolicy,
-        transaction_lock: &mut L,
-        rollback_store: &mut R,
-    ) -> Result<SupervisionJournal, UpdateRuntimeError>
-    where
-        L: SupervisionTransactionLock,
-        R: RollbackStateStore,
-    {
-        if self.status != UpdateStatus::ReadyToInstall {
-            return Err(if self.status == UpdateStatus::AwaitingConsent {
-                UpdateRuntimeError::ConsentRequired
-            } else {
-                UpdateRuntimeError::InvalidTransition
-            });
-        }
-        transaction_lock
-            .ensure_exclusive()
-            .map_err(|_| self.fail(UpdateRuntimeError::InstallerFailed))?;
-        let current_floor = rollback_store
-            .load()
-            .map_err(|_| self.fail(UpdateRuntimeError::RollbackStateFailed))?;
-        let plan = self
-            .plan_install(target, &current_floor)
-            .map_err(|error| self.fail(error))?;
-        let journal = SupervisionJournal::from_authorized_plan(
-            transaction,
-            old_process_exit_attempt,
-            plan,
-            self.release.installed_version().clone(),
-            policy,
-        )
-        .map_err(|error| self.fail(error))?;
-        self.status = UpdateStatus::PreparingInstall;
-        Ok(journal)
+        plan_supervisor_install(&self.release, target, &effective_floor)
     }
 
     /// Resumes or starts a bounded artifact download, verifies the complete
@@ -1640,9 +1615,41 @@ fn persist_journal<J: RecoveryJournalStore>(
         .map_err(|_| UpdateRuntimeError::JournalFailed)
 }
 
+#[cfg(any(feature = "supervisor-host", test))]
 fn release_is_below_floor(release: &VerifiedRelease, floor: &RollbackState) -> bool {
     release.manifest().rollback_epoch() < floor.minimum_epoch()
         || release.manifest().version() < floor.minimum_version()
+}
+
+#[cfg(any(feature = "supervisor-host", test))]
+pub(crate) fn plan_supervisor_install(
+    release: &VerifiedRelease,
+    target: InstallTarget,
+    current_floor: &RollbackState,
+) -> Result<InstallPlan, UpdateRuntimeError> {
+    if target.platform() != release.manifest().platform()
+        || target.identifier() != release.install_identity()
+    {
+        return Err(UpdateRuntimeError::InstallTargetMismatch);
+    }
+    if release_is_below_floor(release, current_floor) {
+        return Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected));
+    }
+    let artifact = ArtifactId::new(
+        *release.artifact_sha256(),
+        release.manifest().artifact_size(),
+    )?;
+    let plan = InstallPlan {
+        artifact,
+        target,
+        version: release.manifest().version().clone(),
+        rollback_epoch: release.manifest().rollback_epoch(),
+        rollback_floor_after_install: RollbackStateDisk::from(
+            &release.rollback_state_after_install(current_floor),
+        ),
+    };
+    plan.validate()?;
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1665,7 +1672,7 @@ fn validate_install_identifier(value: &str) -> Result<(), UpdateRuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ReleaseManifest, SupervisionAction, SupervisionPhase};
+    use crate::ReleaseManifest;
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
 
@@ -1702,6 +1709,7 @@ mod tests {
                 "Nodavo.Package".to_owned()
             },
             installed_version: Version::new(1, 0, 0),
+            signed_manifest_envelope: b"test-only signed manifest envelope".to_vec(),
         }
     }
 
@@ -1883,22 +1891,6 @@ mod tests {
         }
     }
 
-    struct FakeTransactionLock {
-        exclusive: bool,
-        checks: usize,
-    }
-
-    impl SupervisionTransactionLock for FakeTransactionLock {
-        fn ensure_exclusive(&mut self) -> Result<(), ExternalEffectError> {
-            self.checks += 1;
-            if self.exclusive {
-                Ok(())
-            } else {
-                Err(ExternalEffectError)
-            }
-        }
-    }
-
     struct FakeRollbackStore {
         state: RollbackState,
         loads: usize,
@@ -2012,7 +2004,7 @@ mod tests {
         let bytes = b"verified artifact bytes";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         let mut staging = FakeStage {
             bytes: bytes[..8].to_vec(),
@@ -2036,7 +2028,7 @@ mod tests {
         let bytes = b"complete replacement body";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         let mut staging = FakeStage {
             bytes: bytes[..5].to_vec(),
@@ -2059,7 +2051,7 @@ mod tests {
         let bytes = b"resumable verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         let mut staging = FakeStage::default();
         let mut interrupted = FakeDownloader::new(bytes);
@@ -2091,7 +2083,7 @@ mod tests {
         assert_eq!(expected.len(), delivered.len());
         let mut session = UpdateSession::new(verified_release(expected, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         let mut staging = FakeStage::default();
         let mut downloader = FakeDownloader::new(delivered);
@@ -2111,7 +2103,7 @@ mod tests {
         assert_eq!(expected.len(), delivered.len());
         let mut session = UpdateSession::new(verified_release(expected, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         let mut staging = FakeStage {
             fail_discard: true,
@@ -2133,7 +2125,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2166,124 +2158,73 @@ mod tests {
     }
 
     #[test]
-    fn supervision_consumes_one_shot_authorization_under_lock_and_fresh_floor() {
+    fn handoff_requires_staging_and_distinct_install_restart_consent() {
         let bytes = b"verified artifact";
-        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
-        session
-            .decide(UserConsent::ApproveDownloadAndInstall)
-            .unwrap();
-        session
-            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
-            .unwrap();
-        session
-            .authorize_install(InstallConsent::InstallAndRestart)
-            .unwrap();
-        let mut transaction_lock = FakeTransactionLock {
-            exclusive: true,
-            checks: 0,
-        };
-        let mut rollback = FakeRollbackStore::new();
-        let policy = SupervisionPolicy::new(2, 2, 30_000, 90_000, 60_000, 90_000, 30_000).unwrap();
+        let request = InstallRequestId::new([0x51; 32]).unwrap();
 
-        let journal = session
-            .begin_supervision(
-                TransactionId::new([1; 32]).unwrap(),
-                AttemptId::new([2; 32]).unwrap(),
-                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
-                policy,
-                &mut transaction_lock,
-                &mut rollback,
-            )
-            .unwrap();
-        assert_eq!(journal.phase(), SupervisionPhase::Preparing);
+        let awaiting = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         assert!(matches!(
-            journal.next_action().unwrap(),
-            SupervisionAction::Prepare { .. }
+            awaiting.into_install_and_restart_handoff(request),
+            Err(UpdateRuntimeError::ConsentRequired)
         ));
-        assert_eq!(session.status(), UpdateStatus::PreparingInstall);
-        assert_eq!(transaction_lock.checks, 1);
-        assert_eq!(rollback.loads, 1);
-        assert_eq!(
-            session.begin_supervision(
-                TransactionId::new([3; 32]).unwrap(),
-                AttemptId::new([4; 32]).unwrap(),
-                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
-                policy,
-                &mut transaction_lock,
-                &mut rollback,
-            ),
+
+        let mut unstaged = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        unstaged
+            .decide(UserConsent::ApproveDownloadAndStage)
+            .unwrap();
+        assert!(matches!(
+            unstaged.into_install_and_restart_handoff(request),
             Err(UpdateRuntimeError::InvalidTransition)
-        );
-        assert_eq!(transaction_lock.checks, 1);
-        assert_eq!(rollback.loads, 1);
+        ));
 
-        let mut stale = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
-        stale
-            .decide(UserConsent::ApproveDownloadAndInstall)
-            .unwrap();
-        stale
+        let mut staged = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        staged.decide(UserConsent::ApproveDownloadAndStage).unwrap();
+        staged
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
             .unwrap();
-        stale
-            .authorize_install(InstallConsent::InstallAndRestart)
-            .unwrap();
-        let mut raised_floor = FakeRollbackStore {
-            state: RollbackState::new(8, Version::new(2, 1, 0)),
-            loads: 0,
-            advances: 0,
-            fail_advance: false,
-        };
-        assert_eq!(
-            stale.begin_supervision(
-                TransactionId::new([5; 32]).unwrap(),
-                AttemptId::new([6; 32]).unwrap(),
-                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
-                policy,
-                &mut transaction_lock,
-                &mut raised_floor,
-            ),
-            Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected))
-        );
-        assert_eq!(raised_floor.loads, 1);
-        assert!(matches!(stale.status(), UpdateStatus::Failed(_)));
-    }
+        assert!(matches!(
+            staged.into_install_and_restart_handoff(request),
+            Err(UpdateRuntimeError::InvalidTransition)
+        ));
 
-    #[test]
-    fn supervision_requires_lock_before_loading_floor_or_consuming_effects() {
-        let bytes = b"verified artifact";
-        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
-        session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+        let mut accepted = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        accepted
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
-        session
+        accepted
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
             .unwrap();
-        session
+        accepted
             .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
-        let mut transaction_lock = FakeTransactionLock {
-            exclusive: false,
-            checks: 0,
-        };
-        let mut rollback = FakeRollbackStore::new();
+        let handoff = accepted.into_install_and_restart_handoff(request).unwrap();
+        assert_eq!(handoff.request_id(), request);
+        assert_eq!(
+            handoff.signed_manifest_envelope(),
+            b"test-only signed manifest envelope"
+        );
 
-        assert_eq!(
-            session.begin_supervision(
-                TransactionId::new([1; 32]).unwrap(),
-                AttemptId::new([2; 32]).unwrap(),
-                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
-                SupervisionPolicy::new(2, 2, 30_000, 90_000, 60_000, 90_000, 30_000).unwrap(),
-                &mut transaction_lock,
-                &mut rollback,
-            ),
-            Err(UpdateRuntimeError::InstallerFailed)
+        let mut declined = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        declined.decide(UserConsent::Decline).unwrap();
+        assert!(matches!(
+            declined.into_install_and_restart_handoff(request),
+            Err(UpdateRuntimeError::InvalidTransition)
+        ));
+
+        let mut failed = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        failed.decide(UserConsent::ApproveDownloadAndStage).unwrap();
+        assert!(
+            failed
+                .stage_download(
+                    &mut FakeDownloader::new(b"wrong artifact"),
+                    &mut FakeStage::default(),
+                )
+                .is_err()
         );
-        assert_eq!(transaction_lock.checks, 1);
-        assert_eq!(rollback.loads, 0);
-        assert_eq!(
-            session.status(),
-            UpdateStatus::Failed(UpdateRuntimeError::InstallerFailed)
-        );
+        assert!(matches!(
+            failed.into_install_and_restart_handoff(request),
+            Err(UpdateRuntimeError::InvalidTransition)
+        ));
     }
 
     #[test]
@@ -2313,7 +2254,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2364,7 +2305,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2416,7 +2357,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2468,7 +2409,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2490,7 +2431,7 @@ mod tests {
         let mut same_platform =
             UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         same_platform
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         same_platform
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2514,7 +2455,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2549,7 +2490,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2630,7 +2571,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
@@ -2756,7 +2697,7 @@ mod tests {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
         session
-            .decide(UserConsent::ApproveDownloadAndInstall)
+            .decide(UserConsent::ApproveDownloadAndStage)
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())

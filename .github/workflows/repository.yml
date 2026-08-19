@@ -23,6 +23,38 @@ jobs:
         run: python3 .github/scripts/check_docs.py
       - name: Validate Rust workspace metadata
         run: cargo metadata --format-version 1 --no-deps
+      - name: Keep supervisor reducer APIs out of the agent build
+        run: |
+          check_agent_feature_tree() {
+            feature_tree=$(cargo tree --locked -e features -p nodavo-agent "$@") || {
+              echo "could not inspect nodavo-agent feature tree: $*" >&2
+              exit 1
+            }
+            if grep -F 'nodavo-update feature "supervisor-host"' <<<"$feature_tree"; then
+              echo "nodavo-agent enabled the supervisor-only update reducer feature: $*" >&2
+              exit 1
+            fi
+          }
+          check_agent_feature_tree --no-default-features --target aarch64-apple-darwin
+          check_agent_feature_tree --no-default-features --target x86_64-apple-darwin
+          check_agent_feature_tree --no-default-features \
+            --features development-unverified-local-ipc \
+            --target aarch64-apple-darwin
+          check_agent_feature_tree --no-default-features \
+            --features development-unverified-local-ipc \
+            --target x86_64-apple-darwin
+          check_agent_feature_tree --no-default-features \
+            --features windows-ui-auth-development \
+            --target x86_64-pc-windows-msvc
+          check_agent_feature_tree --no-default-features \
+            --features windows-ui-auth-development \
+            --target aarch64-pc-windows-msvc
+          check_agent_feature_tree --no-default-features \
+            --features windows-ui-auth-release \
+            --target x86_64-pc-windows-msvc
+          check_agent_feature_tree --no-default-features \
+            --features windows-ui-auth-release \
+            --target aarch64-pc-windows-msvc
       - name: Verify DCO sign-offs
         if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
         env:
@@ -52,6 +84,10 @@ jobs:
         run: cargo fmt --all --check
       - name: Check the Rust workspace on macOS
         run: cargo check --workspace --locked
+      - name: Test both updater trust-boundary feature sets
+        run: |
+          cargo test -p nodavo-update --locked
+          cargo test -p nodavo-update --locked --features supervisor-host
 
   swift-macos:
     name: Swift packages on macOS

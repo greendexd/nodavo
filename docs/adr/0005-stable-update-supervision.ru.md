@@ -1,4 +1,4 @@
-<!-- doc-id: adr-0005-stable-update-supervision; lang: ru; translation-of: 0005-stable-update-supervision.md; revision: 1 -->
+<!-- doc-id: adr-0005-stable-update-supervision; lang: ru; translation-of: 0005-stable-update-supervision.md; revision: 2 -->
 
 # ADR-0005: Стабильный внешний supervisor для активации обновлений
 
@@ -17,15 +17,19 @@ Activation меняет исполняемый код и не может нас�
 
 Production activation будет принадлежать небольшому отдельно подписанному per-user supervisor, установленному вне заменяемого application target. Supervisor не является компонентом peer session и не получает authority для input, clipboard, file transfer, discovery или сетевого peer. Текущий agent отвечает только за release check, verified staging, отдельное одноразовое решение **Установить и перезапустить**, постоянный bounded quiescence и content-free status projection.
 
+Единственный обычный API, способный создать install request, потребляет точную `ReadyToInstall` session после этого отдельного решения. Он возвращает ограниченный handoff, содержащий только ненулевой one-shot request ID и точный исходный signed manifest envelope, сохранённый при release verification. Codec не может переносить выбранные caller filesystem path, installation plan, artifact name, transaction, process attempt, phase или reducer action, а обычные callers не могут создать его из raw envelope bytes. Default-сборка agent может прочитать request ID и кодировать request, но не может его декодировать или линковать supervisor admission, host, reducer и action APIs. Эти receiving APIs находятся за non-default feature `supervisor-host`, а repository и platform packaging gates отклоняют этот feature в agent artifacts. Это только packaging/build trust boundary; она не заменяет mutual process authentication, protected storage или exclusive locking.
+
 Platform-neutral crate `nodavo-update` задаёт bounded write-ahead reducer. Его authenticated journal связывает:
 
-- случайный идентификатор transaction;
+- ненулевой одноразовый install-request identifier и случайный сгенерированный supervisor идентификатор transaction;
 - точный candidate artifact, install target, version, rollback epoch и identity каждой process attempt;
 - точный сохранённый predecessor artifact и installer evidence;
 - ограниченное число candidate-start, health, predecessor-start и old-process-exit attempts;
 - текущую фазу и rollback floor, который должен получиться после healthy install.
 
-Каждый внешний эффект разрешён одной уже durable фазой. Supervisor сохраняет следующую фазу до prepare, activation, запуска process, rollback или удаления backup. Один timeout никогда не разрешает второй process или replacement, пока предыдущий точный process может быть жив; сначала требуется process-bound stop и наблюдение exit.
+Initial supervisor admission предварительно резервирует request без его durable consumption и доказывает отсутствие active journal, удерживая exclusive lock. До initial persistence он аутентифицирует точный old process и фиксированные installed target/version, загружает свежий rollback floor, повторно проверяет точный исходный signed envelope по supervisor-local policy, локально выводит plan, заново открывает и хэширует точный sealed content-addressed artifact и генерирует identities transaction и old-process attempt. Затем он атомарно коммитит request replay tombstone, exact old-process binding и schema 3 journal и перечитывает точные аутентифицированные bytes. Ошибки до вызова persistence не разрешают никаких actions. После вызова persistence любая ошибка или неточный authenticated reload означает commit ambiguity: admission и lock остаются закрытыми, и только recovery из аутентифицированного хранилища может установить, разрешён ли retry, reducer action или новый request.
+
+Каждый последующий внешний эффект разрешён одной уже durable фазой. Supervisor сохраняет следующую фазу до prepare, activation, запуска process, rollback или удаления backup. Один timeout никогда не разрешает второй process или replacement, пока предыдущий точный process может быть жив; сначала требуется process-bound stop и наблюдение exit.
 
 Порядок commit:
 
@@ -39,11 +43,11 @@ Platform-neutral crate `nodavo-update` задаёт bounded write-ahead reducer.
 
 Platform adapters остаются effect boundaries. Для macOS нужны точный подписанный/notarized universal bundle, private immutable candidate slot, same-volume atomic exchange и отдельно зарегистрированный подписанный supervisor. Для direct-signed Windows нужны точные candidate и predecessor MSIXBundle, four-part package identities, отдельно установленный supervisor package и platform package staging/registration. Microsoft Store builds используют Store-owned updates и не заявляют Nodavo-controlled downgrade без отдельной подтверждённой схемы.
 
-Текущий pre-alpha source реализует только pure supervision policy и неактивирующие platform validation/staging primitives. Он не предоставляет installation IPC, не запускает supervisor, не активирует package и не заявляет power-loss qualification.
+Текущий pre-alpha source реализует только этот bounded handoff contract, feature-gated pure supervision policy и неактивирующие platform validation/staging primitives. Он не предоставляет authenticated supervisor IPC, защищённое production store, supervisor executable, activation или process adapters, package installation либо power-loss qualification.
 
 ## Влияние на безопасность и приватность
 
-Стабильный supervisor исключает candidate code из recovery trust root и делает явными consent, process identity, artifact identity, retry и порядок rollback. Supervisor IPC должен использовать фиксированные взаимные signed-code requirements, эквивалентные существующей границе UI/agent. Public status и logs содержат только bounded phases, versions и общие failure categories; в них нет paths, artifact names, hashes, process identifiers, package family names, transaction identifiers, signing subjects или keys.
+Стабильный supervisor исключает candidate code из recovery trust root и делает явными consent, process identity, artifact identity, retry и порядок rollback. Потребление staged session не позволяет использовать одно решение для создания нескольких handoffs, а повторная проверка точного envelope и связывание request ID не позволяют old agent передать authoritative plan или повторно использовать закоммиченный request. Рассмотрение любого результата после persistence как outcome unknown не позволяет неоднозначному commit разрешить вторую transaction или effect. Supervisor IPC должен использовать фиксированные взаимные signed-code requirements, эквивалентные существующей границе UI/agent. Public status и logs содержат только bounded phases, versions и общие failure categories; в них нет paths, artifact names, hashes, process identifiers, package family names, request/transaction identifiers, signing subjects или keys.
 
 User-owned storage не может предотвратить произвольный denial of service со стороны владельца account. Поэтому production state macOS требует supervisor-only Data Protection Keychain entitlement. Windows DPAPI и user-owned files защищают confidentiality и случайное повреждение, но не дают честной rollback-resistance гарантии против invasive same-user process; security model 1.0 исключает compromise уже авторизованных процессов, а более сильное persistence claim требует отдельно квалифицированного principal или broker.
 

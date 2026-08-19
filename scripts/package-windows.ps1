@@ -1138,6 +1138,22 @@ else {
 }
 
 $cargo = Get-RequiredCommand 'cargo.exe'
+foreach ($rustTarget in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
+    $agentFeatureTree = & $cargo.Source @(
+        'tree', '--locked', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml'),
+        '-e', 'features', '-p', 'nodavo-agent',
+        '--no-default-features', '--features', $rustAuthFeature,
+        '--target', $rustTarget
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not inspect the exact nodavo-agent Cargo feature tree for $rustTarget."
+    }
+    if (($agentFeatureTree -join "`n").IndexOf(
+            'nodavo-update feature "supervisor-host"',
+            [StringComparison]::Ordinal) -ge 0) {
+        throw 'nodavo-agent must not enable the supervisor-only update reducer feature.'
+    }
+}
 $rustup = Get-RequiredCommand 'rustup.exe'
 $dotnet = Get-RequiredCommand 'dotnet.exe'
 $makeAppx = Find-WindowsSdkTool 'makeappx.exe'

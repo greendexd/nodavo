@@ -4,13 +4,17 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+[features]
+default = []
+supervisor-host = ["nodavo-update/supervisor-host"]
+
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 ed25519-dalek = "2"
 libfuzzer-sys = "0.4"
-nodavo-update = { path = ".." }
+nodavo-update = { path = "..", default-features = false }
 semver = "1"
 
 [[bin]]
@@ -26,6 +30,15 @@ path = "fuzz_targets/persistent_state.rs"
 test = false
 doc = false
 bench = false
+required-features = ["supervisor-host"]
+
+[[bin]]
+name = "install_handoff"
+path = "fuzz_targets/install_handoff.rs"
+test = false
+doc = false
+bench = false
+required-features = ["supervisor-host"]
 
 [workspace]
 members = ["."]

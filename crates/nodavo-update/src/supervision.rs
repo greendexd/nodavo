@@ -12,7 +12,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ArtifactId, ExternalEffectError, InstallPlan, InstallTarget, MAX_RECOVERY_JOURNAL_BYTES,
+    ArtifactId, InstallPlan, InstallRequestId, InstallTarget, MAX_RECOVERY_JOURNAL_BYTES,
     MAX_VERSION_BYTES, RollbackState, UpdateRuntimeError,
 };
 
@@ -25,19 +25,7 @@ pub const MIN_SUPERVISION_TIMEOUT_MS: u64 = 1_000;
 /// Largest persisted supervision timeout (ten minutes).
 pub const MAX_SUPERVISION_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 
-const SUPERVISION_JOURNAL_SCHEMA: u16 = 2;
-
-/// Host boundary proving that creation consumed authorization while the stable
-/// supervisor held its exclusive per-installation transaction lock.
-pub trait SupervisionTransactionLock {
-    /// Verifies that the caller currently owns the exclusive transaction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if exclusivity cannot be proved without acquiring a
-    /// second or weaker lock.
-    fn ensure_exclusive(&mut self) -> Result<(), ExternalEffectError>;
-}
+const SUPERVISION_JOURNAL_SCHEMA: u16 = 3;
 
 /// Random transaction identity used to reject stale candidate signals.
 ///
@@ -637,8 +625,9 @@ pub enum SupervisionAction {
 /// Encoded bytes do not authenticate themselves. Production storage must
 /// provide OS-protected integrity, atomic replacement, deletion protection,
 /// and exclusive single-writer ownership outside the target being replaced.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SupervisionJournal {
+    install_request_id: InstallRequestId,
     transaction: TransactionId,
     old_process_exit_attempt: AttemptId,
     plan: InstallPlan,
@@ -649,6 +638,20 @@ pub struct SupervisionJournal {
     phase: SupervisionPhase,
 }
 
+impl fmt::Debug for SupervisionJournal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupervisionJournal")
+            .field("plan", &self.plan)
+            .field("previous_version", &self.previous_version)
+            .field("recovery", &self.recovery)
+            .field("candidate", &self.candidate)
+            .field("policy", &self.policy)
+            .field("phase", &self.phase)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SupervisionJournal {
     /// Creates the first write-ahead journal after distinct install/restart
     /// consent has already been recorded by the authenticated host.
@@ -657,6 +660,7 @@ impl SupervisionJournal {
     ///
     /// Rejects an invalid plan, policy, transaction, or previous version.
     pub(crate) fn from_authorized_plan(
+        install_request_id: InstallRequestId,
         transaction: TransactionId,
         old_process_exit_attempt: AttemptId,
         plan: InstallPlan,
@@ -664,6 +668,7 @@ impl SupervisionJournal {
         policy: SupervisionPolicy,
     ) -> Result<Self, UpdateRuntimeError> {
         let journal = Self {
+            install_request_id,
             transaction,
             old_process_exit_attempt,
             plan,
@@ -675,6 +680,12 @@ impl SupervisionJournal {
         };
         journal.validate()?;
         Ok(journal)
+    }
+
+    /// One-shot request bound to this exact durable transaction.
+    #[must_use]
+    pub const fn install_request_id(&self) -> InstallRequestId {
+        self.install_request_id
     }
 
     #[must_use]
@@ -1348,6 +1359,7 @@ impl SupervisionJournal {
         self.validate()?;
         let encoded = serde_json::to_vec(&SupervisionJournalDisk {
             schema: SUPERVISION_JOURNAL_SCHEMA,
+            install_request_id: self.install_request_id,
             transaction: self.transaction,
             old_process_exit_attempt: self.old_process_exit_attempt,
             plan: self.plan.clone(),
@@ -1380,6 +1392,7 @@ impl SupervisionJournal {
             return Err(UpdateRuntimeError::CorruptPersistentState);
         }
         let journal = Self {
+            install_request_id: disk.install_request_id,
             transaction: disk.transaction,
             old_process_exit_attempt: disk.old_process_exit_attempt,
             plan: disk.plan,
@@ -1394,6 +1407,7 @@ impl SupervisionJournal {
     }
 
     fn validate(&self) -> Result<(), UpdateRuntimeError> {
+        InstallRequestId::new(*self.install_request_id.as_bytes())?;
         TransactionId::new(*self.transaction.as_bytes())?;
         AttemptId::new(*self.old_process_exit_attempt.as_bytes())?;
         self.plan.validate()?;
@@ -1695,6 +1709,7 @@ impl SupervisionJournal {
 
     fn with_phase(&self, phase: SupervisionPhase) -> Self {
         Self {
+            install_request_id: self.install_request_id,
             transaction: self.transaction,
             old_process_exit_attempt: self.old_process_exit_attempt,
             plan: self.plan.clone(),
@@ -1711,6 +1726,7 @@ impl SupervisionJournal {
 #[serde(deny_unknown_fields)]
 struct SupervisionJournalDisk {
     schema: u16,
+    install_request_id: InstallRequestId,
     transaction: TransactionId,
     old_process_exit_attempt: AttemptId,
     plan: InstallPlan,
@@ -1777,6 +1793,10 @@ mod tests {
         AttemptId::new([byte; 32]).unwrap()
     }
 
+    fn request(byte: u8) -> InstallRequestId {
+        InstallRequestId::new([byte; 32]).unwrap()
+    }
+
     fn policy(candidate_attempts: u8, previous_attempts: u8) -> SupervisionPolicy {
         SupervisionPolicy::new(
             candidate_attempts,
@@ -1792,6 +1812,7 @@ mod tests {
 
     fn journal_with_policy(policy: SupervisionPolicy) -> SupervisionJournal {
         SupervisionJournal::from_authorized_plan(
+            request(11),
             transaction(1),
             attempt(10),
             InstallPlan::test_macos(Version::new(2, 0, 0), 7),
@@ -2843,7 +2864,22 @@ mod tests {
         );
 
         let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-        value["schema"] = serde_json::Value::from(1);
+        value["schema"] = serde_json::Value::from(2);
+        assert_eq!(
+            SupervisionJournal::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(UpdateRuntimeError::CorruptPersistentState)
+        );
+
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value.as_object_mut().unwrap().remove("install_request_id");
+        assert_eq!(
+            SupervisionJournal::decode(&serde_json::to_vec(&value).unwrap()),
+            Err(UpdateRuntimeError::CorruptPersistentState)
+        );
+
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value["install_request_id"] =
+            serde_json::Value::Array(std::iter::repeat_n(serde_json::Value::from(0), 32).collect());
         assert_eq!(
             SupervisionJournal::decode(&serde_json::to_vec(&value).unwrap()),
             Err(UpdateRuntimeError::CorruptPersistentState)
@@ -2854,6 +2890,7 @@ mod tests {
     fn journal_rejects_non_previous_version_and_redacts_transaction_debug() {
         assert_eq!(
             SupervisionJournal::from_authorized_plan(
+                request(11),
                 transaction(1),
                 attempt(10),
                 InstallPlan::test_macos(Version::new(2, 0, 0), 7),

@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 11 -->
+<!-- doc-id: architecture; lang: en; revision: 12 -->
 
 # Architecture
 
@@ -49,11 +49,15 @@ No hosted control plane, account service, relay, or telemetry collector is requi
 | `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard, OLE, private update staging, and read-only Appx inspection |
 | `nodavo-local-ipc` | Authenticated UI ↔ agent protocol and OS access controls |
 | `nodavo-agent` | Process orchestration and lifecycle |
-| `nodavo-update` | Signed manifests, verification, staging contracts, and an effect-free external-supervisor reducer |
+| `nodavo-update` | Signed manifests, verification, staging contracts, an encode-only one-shot handoff for ordinary callers, and a feature-gated external-supervisor reducer |
 
 Crates use dependency injection at platform and transport boundaries. Tests can replace both with deterministic virtual adapters.
 
-Update activation is intentionally outside the running UI and agent. The source-only supervisor reducer authorizes one durable external effect at a time and binds exact candidate, predecessor, process-attempt, timeout, health, and rollback-floor evidence. Platform crates currently stop at validation/staging boundaries: macOS retains a sealed signed universal tree but exposes no replacement primitive, and Windows stages privately and inspects Appx content without deployment. A separately packaged supervisor, protected persistent stores, activation adapters, restart/health IPC, and physical power-loss qualification do not yet exist.
+Update activation is intentionally outside the running UI and agent. After verified staging and a distinct **Install and restart** decision, consuming the exact `ReadyToInstall` session is the only ordinary API that produces a handoff. Its fixed bounded codec carries only a nonzero one-shot request ID and the exact original signed manifest envelope; it cannot carry a caller-selected path, plan, artifact name, transaction, attempt, phase, or action. The default agent build can encode that opaque request but excludes handoff decoding and all supervisor host, admission, reducer, and action APIs. Repository CI and macOS/Windows packaging gates reject the non-default `supervisor-host` feature from agent artifacts. This is a packaging/build trust boundary only; a real supervisor must still mutually authenticate the process and current installation, hold an exclusive protected transaction, and authenticate persistent state.
+
+With `supervisor-host`, initial admission provisionally reserves the request without durably consuming it, then authenticates the exact current target/version, loads a fresh rollback floor, authoritatively re-verifies the original signed envelope, derives the plan locally, and reopens and rehashes the exact sealed content-addressed artifact. Supervisor-generated transaction and old-process-attempt identities are stored with the request ID in journal schema 3. The request tombstone, exact old-process binding, and journal must be committed atomically and reloaded through the authenticated store before reducer execution. Once persistence is called, an error or non-exact reload is commit-ambiguous: admission and the lock remain closed, and only authenticated-store recovery may establish whether any retry or action is allowed.
+
+The source-only reducer then authorizes one already-durable external effect at a time and binds exact candidate, predecessor, process-attempt, timeout, health, and rollback-floor evidence. Platform crates currently stop at validation/staging boundaries: macOS retains a sealed signed universal tree but exposes no replacement primitive, and Windows stages privately and inspects Appx content without deployment. A separately packaged supervisor executable, authenticated supervisor IPC, protected persistent stores, activation adapters, restart/health/rollback process wiring, and physical power-loss qualification do not yet exist.
 
 ## Transport model
 

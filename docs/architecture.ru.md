@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 11 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 12 -->
 
 # Архитектура
 
@@ -49,11 +49,15 @@ flowchart TB
 | `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard, OLE, private update staging и read-only Appx inspection |
 | `nodavo-local-ipc` | Authenticated UI ↔ agent protocol и OS access controls |
 | `nodavo-agent` | Process orchestration и lifecycle |
-| `nodavo-update` | Signed manifests, verification, staging contracts и effect-free reducer внешнего supervisor |
+| `nodavo-update` | Signed manifests, verification, staging contracts, encode-only одноразовый handoff для обычных callers и feature-gated reducer внешнего supervisor |
 
 Platform и transport boundaries используют dependency injection, чтобы тесты заменяли их детерминированными virtual adapters.
 
-Activation обновления намеренно находится вне работающих UI и agent. Source-only reducer supervisor разрешает по одному durable external effect и связывает точный evidence candidate, predecessor, process attempt, timeout, health и rollback floor. Platform crates пока останавливаются на границе validation/staging: macOS удерживает sealed signed universal tree, но не предоставляет replacement primitive, а Windows выполняет приватный staging и Appx inspection без deployment. Отдельно упакованный supervisor, защищённые persistent stores, activation adapters, restart/health IPC и физическая power-loss квалификация ещё отсутствуют.
+Activation обновления намеренно находится вне работающих UI и agent. После verified staging и отдельного решения **Установить и перезапустить** handoff через обычный API можно получить только путём потребления точной `ReadyToInstall` session. Его фиксированный bounded codec переносит лишь ненулевой one-shot request ID и точный исходный signed manifest envelope; он не может переносить выбранные caller path, plan, artifact name, transaction, attempt, phase или action. Default-сборка agent может кодировать этот opaque request, но исключает decoding handoff и все APIs supervisor host, admission, reducer и actions. Repository CI и packaging macOS/Windows отклоняют non-default feature `supervisor-host` в agent artifacts. Это только packaging/build trust boundary; реальный supervisor всё равно обязан взаимно аутентифицировать process и текущую установку, удерживать exclusive protected transaction и аутентифицировать persistent state.
+
+С feature `supervisor-host` initial admission предварительно резервирует request без его durable consumption, затем аутентифицирует точные текущие target/version, загружает свежий rollback floor, authoritative повторно проверяет исходный signed envelope, локально выводит plan и заново открывает и хэширует точный sealed content-addressed artifact. Сгенерированные supervisor identities transaction и old-process attempt сохраняются вместе с request ID в schema 3 journal. Request tombstone, exact old-process binding и journal должны быть атомарно закоммичены и перечитаны через аутентифицированное хранилище до выполнения reducer. После вызова persistence ошибка или неточное чтение означают commit ambiguity: admission и lock остаются закрытыми, и только recovery через аутентифицированное хранилище может установить, разрешены ли retry или action.
+
+После этого source-only reducer разрешает по одному уже durable external effect и связывает точный evidence candidate, predecessor, process attempt, timeout, health и rollback floor. Platform crates пока останавливаются на границе validation/staging: macOS удерживает sealed signed universal tree, но не предоставляет replacement primitive, а Windows выполняет приватный staging и Appx inspection без deployment. Отдельно упакованный supervisor executable, authenticated supervisor IPC, защищённые persistent stores, activation adapters, process wiring для restart/health/rollback и физическая power-loss квалификация ещё отсутствуют.
 
 ## Модель транспорта
 

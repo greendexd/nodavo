@@ -8,6 +8,13 @@ rust-version.workspace = true
 description = "Signed release verification and effect-isolated update orchestration"
 publish = false
 
+[features]
+default = []
+# Packaging/build trust boundary: only the separately packaged stable
+# supervisor may enable reducer admission/action APIs. Runtime peer
+# authentication and protected state remain independently mandatory.
+supervisor-host = []
+
 [dependencies]
 base64.workspace = true
 ed25519-dalek.workspace = true

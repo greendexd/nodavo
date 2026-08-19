@@ -382,7 +382,7 @@ impl UpdateCoordinator {
         match offer.session.status() {
             UpdateStatus::AwaitingConsent => offer
                 .session
-                .decide(UserConsent::ApproveDownloadAndInstall)
+                .decide(UserConsent::ApproveDownloadAndStage)
                 .map_err(|_| CoordinatorError::InvalidTransition)?,
             UpdateStatus::DownloadPaused { .. } => {}
             _ => {

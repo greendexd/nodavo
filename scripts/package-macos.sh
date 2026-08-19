@@ -210,7 +210,6 @@ RUST_PRODUCT_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
     || fail "could not read the exact nodavo-agent package version"
 [[ "$VERSION" == "$RUST_PRODUCT_VERSION" ]] \
     || fail "--version ${VERSION} does not match nodavo-agent ${RUST_PRODUCT_VERSION}"
-
 mkdir -p "$OUTPUT_DIRECTORY"
 OUTPUT_DIRECTORY=$(cd "$OUTPUT_DIRECTORY" && pwd -P)
 
@@ -267,6 +266,17 @@ else
     SWIFT_BUILD_FLAGS=(-Xswiftc -DNODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC)
     RUST_AUTH_FEATURES+=(--features development-unverified-local-ipc)
 fi
+for RUST_TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
+    AGENT_FEATURE_TREE=$(cargo tree --locked \
+        --manifest-path "${REPOSITORY_ROOT}/Cargo.toml" \
+        -e features -p nodavo-agent \
+        "${RUST_AUTH_FEATURES[@]}" --target "$RUST_TARGET") \
+        || fail "could not inspect the exact nodavo-agent feature tree for ${RUST_TARGET}"
+    if grep -F 'nodavo-update feature "supervisor-host"' \
+        <<<"$AGENT_FEATURE_TREE" >/dev/null; then
+        fail "nodavo-agent must not enable the supervisor-only update reducer feature"
+    fi
+done
 swift build --package-path "$MACOS_SOURCE" --scratch-path "$SWIFT_ARM_SCRATCH" \
     --configuration release --triple "arm64-apple-macosx${MINIMUM_MACOS_VERSION}" \
     --product Nodavo --disable-index-store "${SWIFT_BUILD_FLAGS[@]}"
