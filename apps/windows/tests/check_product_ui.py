@@ -457,6 +457,10 @@ assert certificate_policy < architecture_loop, "signer pin must be embedded befo
 assert metadata_properties < architecture_loop, "C# server policy must be set before .NET builds"
 assert "'--no-default-features'" in package_script
 assert "'--features', $rustAuthFeature" in package_script
+assert "& $cargo @(" in package_script
+assert "$cargo.Source" not in package_script, (
+    "Get-RequiredCommand already returns the cargo executable path"
+)
 assert "NODAVO_WINDOWS_AUTH_SIGNER_CERT_SHA256" in package_script
 assert "NODAVO_WINDOWS_AUTH_PACKAGE_FAMILY_NAME" in package_script
 assert "NODAVO_WINDOWS_AUTH_PUBLISHER" in package_script

@@ -1139,7 +1139,7 @@ else {
 
 $cargo = Get-RequiredCommand 'cargo.exe'
 foreach ($rustTarget in @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc')) {
-    $agentFeatureTree = & $cargo.Source @(
+    $agentFeatureTree = & $cargo @(
         'tree', '--locked', '--manifest-path', (Join-Path $repositoryRoot 'Cargo.toml'),
         '-e', 'features', '-p', 'nodavo-agent',
         '--no-default-features', '--features', $rustAuthFeature,
