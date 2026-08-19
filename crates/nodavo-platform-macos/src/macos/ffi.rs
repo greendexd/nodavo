@@ -1,6 +1,8 @@
 //! The only direct native FFI boundary in this crate.
 
 use std::ffi::{CString, c_char, c_void};
+use std::fs::File;
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{self, NonNull};
 use std::rc::Rc;
@@ -34,6 +36,7 @@ use crate::clipboard::{
     MacClipboardError, NativeClipboardRepresentation, NativeClipboardSnapshot, PasteboardTarget,
 };
 use crate::keychain::{KeychainError, MAX_KEYCHAIN_SECRET_BYTES, StoreDisposition};
+use crate::update::MacUpdateBundlePolicy;
 use nodavo_clipboard::{
     MAX_HTML_BYTES, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, NativeClipboardRevision, RepresentationKind,
 };
@@ -54,6 +57,17 @@ const PASTEBOARD_INVALID_KIND: i32 = 8;
 const PASTEBOARD_UTF8_TEXT: u8 = 1;
 const PASTEBOARD_HTML: u8 = 2;
 const PASTEBOARD_PNG: u8 = 3;
+
+const UPDATE_VERSION_CAPACITY: usize = 129;
+const UPDATE_BUILD_CAPACITY: usize = 65;
+const UPDATE_CDHASH_BYTES: usize = 20;
+const UPDATE_TREE_HASH_BYTES: usize = 32;
+const UPDATE_CRITICAL_HANDLES: usize = 6;
+const UPDATE_OK: i32 = 0;
+const UPDATE_LAYOUT_REJECTED: i32 = 2;
+const UPDATE_IDENTITY_REJECTED: i32 = 3;
+const UPDATE_SIGNATURE_REJECTED: i32 = 4;
+const UPDATE_SYSTEM_POLICY_REJECTED: i32 = 9;
 
 const AUDIT_TOKEN_WORDS: usize = 8;
 #[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
@@ -202,7 +216,89 @@ impl Drop for RawPasteboardSnapshot {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawUpdateIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[repr(C)]
+struct RawUpdateBundleClaims {
+    identity: RawUpdateIdentity,
+    app_code_directory_hash: [u8; UPDATE_CDHASH_BYTES],
+    agent_code_directory_hash: [u8; UPDATE_CDHASH_BYTES],
+    tree_hash: [u8; UPDATE_TREE_HASH_BYTES],
+    tree_generation_hash: [u8; UPDATE_TREE_HASH_BYTES],
+    critical_fds: [i32; UPDATE_CRITICAL_HANDLES],
+    require_effective_user_owner: u8,
+    version: [c_char; UPDATE_VERSION_CAPACITY],
+    build: [c_char; UPDATE_BUILD_CAPACITY],
+}
+
+pub(crate) struct NativeUpdateBundleClaims {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) app_code_directory_hash: [u8; UPDATE_CDHASH_BYTES],
+    pub(crate) agent_code_directory_hash: [u8; UPDATE_CDHASH_BYTES],
+    pub(crate) proof: NativeUpdateTreeProof,
+    pub(crate) version: String,
+    pub(crate) build: String,
+}
+
+pub(crate) struct NativeUpdateTreeProof {
+    tree_hash: [u8; UPDATE_TREE_HASH_BYTES],
+    tree_generation_hash: [u8; UPDATE_TREE_HASH_BYTES],
+    _critical_files: Vec<File>,
+    require_effective_user_owner: bool,
+}
+
+impl NativeUpdateTreeProof {
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.tree_hash == other.tree_hash
+            && self.tree_generation_hash == other.tree_generation_hash
+            && self.require_effective_user_owner == other.require_effective_user_owner
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeUpdateValidationError {
+    Entry,
+    Layout,
+    Identity,
+    Signature,
+    SystemPolicy,
+}
+
 unsafe extern "C" {
+    fn ndv_update_open_directory(
+        path_utf8: *const c_char,
+        require_private: bool,
+        out_fd: *mut i32,
+        out_identity: *mut RawUpdateIdentity,
+    ) -> i32;
+    fn ndv_update_validate_nodavo_bundle(
+        directory_fd: i32,
+        leaf_utf8: *const c_char,
+        team_identifier_utf8: *const c_char,
+        version_utf8: *const c_char,
+        build_utf8: *const c_char,
+        app_requirement_utf8: *const c_char,
+        agent_requirement_utf8: *const c_char,
+        keychain_access_group_utf8: *const c_char,
+        require_effective_user_owner: bool,
+        out_claims: *mut RawUpdateBundleClaims,
+    ) -> i32;
+    #[cfg(test)]
+    fn ndv_update_observe_sealed_tree(
+        directory_fd: i32,
+        leaf_utf8: *const c_char,
+        require_effective_user_owner: bool,
+        out_tree_hash: *mut u8,
+        out_tree_generation_hash: *mut u8,
+    ) -> i32;
+    #[cfg(test)]
+    fn ndv_update_test_code_hash_length(path_utf8: *const c_char, out_length: *mut usize) -> i32;
     fn ndv_xpc_listener_create(
         service_name: *const c_char,
         peer_requirement: *const c_char,
@@ -253,6 +349,193 @@ unsafe extern "C" {
     -> i32;
     #[cfg(test)]
     fn ndv_pasteboard_release_named(name: *const c_void);
+}
+
+pub(crate) fn update_open_directory(path: &CString, require_private: bool) -> Result<File, ()> {
+    let mut fd = -1_i32;
+    let mut identity = RawUpdateIdentity {
+        device: 0,
+        inode: 0,
+    };
+    // SAFETY: The path is NUL-terminated and immutable, both outputs are
+    // initialized and exclusively borrowed, and native code retains nothing.
+    let status = unsafe {
+        ndv_update_open_directory(
+            path.as_ptr(),
+            require_private,
+            &raw mut fd,
+            &raw mut identity,
+        )
+    };
+    if status != UPDATE_OK || fd < 0 {
+        return Err(());
+    }
+    // SAFETY: Successful native return transfers ownership of one fresh,
+    // close-on-exec descriptor to this File.
+    let file = unsafe { File::from_raw_fd(fd) };
+    Ok(file)
+}
+
+pub(crate) fn update_validate_nodavo_bundle(
+    directory: &File,
+    leaf: &CString,
+    policy: &MacUpdateBundlePolicy,
+    require_effective_user_owner: bool,
+) -> Result<NativeUpdateBundleClaims, NativeUpdateValidationError> {
+    let team = CString::new(policy.team_identifier())
+        .map_err(|_| NativeUpdateValidationError::Identity)?;
+    let version =
+        CString::new(policy.version()).map_err(|_| NativeUpdateValidationError::Identity)?;
+    let build = CString::new(policy.build()).map_err(|_| NativeUpdateValidationError::Identity)?;
+    let app_requirement = CString::new(policy.app_requirement())
+        .map_err(|_| NativeUpdateValidationError::Identity)?;
+    let agent_requirement = CString::new(policy.agent_requirement())
+        .map_err(|_| NativeUpdateValidationError::Identity)?;
+    let keychain_group = CString::new(policy.keychain_access_group())
+        .map_err(|_| NativeUpdateValidationError::Identity)?;
+    let mut claims = RawUpdateBundleClaims {
+        identity: RawUpdateIdentity {
+            device: 0,
+            inode: 0,
+        },
+        app_code_directory_hash: [0; UPDATE_CDHASH_BYTES],
+        agent_code_directory_hash: [0; UPDATE_CDHASH_BYTES],
+        tree_hash: [0; UPDATE_TREE_HASH_BYTES],
+        tree_generation_hash: [0; UPDATE_TREE_HASH_BYTES],
+        critical_fds: [-1; UPDATE_CRITICAL_HANDLES],
+        require_effective_user_owner: 0,
+        version: [0; UPDATE_VERSION_CAPACITY],
+        build: [0; UPDATE_BUILD_CAPACITY],
+    };
+    // SAFETY: All strings are immutable and NUL-terminated, the retained
+    // directory descriptor remains live, and the initialized output is
+    // exclusively borrowed for this synchronous call.
+    let status = unsafe {
+        ndv_update_validate_nodavo_bundle(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            team.as_ptr(),
+            version.as_ptr(),
+            build.as_ptr(),
+            app_requirement.as_ptr(),
+            agent_requirement.as_ptr(),
+            keychain_group.as_ptr(),
+            require_effective_user_owner,
+            &raw mut claims,
+        )
+    };
+    match status {
+        UPDATE_OK => {
+            let critical_files = take_update_files(&mut claims.critical_fds)
+                .map_err(|()| NativeUpdateValidationError::Entry)?;
+            Ok(NativeUpdateBundleClaims {
+                device: claims.identity.device,
+                inode: claims.identity.inode,
+                app_code_directory_hash: claims.app_code_directory_hash,
+                agent_code_directory_hash: claims.agent_code_directory_hash,
+                proof: NativeUpdateTreeProof {
+                    tree_hash: claims.tree_hash,
+                    tree_generation_hash: claims.tree_generation_hash,
+                    _critical_files: critical_files,
+                    require_effective_user_owner: claims.require_effective_user_owner != 0,
+                },
+                version: decode_required_update_string(&claims.version)
+                    .map_err(|()| NativeUpdateValidationError::Identity)?,
+                build: decode_required_update_string(&claims.build)
+                    .map_err(|()| NativeUpdateValidationError::Identity)?,
+            })
+        }
+        UPDATE_LAYOUT_REJECTED => Err(NativeUpdateValidationError::Layout),
+        UPDATE_IDENTITY_REJECTED => Err(NativeUpdateValidationError::Identity),
+        UPDATE_SIGNATURE_REJECTED => Err(NativeUpdateValidationError::Signature),
+        UPDATE_SYSTEM_POLICY_REJECTED => Err(NativeUpdateValidationError::SystemPolicy),
+        _ => Err(NativeUpdateValidationError::Entry),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn update_observe_sealed_tree(
+    directory: &File,
+    leaf: &CString,
+    require_effective_user_owner: bool,
+) -> Result<NativeUpdateTreeProof, ()> {
+    let mut tree_hash = [0_u8; UPDATE_TREE_HASH_BYTES];
+    let mut tree_generation_hash = [0_u8; UPDATE_TREE_HASH_BYTES];
+    // SAFETY: The directory and leaf remain valid for this synchronous call,
+    // and both fixed-size outputs are exclusively borrowed.
+    let status = unsafe {
+        ndv_update_observe_sealed_tree(
+            directory.as_raw_fd(),
+            leaf.as_ptr(),
+            require_effective_user_owner,
+            tree_hash.as_mut_ptr(),
+            tree_generation_hash.as_mut_ptr(),
+        )
+    };
+    if status != UPDATE_OK {
+        return Err(());
+    }
+    Ok(NativeUpdateTreeProof {
+        tree_hash,
+        tree_generation_hash,
+        _critical_files: Vec::new(),
+        require_effective_user_owner,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn update_test_code_hash_length(path: &CString) -> Result<usize, ()> {
+    let mut length = 0_usize;
+    // SAFETY: The path is immutable and NUL-terminated and the scalar output
+    // is initialized and exclusively borrowed for this synchronous test call.
+    let status = unsafe { ndv_update_test_code_hash_length(path.as_ptr(), &raw mut length) };
+    if status == UPDATE_OK {
+        Ok(length)
+    } else {
+        Err(())
+    }
+}
+
+fn decode_required_update_string<const N: usize>(value: &[c_char; N]) -> Result<String, ()> {
+    let bytes = value.map(i8::cast_unsigned);
+    let end = bytes.iter().position(|byte| *byte == 0).ok_or(())?;
+    if end == 0 {
+        return Err(());
+    }
+    std::str::from_utf8(&bytes[..end])
+        .map(str::to_owned)
+        .map_err(|_| ())
+}
+
+fn take_update_files(descriptors: &mut [i32; UPDATE_CRITICAL_HANDLES]) -> Result<Vec<File>, ()> {
+    let valid = descriptors.iter().all(|descriptor| *descriptor >= 0)
+        && descriptors.iter().enumerate().all(|(index, descriptor)| {
+            !descriptors[..index]
+                .iter()
+                .any(|earlier| earlier == descriptor)
+        });
+    if !valid {
+        for index in 0..descriptors.len() {
+            let descriptor = descriptors[index];
+            if descriptor >= 0 && !descriptors[..index].contains(&descriptor) {
+                // SAFETY: Native validation only returns owned descriptors;
+                // each distinct nonnegative value is reclaimed at most once.
+                drop(unsafe { File::from_raw_fd(descriptor) });
+            }
+            descriptors[index] = -1;
+        }
+        return Err(());
+    }
+    Ok(descriptors
+        .iter_mut()
+        .map(|descriptor| {
+            let owned = *descriptor;
+            *descriptor = -1;
+            // SAFETY: Successful validation transfers each distinct descriptor
+            // exactly once and the source array is invalidated immediately.
+            unsafe { File::from_raw_fd(owned) }
+        })
+        .collect())
 }
 
 impl NativeXpcListener {

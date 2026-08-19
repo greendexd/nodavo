@@ -16,6 +16,7 @@ mod clipboard;
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 mod display_runtime;
 mod input_runtime;
+mod update;
 
 #[cfg(any(target_os = "windows", test))]
 mod windows_ipc_policy;
@@ -27,6 +28,14 @@ pub use display_runtime::{DisplaySnapshot, DisplaySnapshotState};
 pub use input_runtime::{
     ForceReleaseAcknowledgement, WindowsInputCaptureEvent, WindowsInputLifecycleEvent,
 };
+pub use update::{
+    InspectedWindowsBundle, InspectedWindowsPackage, WindowsDirectoryDurability,
+    WindowsDistribution, WindowsPackageArchitecture, WindowsPackageIdentityPolicy,
+    WindowsPackageVersion, WindowsUpdateError,
+};
+
+#[cfg(target_os = "windows")]
+pub use update::{WindowsArtifactStaging, inspect_windows_package_bundle};
 
 /// `dwExtraInfo` value attached to every Nodavo `SendInput` event.
 ///

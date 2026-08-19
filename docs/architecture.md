@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 10 -->
+<!-- doc-id: architecture; lang: en; revision: 11 -->
 
 # Architecture
 
@@ -45,13 +45,15 @@ No hosted control plane, account service, relay, or telemetry collector is requi
 | `nodavo-input` | Canonical HID events, mappings, coordinate and modifier state |
 | `nodavo-clipboard` | Text/HTML/image normalization, versioning, ownership and limits |
 | `nodavo-transfer` | Manifests, chunks, staging, BLAKE3, resume, quota and finalize |
-| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard, Keychain and signed local-IPC peer policy |
-| `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard and OLE APIs |
+| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard, Keychain, signed local-IPC policy, and validation-only sealed update bundles |
+| `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard, OLE, private update staging, and read-only Appx inspection |
 | `nodavo-local-ipc` | Authenticated UI ↔ agent protocol and OS access controls |
 | `nodavo-agent` | Process orchestration and lifecycle |
-| `nodavo-update` | Signed manifests, channels, verification and rollback metadata |
+| `nodavo-update` | Signed manifests, verification, staging contracts, and an effect-free external-supervisor reducer |
 
 Crates use dependency injection at platform and transport boundaries. Tests can replace both with deterministic virtual adapters.
+
+Update activation is intentionally outside the running UI and agent. The source-only supervisor reducer authorizes one durable external effect at a time and binds exact candidate, predecessor, process-attempt, timeout, health, and rollback-floor evidence. Platform crates currently stop at validation/staging boundaries: macOS retains a sealed signed universal tree but exposes no replacement primitive, and Windows stages privately and inspects Appx content without deployment. A separately packaged supervisor, protected persistent stores, activation adapters, restart/health IPC, and physical power-loss qualification do not yet exist.
 
 ## Transport model
 

@@ -1,10 +1,16 @@
 //! Audited Win32 FFI wrappers. Unsafe code must remain in this module.
 
+// windows-rs `#[implement]` emits always-inline pointer adapter thunks. These
+// two lints cannot be attached to only the macro expansion.
+#![allow(clippy::inline_always, clippy::ref_as_ptr)]
+
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::mem::{size_of, size_of_val};
-use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -20,16 +26,20 @@ use windows::Win32::Devices::Display::{
     GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
 use windows::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER,
-    ERROR_SUCCESS, FILETIME, GlobalFree, HANDLE, HGLOBAL, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT,
-    LocalFree, POINT, RECT, WAIT_TIMEOUT, WPARAM,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, FILETIME, GlobalFree, HANDLE,
+    HGLOBAL, HINSTANCE, HLOCAL, HWND, LPARAM, LRESULT, LocalFree, POINT, RECT, RPC_E_CHANGED_MODE,
+    S_FALSE, S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION, STG_E_INVALIDPOINTER,
+    STG_E_READFAULT, STG_E_REVERTED, STG_E_SEEKERROR, STG_E_WRITEFAULT, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     DEVMODEW, DM_DISPLAYORIENTATION, ENUM_CURRENT_SETTINGS, EnumDisplayMonitors,
     EnumDisplaySettingsW, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT,
 };
 use windows::Win32::Security::Cryptography::{
     BCRYPT_SHA256_ALGORITHM, CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptHashCertificate2,
@@ -43,20 +53,31 @@ use windows::Win32::Security::WinTrust::{
     WTHelperProvDataFromStateData, WinVerifyTrustEx,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, IsValidSid, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, IsValidSid, OBJECT_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
     TOKEN_STATISTICS, TOKEN_USER, TokenSessionId, TokenStatistics, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, MOVE_FILE_FLAGS,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetFinalPathNameByHandleW,
+    MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+    READ_CONTROL, ReOpenFile, VOLUME_NAME_GUID,
 };
 use windows::Win32::Storage::Packaging::Appx::{
-    APPLICATION_USER_MODEL_ID_MAX_LENGTH, GetApplicationUserModelId,
+    APPLICATION_USER_MODEL_ID_MAX_LENGTH, APPX_PACKAGE_ARCHITECTURE_ARM64,
+    APPX_PACKAGE_ARCHITECTURE_X64, AppxBundleFactory, AppxFactory, GetApplicationUserModelId,
     GetApplicationUserModelIdFromToken, GetPackageFamilyName, GetPackageFamilyNameFromToken,
-    GetPackageFullName, GetPackageFullNameFromToken, GetPackagePathByFullName2,
-    PACKAGE_FAMILY_NAME_MAX_LENGTH, PACKAGE_FULL_NAME_MAX_LENGTH, PACKAGE_ID,
-    PACKAGE_INFORMATION_FULL, PackageFamilyNameFromId, PackageIdFromFullName,
-    PackagePathType_Install,
+    GetPackageFullName, GetPackageFullNameFromToken, GetPackagePathByFullName2, IAppxBundleFactory,
+    IAppxFactory, IAppxManifestPackageId, PACKAGE_FAMILY_NAME_MAX_LENGTH,
+    PACKAGE_FULL_NAME_MAX_LENGTH, PACKAGE_ID, PACKAGE_INFORMATION_FULL, PackageFamilyNameFromId,
+    PackageIdFromFullName, PackagePathType_Install,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, ISequentialStream_Impl, IStream, IStream_Impl, LOCKTYPE, STATFLAG, STATSTG,
+    STGC, STGM_READ, STGTY_STREAM, STREAM_SEEK, STREAM_SEEK_CUR, STREAM_SEEK_END, STREAM_SEEK_SET,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, CountClipboardFormats, EmptyClipboard, GetClipboardData,
@@ -84,6 +105,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE, QueryFullProcessImageNameW, WaitForSingleObject,
 };
+use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::Win32::UI::HiDpi::{
     AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     GetDpiAwarenessContextForProcess, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
@@ -121,7 +143,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT,
     WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
-use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR, w};
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR, implement, w};
 use zeroize::Zeroizing;
 
 use crate::clipboard::{
@@ -2070,6 +2092,899 @@ pub(super) fn replace_file_atomic(
     unsafe {
         MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr()), flags)
             .map_err(|_| WindowsPlatformError::NativeApi)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeUpdateFileOpenError {
+    NotFound,
+    Failed,
+}
+
+impl NativeUpdateFileOpenError {
+    pub(crate) const fn is_not_found(self) -> bool {
+        matches!(self, Self::NotFound)
+    }
+}
+
+pub(crate) fn create_private_update_directory(path: &Path) -> Result<(), WindowsPlatformError> {
+    let path = nul_terminated_path(path)?;
+    with_owner_only_security_attributes(|attributes| {
+        // SAFETY: the path and owner-only security descriptor are live for the
+        // synchronous call. The protected DACL is applied at directory birth.
+        unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(attributes)) }
+            .map_err(|_| WindowsPlatformError::NativeApi)
+    })
+}
+
+pub(crate) fn open_retained_update_directory(
+    path: &Path,
+) -> Result<std::fs::File, WindowsPlatformError> {
+    let path = nul_terminated_path(path)?;
+    let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    // SAFETY: the path is a live NUL-terminated string. Read/write sharing lets
+    // this process enumerate the retained directory; absent delete sharing
+    // prevents replacement or rename of the root. READ_CONTROL is required by
+    // the immediate owner/DACL validation through GetSecurityInfo.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| WindowsPlatformError::NativeApi)?;
+    owned_handle(handle).map(std::fs::File::from)
+}
+
+pub(crate) fn canonical_fixed_volume_root(
+    drive_root: &std::fs::File,
+) -> Result<PathBuf, WindowsPlatformError> {
+    let canonical = canonical_volume_path(drive_root)?;
+    let canonical_units = nul_terminated_path(&canonical)?;
+    // SAFETY: the canonical volume-GUID root is live and NUL-terminated. A
+    // network, removable, optical, RAM, or unknown volume is not accepted for
+    // update durability.
+    if unsafe { GetDriveTypeW(PCWSTR(canonical_units.as_ptr())) } != DRIVE_FIXED {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn canonical_volume_path(
+    handle: &std::fs::File,
+) -> Result<PathBuf, WindowsPlatformError> {
+    let mut encoded = vec![0_u16; MAX_WINDOWS_PATH_UNITS];
+    let flags = VOLUME_NAME_GUID;
+    // SAFETY: the retained handle and complete mutable output buffer are live
+    // for this call. The fixed bound exceeds every accepted path.
+    let length =
+        unsafe { GetFinalPathNameByHandleW(HANDLE(handle.as_raw_handle()), &mut encoded, flags) };
+    let length = usize::try_from(length).map_err(|_| WindowsPlatformError::NativeApi)?;
+    if length == 0 || length >= encoded.len() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    encoded.truncate(length);
+    Ok(PathBuf::from(OsString::from_wide(&encoded)))
+}
+
+pub(crate) fn open_or_create_private_update_lease(
+    path: &Path,
+) -> Result<std::fs::File, WindowsPlatformError> {
+    match open_update_file(path, true, OPEN_EXISTING, None) {
+        Ok(file) => Ok(file),
+        Err(NativeUpdateFileOpenError::NotFound) => {
+            let mut created = None;
+            with_owner_only_security_attributes(|attributes| {
+                created = Some(
+                    open_update_file(path, true, CREATE_NEW, Some(attributes))
+                        .map_err(|_| WindowsPlatformError::NativeApi)?,
+                );
+                Ok(())
+            })
+            .map_err(|_| WindowsPlatformError::NativeApi)?;
+            created.ok_or(WindowsPlatformError::NativeApi)
+        }
+        Err(NativeUpdateFileOpenError::Failed) => Err(WindowsPlatformError::NativeApi),
+    }
+}
+
+pub(crate) fn create_private_update_file(
+    path: &Path,
+) -> Result<std::fs::File, WindowsPlatformError> {
+    let mut created = None;
+    with_owner_only_security_attributes(|attributes| {
+        created = Some(
+            open_update_file(path, true, CREATE_NEW, Some(attributes))
+                .map_err(|_| WindowsPlatformError::NativeApi)?,
+        );
+        Ok(())
+    })
+    .map_err(|_| WindowsPlatformError::NativeApi)?;
+    created.ok_or(WindowsPlatformError::NativeApi)
+}
+
+pub(crate) fn open_existing_update_file(
+    path: &Path,
+    writable: bool,
+) -> Result<std::fs::File, NativeUpdateFileOpenError> {
+    open_update_file(path, writable, OPEN_EXISTING, None)
+}
+
+fn open_update_file(
+    path: &Path,
+    writable: bool,
+    disposition: windows::Win32::Storage::FileSystem::FILE_CREATION_DISPOSITION,
+    security: Option<*const SECURITY_ATTRIBUTES>,
+) -> Result<std::fs::File, NativeUpdateFileOpenError> {
+    let path = nul_terminated_path(path).map_err(|_| NativeUpdateFileOpenError::Failed)?;
+    let desired_access = if writable {
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0
+    } else {
+        FILE_GENERIC_READ.0
+    };
+    let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
+    // SAFETY: the path and optional security descriptor are live for this call.
+    // No sharing is granted and reparse traversal is explicitly suppressed.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            desired_access,
+            FILE_SHARE_NONE,
+            security,
+            disposition,
+            flags,
+            None,
+        )
+    };
+    match handle {
+        Ok(handle) => owned_handle(handle)
+            .map(std::fs::File::from)
+            .map_err(|_| NativeUpdateFileOpenError::Failed),
+        Err(error)
+            if error.code() == ERROR_FILE_NOT_FOUND.to_hresult()
+                || error.code() == ERROR_PATH_NOT_FOUND.to_hresult() =>
+        {
+            Err(NativeUpdateFileOpenError::NotFound)
+        }
+        Err(_) => Err(NativeUpdateFileOpenError::Failed),
+    }
+}
+
+pub(crate) fn move_update_file_write_through(
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+) -> Result<(), WindowsPlatformError> {
+    if source == destination
+        || source.parent() != destination.parent()
+        || source.file_name().is_none()
+        || destination.file_name().is_none()
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let source = nul_terminated_path(source)?;
+    let destination = nul_terminated_path(destination)?;
+    let mut flags = MOVEFILE_WRITE_THROUGH;
+    if replace {
+        flags = MOVE_FILE_FLAGS(flags.0 | MOVEFILE_REPLACE_EXISTING.0);
+    }
+    // SAFETY: both path buffers are live NUL-terminated UTF-16. COPY_ALLOWED
+    // is absent, so the namespace mutation cannot silently cross volumes.
+    unsafe { MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(destination.as_ptr()), flags) }
+        .map_err(|_| WindowsPlatformError::NativeApi)
+}
+
+pub(crate) fn validate_private_update_handle(
+    file: &std::fs::File,
+) -> Result<(), WindowsPlatformError> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let information =
+        OBJECT_SECURITY_INFORMATION(OWNER_SECURITY_INFORMATION.0 | DACL_SECURITY_INFORMATION.0);
+    // SAFETY: the retained file handle is valid; only the self-relative
+    // descriptor output is requested and it is released with LocalFree below.
+    let status = unsafe {
+        GetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            information,
+            None,
+            None,
+            None,
+            None,
+            Some(&raw mut descriptor),
+        )
+    };
+    if status != ERROR_SUCCESS || descriptor.0.is_null() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    let mut encoded = PWSTR::null();
+    let mut encoded_length = 0_u32;
+    // SAFETY: the descriptor is live and the output is LocalAlloc memory which
+    // remains owned by the guard until after the bounded conversion.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor.0,
+            SDDL_REVISION_1,
+            information,
+            &raw mut encoded,
+            Some(&raw mut encoded_length),
+        )
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    if encoded.is_null() || encoded_length == 0 || encoded_length > 8 * 1024 {
+        if !encoded.is_null() {
+            let _ = unsafe { LocalFree(Some(HLOCAL(encoded.0.cast::<c_void>()))) };
+        }
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let encoded = LocalWideString(encoded);
+    // SAFETY: the API reported the exact NUL-inclusive character count for the
+    // retained allocation.
+    let units = unsafe {
+        std::slice::from_raw_parts(
+            encoded.0.0,
+            usize::try_from(encoded_length).map_err(|_| WindowsPlatformError::NativeApi)?,
+        )
+    };
+    let terminator = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    let actual =
+        String::from_utf16(&units[..terminator]).map_err(|_| WindowsPlatformError::NativeApi)?;
+    let expected = format!("O:{}D:P(A;;FA;;;OW)", current_user_sid_string()?);
+    if actual != expected {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    Ok(())
+}
+
+fn with_owner_only_security_attributes<T>(
+    operation: impl FnOnce(*const SECURITY_ATTRIBUTES) -> Result<T, WindowsPlatformError>,
+) -> Result<T, WindowsPlatformError> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the static SDDL and output pointer are valid for this call.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(OWNER_ONLY_PIPE_SDDL.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| WindowsPlatformError::NativeApi)?,
+        lpSecurityDescriptor: descriptor.0.0,
+        bInheritHandle: false.into(),
+    };
+    operation(&raw const attributes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeUpdateArchitecture {
+    X64,
+    Arm64,
+}
+
+pub(crate) struct NativeInspectedUpdatePackage {
+    pub(crate) package_full_name: String,
+    pub(crate) architecture: NativeUpdateArchitecture,
+    pub(crate) resource_id: String,
+    pub(crate) application_user_model_id: String,
+}
+
+pub(crate) struct NativeInspectedUpdateBundle {
+    pub(crate) package_name: String,
+    pub(crate) publisher: String,
+    pub(crate) package_family_name: String,
+    pub(crate) version: u64,
+    pub(crate) packages: Vec<NativeInspectedUpdatePackage>,
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn inspect_update_bundle(
+    bundle_guard: std::fs::File,
+) -> Result<NativeInspectedUpdateBundle, WindowsPlatformError> {
+    let metadata = bundle_guard
+        .metadata()
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || metadata.len() == 0
+        || metadata.len() > 16 * 1024 * 1024 * 1024
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    validate_private_update_handle(&bundle_guard)?;
+    let _com = ComApartment::initialize()?;
+    let stream = read_only_file_stream(bundle_guard, metadata.len())?;
+    // SAFETY: COM is initialized on this thread and the class/interface IDs are
+    // the official inbox Appx packaging factory.
+    let bundle_factory: IAppxBundleFactory =
+        unsafe { CoCreateInstance(&AppxBundleFactory, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| WindowsPlatformError::NativeApi)?;
+    // SAFETY: the retained read-only stream remains live for the reader.
+    let bundle_reader = unsafe { bundle_factory.CreateBundleReader(&stream) }
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    // SAFETY: the reader owns validated bundle state for the returned manifest.
+    let bundle_manifest =
+        unsafe { bundle_reader.GetManifest() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+    // SAFETY: the manifest reader retains the identity object.
+    let bundle_id =
+        unsafe { bundle_manifest.GetPackageId() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+    let package_name = appx_package_id_text(&bundle_id, AppxIdentityText::Name, 50)?;
+    let publisher = appx_package_id_text(&bundle_id, AppxIdentityText::Publisher, 8 * 1024)?;
+    let package_family_name = appx_package_id_text(&bundle_id, AppxIdentityText::FamilyName, 64)?;
+    // SAFETY: simple value getter on the retained identity.
+    let version = unsafe { bundle_id.GetVersion() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+
+    // SAFETY: the official package factory consumes each payload IStream.
+    let package_factory: IAppxFactory =
+        unsafe { CoCreateInstance(&AppxFactory, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| WindowsPlatformError::NativeApi)?;
+    // SAFETY: enumerator is retained by the bundle reader.
+    let payloads = unsafe { bundle_reader.GetPayloadPackages() }
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    let mut packages = Vec::new();
+    // SAFETY: boolean/current/move-next calls follow the COM enumerator contract.
+    while unsafe { payloads.GetHasCurrent() }
+        .map_err(|_| WindowsPlatformError::NativeApi)?
+        .as_bool()
+    {
+        if packages.len() >= 4 {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        // SAFETY: GetHasCurrent returned true.
+        let payload =
+            unsafe { payloads.GetCurrent() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        // SAFETY: the payload owns the returned read-only stream.
+        let payload_stream =
+            unsafe { payload.GetStream() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        // SAFETY: factory and stream remain live through reader construction.
+        let package_reader = unsafe { package_factory.CreatePackageReader(&payload_stream) }
+            .map_err(|_| WindowsPlatformError::NativeApi)?;
+        // SAFETY: the package reader retains the returned manifest.
+        let manifest =
+            unsafe { package_reader.GetManifest() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        // SAFETY: identity is retained by the manifest reader.
+        let package_id =
+            unsafe { manifest.GetPackageId() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        let payload_name = appx_package_id_text(&package_id, AppxIdentityText::Name, 50)?;
+        let payload_publisher =
+            appx_package_id_text(&package_id, AppxIdentityText::Publisher, 8 * 1024)?;
+        // SAFETY: simple integer value getter.
+        let payload_version =
+            unsafe { package_id.GetVersion() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        if payload_name != package_name
+            || payload_publisher != publisher
+            || payload_version != version
+        {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        // SAFETY: simple value getter.
+        let architecture = match unsafe { package_id.GetArchitecture() }
+            .map_err(|_| WindowsPlatformError::NativeApi)?
+        {
+            APPX_PACKAGE_ARCHITECTURE_X64 => NativeUpdateArchitecture::X64,
+            APPX_PACKAGE_ARCHITECTURE_ARM64 => NativeUpdateArchitecture::Arm64,
+            _ => return Err(WindowsPlatformError::NativeApi),
+        };
+        let resource_id = appx_package_id_text(&package_id, AppxIdentityText::ResourceId, 64)?;
+        let package_full_name = appx_package_id_text(&package_id, AppxIdentityText::FullName, 255)?;
+
+        // Exactly one application is required in every architecture payload.
+        // SAFETY: the manifest retains the application enumerator.
+        let applications =
+            unsafe { manifest.GetApplications() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        if !unsafe { applications.GetHasCurrent() }
+            .map_err(|_| WindowsPlatformError::NativeApi)?
+            .as_bool()
+        {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        // SAFETY: GetHasCurrent returned true.
+        let application =
+            unsafe { applications.GetCurrent() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+        // SAFETY: returned COM-owned string is copied and freed below.
+        let application_user_model_id = take_appx_text(
+            unsafe { application.GetAppUserModelId() }
+                .map_err(|_| WindowsPlatformError::NativeApi)?,
+            130,
+            false,
+        )?;
+        if unsafe { applications.MoveNext() }
+            .map_err(|_| WindowsPlatformError::NativeApi)?
+            .as_bool()
+        {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        packages.push(NativeInspectedUpdatePackage {
+            package_full_name,
+            architecture,
+            resource_id,
+            application_user_model_id,
+        });
+        // SAFETY: advances the enumerator after consuming the current payload.
+        let _ = unsafe { payloads.MoveNext() }.map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    if packages.is_empty() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    Ok(NativeInspectedUpdateBundle {
+        package_name,
+        publisher,
+        package_family_name,
+        version,
+        packages,
+    })
+}
+
+pub(crate) fn open_update_bundle_guard(path: &Path) -> Result<std::fs::File, WindowsPlatformError> {
+    let path = nul_terminated_path(path)?;
+    let flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
+    // SAFETY: the path is live and NUL-terminated. Read sharing permits only
+    // handle-based IStream clones; absent write/delete sharing prevents
+    // mutation or pathname replacement for the entire inspection.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| WindowsPlatformError::NativeApi)?;
+    owned_handle(handle).map(std::fs::File::from)
+}
+
+#[implement(IStream)]
+struct ReadOnlyFileStream {
+    file: Mutex<std::fs::File>,
+    length: u64,
+}
+
+fn read_only_file_stream(
+    mut file: std::fs::File,
+    length: u64,
+) -> Result<IStream, WindowsPlatformError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    Ok(ReadOnlyFileStream {
+        file: Mutex::new(file),
+        length,
+    }
+    .into())
+}
+
+#[allow(non_snake_case)]
+impl ISequentialStream_Impl for ReadOnlyFileStream_Impl {
+    fn Read(&self, output: *mut c_void, requested: u32, read: *mut u32) -> HRESULT {
+        if !read.is_null() {
+            // SAFETY: COM requires a non-null output pointer to reference a live
+            // u32 for this synchronous call.
+            unsafe { read.write(0) };
+        }
+        if requested == 0 {
+            return S_OK;
+        }
+        if output.is_null() {
+            return STG_E_INVALIDPOINTER;
+        }
+        let Ok(length) = usize::try_from(requested) else {
+            return STG_E_READFAULT;
+        };
+        // SAFETY: ISequentialStream::Read requires `output` to reference at
+        // least `requested` writable bytes for the duration of the call.
+        let output = unsafe { std::slice::from_raw_parts_mut(output.cast::<u8>(), length) };
+        let Ok(mut file) = self.file.lock() else {
+            return STG_E_REVERTED;
+        };
+        let Ok(observed) = file.read(output) else {
+            return STG_E_READFAULT;
+        };
+        let Ok(observed_u32) = u32::try_from(observed) else {
+            return STG_E_READFAULT;
+        };
+        if !read.is_null() {
+            // SAFETY: validated by the COM caller contract above.
+            unsafe { read.write(observed_u32) };
+        }
+        if observed_u32 == requested {
+            S_OK
+        } else {
+            S_FALSE
+        }
+    }
+
+    fn Write(&self, _input: *const c_void, _length: u32, written: *mut u32) -> HRESULT {
+        if !written.is_null() {
+            // SAFETY: COM requires a non-null output pointer to reference a live
+            // u32 for this synchronous call.
+            unsafe { written.write(0) };
+        }
+        STG_E_ACCESSDENIED
+    }
+}
+
+#[allow(non_snake_case)]
+impl IStream_Impl for ReadOnlyFileStream_Impl {
+    fn Seek(
+        &self,
+        displacement: i64,
+        origin: STREAM_SEEK,
+        new_position: *mut u64,
+    ) -> windows::core::Result<()> {
+        let position = match origin {
+            STREAM_SEEK_SET => SeekFrom::Start(
+                u64::try_from(displacement)
+                    .map_err(|_| windows::core::Error::from_hresult(STG_E_SEEKERROR))?,
+            ),
+            STREAM_SEEK_CUR => SeekFrom::Current(displacement),
+            STREAM_SEEK_END => SeekFrom::End(displacement),
+            _ => return Err(windows::core::Error::from_hresult(STG_E_INVALIDFUNCTION)),
+        };
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_REVERTED))?;
+        let observed = file
+            .seek(position)
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_SEEKERROR))?;
+        if !new_position.is_null() {
+            // SAFETY: COM requires this optional non-null output to reference a
+            // live u64 for the duration of the call.
+            unsafe { new_position.write(observed) };
+        }
+        Ok(())
+    }
+
+    fn SetSize(&self, _new_size: u64) -> windows::core::Result<()> {
+        Err(windows::core::Error::from_hresult(STG_E_ACCESSDENIED))
+    }
+
+    fn CopyTo(
+        &self,
+        target: windows::core::Ref<IStream>,
+        requested: u64,
+        read: *mut u64,
+        written: *mut u64,
+    ) -> windows::core::Result<()> {
+        if !read.is_null() {
+            // SAFETY: COM requires optional non-null outputs to be live.
+            unsafe { read.write(0) };
+        }
+        if !written.is_null() {
+            // SAFETY: COM requires optional non-null outputs to be live.
+            unsafe { written.write(0) };
+        }
+        if target.is_null() {
+            return Err(windows::core::Error::from_hresult(STG_E_INVALIDPOINTER));
+        }
+        let target = target.ok()?;
+        let mut total_read = 0_u64;
+        let mut total_written = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        while total_read < requested {
+            let request = usize::try_from((requested - total_read).min(buffer.len() as u64))
+                .map_err(|_| windows::core::Error::from_hresult(STG_E_READFAULT))?;
+            let observed = {
+                let mut file = self
+                    .file
+                    .lock()
+                    .map_err(|_| windows::core::Error::from_hresult(STG_E_REVERTED))?;
+                file.read(&mut buffer[..request])
+                    .map_err(|_| windows::core::Error::from_hresult(STG_E_READFAULT))?
+            };
+            if observed == 0 {
+                break;
+            }
+            let mut chunk_written = 0_u32;
+            // SAFETY: the target interface is retained, and the input slice and
+            // output count remain live for this synchronous COM call.
+            unsafe {
+                target.Write(
+                    buffer.as_ptr().cast::<c_void>(),
+                    u32::try_from(observed)
+                        .map_err(|_| windows::core::Error::from_hresult(STG_E_WRITEFAULT))?,
+                    Some(&raw mut chunk_written),
+                )
+            }
+            .ok()?;
+            if usize::try_from(chunk_written).ok() != Some(observed) {
+                return Err(windows::core::Error::from_hresult(STG_E_WRITEFAULT));
+            }
+            let observed_u64 = u64::try_from(observed)
+                .map_err(|_| windows::core::Error::from_hresult(STG_E_READFAULT))?;
+            total_read = total_read
+                .checked_add(observed_u64)
+                .ok_or_else(|| windows::core::Error::from_hresult(STG_E_READFAULT))?;
+            total_written = total_written
+                .checked_add(u64::from(chunk_written))
+                .ok_or_else(|| windows::core::Error::from_hresult(STG_E_WRITEFAULT))?;
+        }
+        if !read.is_null() {
+            // SAFETY: validated by the COM caller contract above.
+            unsafe { read.write(total_read) };
+        }
+        if !written.is_null() {
+            // SAFETY: validated by the COM caller contract above.
+            unsafe { written.write(total_written) };
+        }
+        Ok(())
+    }
+
+    fn Commit(&self, _flags: &STGC) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn Revert(&self) -> windows::core::Result<()> {
+        Err(windows::core::Error::from_hresult(STG_E_INVALIDFUNCTION))
+    }
+
+    fn LockRegion(
+        &self,
+        _offset: u64,
+        _length: u64,
+        _lock_type: &LOCKTYPE,
+    ) -> windows::core::Result<()> {
+        Err(windows::core::Error::from_hresult(STG_E_INVALIDFUNCTION))
+    }
+
+    fn UnlockRegion(
+        &self,
+        _offset: u64,
+        _length: u64,
+        _lock_type: u32,
+    ) -> windows::core::Result<()> {
+        Err(windows::core::Error::from_hresult(STG_E_INVALIDFUNCTION))
+    }
+
+    fn Stat(&self, output: *mut STATSTG, _flags: &STATFLAG) -> windows::core::Result<()> {
+        if output.is_null() {
+            return Err(windows::core::Error::from_hresult(STG_E_INVALIDPOINTER));
+        }
+        let value = STATSTG {
+            r#type: u32::try_from(STGTY_STREAM.0)
+                .map_err(|_| windows::core::Error::from_hresult(STG_E_INVALIDFUNCTION))?,
+            cbSize: self.length,
+            grfMode: STGM_READ,
+            ..STATSTG::default()
+        };
+        // SAFETY: COM requires `output` to reference one live STATSTG.
+        unsafe { output.write(value) };
+        Ok(())
+    }
+
+    fn Clone(&self) -> windows::core::Result<IStream> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_REVERTED))?;
+        let position = file
+            .stream_position()
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_SEEKERROR))?;
+        // SAFETY: the original file handle is live and retained under the
+        // mutex. ReOpenFile binds the clone to the same file object without a
+        // pathname lookup and gives it an independent seek pointer.
+        let handle = unsafe {
+            ReOpenFile(
+                HANDLE(file.as_raw_handle()),
+                FILE_GENERIC_READ.0,
+                FILE_SHARE_READ,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+            )
+        }
+        .map_err(|_| windows::core::Error::from_hresult(STG_E_READFAULT))?;
+        let owned = owned_handle(handle)
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_READFAULT))?;
+        let mut cloned = std::fs::File::from(owned);
+        cloned
+            .seek(SeekFrom::Start(position))
+            .map_err(|_| windows::core::Error::from_hresult(STG_E_SEEKERROR))?;
+        drop(file);
+        Ok(ReadOnlyFileStream {
+            file: Mutex::new(cloned),
+            length: self.length,
+        }
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod update_stream_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static NEXT_STREAM_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nodavo-windows-handle-stream-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_STREAM_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn appx_stream_reads_and_clones_the_retained_file_handle() {
+        let root = temporary_root();
+        create_private_update_directory(&root).unwrap();
+        let path = root.join("bundle.bin");
+        let mut file = create_private_update_file(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"abc").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let guard = open_update_bundle_guard(&path).unwrap();
+        let stream = read_only_file_stream(guard, 3).unwrap();
+        assert!(std::fs::rename(&path, root.join("pivot.bin")).is_err());
+        let mut null_read = 0_u64;
+        let mut null_written = 0_u64;
+        let error = unsafe {
+            stream.CopyTo(
+                None::<&IStream>,
+                1,
+                Some(&raw mut null_read),
+                Some(&raw mut null_written),
+            )
+        }
+        .unwrap_err();
+        assert_eq!(error.code(), STG_E_INVALIDPOINTER);
+        assert_eq!((null_read, null_written), (0, 0));
+        unsafe { stream.Seek(1, STREAM_SEEK_SET, None) }.unwrap();
+        let clone = unsafe { stream.Clone() }.unwrap();
+
+        let mut clone_byte = [0_u8; 1];
+        let mut clone_read = 0_u32;
+        assert_eq!(
+            unsafe {
+                clone.Read(
+                    clone_byte.as_mut_ptr().cast::<c_void>(),
+                    1,
+                    Some(&raw mut clone_read),
+                )
+            },
+            S_OK
+        );
+        assert_eq!((clone_byte, clone_read), ([b'b'], 1));
+
+        let mut original_byte = [0_u8; 1];
+        let mut original_read = 0_u32;
+        assert_eq!(
+            unsafe {
+                stream.Read(
+                    original_byte.as_mut_ptr().cast::<c_void>(),
+                    1,
+                    Some(&raw mut original_read),
+                )
+            },
+            S_OK
+        );
+        assert_eq!((original_byte, original_read), ([b'b'], 1));
+
+        drop(clone);
+        drop(stream);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AppxIdentityText {
+    Name,
+    Publisher,
+    FamilyName,
+    ResourceId,
+    FullName,
+}
+
+fn appx_package_id_text(
+    identity: &IAppxManifestPackageId,
+    field: AppxIdentityText,
+    maximum_units: usize,
+) -> Result<String, WindowsPlatformError> {
+    // SAFETY: each getter belongs to the retained identity. Every returned
+    // COM-owned string is copied with a fixed bound and released exactly once.
+    let value = unsafe {
+        match field {
+            AppxIdentityText::Name => identity.GetName(),
+            AppxIdentityText::Publisher => identity.GetPublisher(),
+            AppxIdentityText::FamilyName => identity.GetPackageFamilyName(),
+            AppxIdentityText::ResourceId => identity.GetResourceId(),
+            AppxIdentityText::FullName => identity.GetPackageFullName(),
+        }
+    }
+    .map_err(|_| WindowsPlatformError::NativeApi)?;
+    take_appx_text(
+        value,
+        maximum_units,
+        matches!(field, AppxIdentityText::ResourceId),
+    )
+}
+
+fn take_appx_text(
+    value: PWSTR,
+    maximum_units: usize,
+    allow_empty: bool,
+) -> Result<String, WindowsPlatformError> {
+    if value.is_null() || maximum_units == 0 {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let owned = CoTaskWideString(value);
+    let mut length = None;
+    for index in 0..=maximum_units {
+        // SAFETY: Appx APIs return a valid NUL-terminated COM allocation. Reads
+        // are bounded to one unit past the documented local policy maximum.
+        if unsafe { *owned.0.0.add(index) } == 0 {
+            length = Some(index);
+            break;
+        }
+    }
+    let length = length.ok_or(WindowsPlatformError::NativeApi)?;
+    if length == 0 && !allow_empty {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    // SAFETY: the preceding bounded scan found the terminator in this allocation.
+    let units = unsafe { std::slice::from_raw_parts(owned.0.0, length) };
+    String::from_utf16(units).map_err(|_| WindowsPlatformError::NativeApi)
+}
+
+struct CoTaskWideString(PWSTR);
+
+impl Drop for CoTaskWideString {
+    fn drop(&mut self) {
+        // SAFETY: Appx returned this exact string with the COM task allocator.
+        unsafe { CoTaskMemFree(Some(self.0.0.cast::<c_void>())) };
+    }
+}
+
+struct ComApartment {
+    uninitialize: bool,
+}
+
+impl ComApartment {
+    fn initialize() -> Result<Self, WindowsPlatformError> {
+        // SAFETY: no reserved pointer is supplied; apartment lifetime is held by
+        // the returned guard on this same thread.
+        let status = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        if status.is_ok() {
+            Ok(Self { uninitialize: true })
+        } else if status == RPC_E_CHANGED_MODE {
+            // An existing STA is also sufficient for the synchronous Appx APIs;
+            // this call did not acquire an initialization reference.
+            Ok(Self {
+                uninitialize: false,
+            })
+        } else {
+            Err(WindowsPlatformError::NativeApi)
+        }
+    }
+}
+
+impl Drop for ComApartment {
+    fn drop(&mut self) {
+        if self.uninitialize {
+            // SAFETY: paired with the successful CoInitializeEx on this thread.
+            unsafe { CoUninitialize() };
+        }
     }
 }
 

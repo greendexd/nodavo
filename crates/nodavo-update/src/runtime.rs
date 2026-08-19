@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ArtifactVerifier, MAX_ARTIFACT_BYTES, MAX_VERSION_BYTES, RollbackState, UpdateError,
+    ArtifactVerifier, AttemptId, MAX_ARTIFACT_BYTES, MAX_VERSION_BYTES, RollbackState,
+    SupervisionJournal, SupervisionPolicy, SupervisionTransactionLock, TransactionId, UpdateError,
     VerifiedRelease, validate_https_url,
 };
 
@@ -19,7 +20,7 @@ pub const MAX_ROLLBACK_STATE_BYTES: usize = 4 * 1024;
 pub const MAX_RECOVERY_JOURNAL_BYTES: usize = 16 * 1024;
 
 const ROLLBACK_STATE_SCHEMA: u16 = 1;
-const RECOVERY_JOURNAL_SCHEMA: u16 = 1;
+const RECOVERY_JOURNAL_SCHEMA: u16 = 2;
 const MAX_INSTALL_IDENTIFIER_BYTES: usize = 255;
 
 /// Opaque content-addressed key used by staging adapters.
@@ -255,8 +256,21 @@ pub trait ArtifactStaging {
 /// Explicit user decision for the offered release.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserConsent {
+    /// Approves downloading and verifying this exact release.
+    ///
+    /// A distinct [`InstallConsent`] is still required before any installation
+    /// or restart effect.
     ApproveDownloadAndInstall,
     Decline,
+}
+
+/// Explicit post-staging consent for installation and process restart.
+///
+/// This is deliberately separate from [`UserConsent`]: a UI that offered only
+/// download/staging must never accidentally authorize activation later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallConsent {
+    InstallAndRestart,
 }
 
 /// Observable updater status. It contains no URL, path, or artifact content.
@@ -268,6 +282,7 @@ pub enum UpdateStatus {
     Downloading { received: u64, total: u64 },
     DownloadPaused { received: u64, total: u64 },
     Staged,
+    ReadyToInstall,
     PreparingInstall,
     AwaitingRestart,
     AwaitingHealthCheck,
@@ -366,7 +381,26 @@ impl InstallPlan {
         self.rollback_floor_after_install.clone().into_state()
     }
 
-    fn validate(&self) -> Result<(), UpdateRuntimeError> {
+    #[cfg(test)]
+    pub(crate) fn test_macos(version: Version, rollback_epoch: u64) -> Self {
+        Self {
+            artifact: ArtifactId {
+                sha256: [7; 32],
+                size: 128,
+            },
+            target: InstallTarget::MacOsAppBundle {
+                bundle_identifier: "dev.nodavo.macos".to_owned(),
+            },
+            rollback_floor_after_install: RollbackStateDisk {
+                minimum_epoch: rollback_epoch,
+                minimum_version: version.clone(),
+            },
+            version,
+            rollback_epoch,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), UpdateRuntimeError> {
         if self.artifact.size == 0 || self.artifact.size > MAX_ARTIFACT_BYTES {
             return Err(UpdateRuntimeError::CorruptPersistentState);
         }
@@ -381,8 +415,8 @@ impl InstallPlan {
                 .to_string()
                 .len()
                 > MAX_VERSION_BYTES
-            || self.rollback_floor_after_install.minimum_version < self.version
-            || self.rollback_floor_after_install.minimum_epoch < self.rollback_epoch
+            || self.rollback_floor_after_install.minimum_version != self.version
+            || self.rollback_floor_after_install.minimum_epoch != self.rollback_epoch
         {
             return Err(UpdateRuntimeError::CorruptPersistentState);
         }
@@ -399,6 +433,7 @@ pub enum InstallPhase {
     Activated,
     CandidateStarted,
     Healthy,
+    FloorAdvanced,
     RollingBack,
 }
 
@@ -460,6 +495,7 @@ impl InstallJournal {
         })
     }
 
+    #[cfg(test)]
     fn with_phase(&self, phase: InstallPhase) -> Self {
         Self {
             phase,
@@ -684,6 +720,8 @@ pub enum UpdateRuntimeError {
     RollbackStateFailed,
     #[error("the platform installer effect failed")]
     InstallerFailed,
+    #[error("the reported update process does not match the active transaction and version")]
+    CandidateMismatch,
     #[error("persistent updater state is malformed or outside its hard bound")]
     CorruptPersistentState,
 }
@@ -699,6 +737,7 @@ pub struct UpdateSession {
     release: VerifiedRelease,
     rollback_before: RollbackState,
     status: UpdateStatus,
+    #[cfg(test)]
     plan: Option<InstallPlan>,
 }
 
@@ -719,6 +758,7 @@ impl UpdateSession {
             release,
             rollback_before,
             status: UpdateStatus::AwaitingConsent,
+            #[cfg(test)]
             plan: None,
         }
     }
@@ -733,8 +773,8 @@ impl UpdateSession {
         &self.release
     }
 
-    /// Records the explicit user decision. Approval covers download and the
-    /// later platform install transaction for this exact signed release.
+    /// Records the explicit user decision for download and staging. A later
+    /// platform install transaction requires distinct [`InstallConsent`].
     ///
     /// # Errors
     ///
@@ -748,6 +788,130 @@ impl UpdateSession {
             UserConsent::Decline => UpdateStatus::Declined,
         };
         Ok(())
+    }
+
+    /// Records distinct informed consent to install and restart after the
+    /// complete artifact has been verified and sealed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless this exact session is durably staged and has not
+    /// already consumed an installation decision.
+    pub fn authorize_install(&mut self, consent: InstallConsent) -> Result<(), UpdateRuntimeError> {
+        if self.status != UpdateStatus::Staged {
+            return Err(UpdateRuntimeError::InvalidTransition);
+        }
+        match consent {
+            InstallConsent::InstallAndRestart => {
+                self.status = UpdateStatus::ReadyToInstall;
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates an immutable installation plan without executing an install
+    /// effect. The caller must load the authenticated current rollback floor
+    /// immediately before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing install/restart consent, a mismatched target, or a
+    /// release below the supplied durable rollback floor.
+    pub(crate) fn plan_install(
+        &self,
+        target: InstallTarget,
+        current_floor: &RollbackState,
+    ) -> Result<InstallPlan, UpdateRuntimeError> {
+        if self.status != UpdateStatus::ReadyToInstall {
+            return Err(if self.status == UpdateStatus::AwaitingConsent {
+                UpdateRuntimeError::ConsentRequired
+            } else {
+                UpdateRuntimeError::InvalidTransition
+            });
+        }
+        if target.platform() != self.release.manifest().platform()
+            || target.identifier() != self.release.install_identity()
+        {
+            return Err(UpdateRuntimeError::InstallTargetMismatch);
+        }
+        if release_is_below_floor(&self.release, current_floor) {
+            return Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected));
+        }
+        let effective_floor = RollbackState::new(
+            self.rollback_before
+                .minimum_epoch()
+                .max(current_floor.minimum_epoch()),
+            self.rollback_before
+                .minimum_version()
+                .clone()
+                .max(current_floor.minimum_version().clone()),
+        );
+        let plan = InstallPlan {
+            artifact: self.artifact_id(),
+            target,
+            version: self.release.manifest().version().clone(),
+            rollback_epoch: self.release.manifest().rollback_epoch(),
+            rollback_floor_after_install: RollbackStateDisk::from(
+                &self.release.rollback_state_after_install(&effective_floor),
+            ),
+        };
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    /// Consumes the one-shot install/restart authorization while an external
+    /// stable supervisor holds its exclusive transaction lock.
+    ///
+    /// The rollback floor is loaded inside the locked operation immediately
+    /// before the immutable plan is derived. The returned initial journal must
+    /// be atomically authenticated and persisted before its `Prepare` action is
+    /// executed. A public, deserialized, cloned, or previously returned
+    /// [`InstallPlan`] cannot create a new supervision transaction.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/consumed authorization, absent lock ownership, stale
+    /// rollback state, target mismatch, or invalid transaction policy. Any
+    /// failure after lock validation consumes this session fail closed.
+    pub fn begin_supervision<L, R>(
+        &mut self,
+        transaction: TransactionId,
+        old_process_exit_attempt: AttemptId,
+        target: InstallTarget,
+        policy: SupervisionPolicy,
+        transaction_lock: &mut L,
+        rollback_store: &mut R,
+    ) -> Result<SupervisionJournal, UpdateRuntimeError>
+    where
+        L: SupervisionTransactionLock,
+        R: RollbackStateStore,
+    {
+        if self.status != UpdateStatus::ReadyToInstall {
+            return Err(if self.status == UpdateStatus::AwaitingConsent {
+                UpdateRuntimeError::ConsentRequired
+            } else {
+                UpdateRuntimeError::InvalidTransition
+            });
+        }
+        transaction_lock
+            .ensure_exclusive()
+            .map_err(|_| self.fail(UpdateRuntimeError::InstallerFailed))?;
+        let current_floor = rollback_store
+            .load()
+            .map_err(|_| self.fail(UpdateRuntimeError::RollbackStateFailed))?;
+        let plan = self
+            .plan_install(target, &current_floor)
+            .map_err(|error| self.fail(error))?;
+        let journal = SupervisionJournal::from_authorized_plan(
+            transaction,
+            old_process_exit_attempt,
+            plan,
+            self.release.installed_version().clone(),
+            policy,
+        )
+        .map_err(|error| self.fail(error))?;
+        self.status = UpdateStatus::PreparingInstall;
+        Ok(journal)
     }
 
     /// Resumes or starts a bounded artifact download, verifies the complete
@@ -874,7 +1038,8 @@ impl UpdateSession {
     ///
     /// Rejects unstaged content, target mismatch, or any journal/installer
     /// effect failure.
-    pub fn begin_install<I, J, R>(
+    #[cfg(test)]
+    fn begin_install<I, J, R>(
         &mut self,
         target: InstallTarget,
         installer: &mut I,
@@ -886,43 +1051,19 @@ impl UpdateSession {
         J: RecoveryJournalStore,
         R: RollbackStateStore,
     {
-        if self.status != UpdateStatus::Staged {
+        if self.status != UpdateStatus::ReadyToInstall {
             return Err(if self.status == UpdateStatus::AwaitingConsent {
                 UpdateRuntimeError::ConsentRequired
             } else {
                 UpdateRuntimeError::InvalidTransition
             });
         }
-        if target.platform() != self.release.manifest().platform()
-            || target.identifier() != self.release.install_identity()
-        {
-            return Err(self.fail(UpdateRuntimeError::InstallTargetMismatch));
-        }
         let current_floor = rollback_store
             .load()
             .map_err(|_| self.fail(UpdateRuntimeError::RollbackStateFailed))?;
-        if release_is_below_floor(&self.release, &current_floor) {
-            return Err(self.fail(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected)));
-        }
-        let effective_floor = RollbackState::new(
-            self.rollback_before
-                .minimum_epoch()
-                .max(current_floor.minimum_epoch()),
-            self.rollback_before
-                .minimum_version()
-                .clone()
-                .max(current_floor.minimum_version().clone()),
-        );
-        let plan = InstallPlan {
-            artifact: self.artifact_id(),
-            target,
-            version: self.release.manifest().version().clone(),
-            rollback_epoch: self.release.manifest().rollback_epoch(),
-            rollback_floor_after_install: RollbackStateDisk::from(
-                &self.release.rollback_state_after_install(&effective_floor),
-            ),
-        };
-        plan.validate()?;
+        let plan = self
+            .plan_install(target, &current_floor)
+            .map_err(|error| self.fail(error))?;
         self.status = UpdateStatus::PreparingInstall;
         let mut journal = InstallJournal {
             phase: InstallPhase::Preparing,
@@ -953,7 +1094,8 @@ impl UpdateSession {
     /// Returns an error outside [`UpdateStatus::AwaitingRestart`] or unless the
     /// journal and platform executor both still report the expected activated
     /// transaction.
-    pub fn acknowledge_restart<I, J>(
+    #[cfg(test)]
+    fn acknowledge_restart<I, J>(
         &mut self,
         installer: &mut I,
         journal_store: &mut J,
@@ -981,7 +1123,8 @@ impl UpdateSession {
     ///
     /// Returns an error outside the health-check phase or when any durable
     /// effect fails.
-    pub fn confirm_healthy<I, J, R>(
+    #[cfg(test)]
+    fn confirm_healthy<I, J, R>(
         &mut self,
         installer: &mut I,
         journal_store: &mut J,
@@ -1022,12 +1165,14 @@ impl UpdateSession {
         }
         let journal = started.with_phase(InstallPhase::Healthy);
         persist_journal(journal_store, &journal).map_err(|error| self.fail(error))?;
-        installer
-            .commit(&plan)
-            .map_err(|_| self.fail(UpdateRuntimeError::InstallerFailed))?;
         rollback_store
             .advance(&plan.rollback_floor_after_install())
             .map_err(|_| self.fail(UpdateRuntimeError::RollbackStateFailed))?;
+        let floor_advanced = journal.with_phase(InstallPhase::FloorAdvanced);
+        persist_journal(journal_store, &floor_advanced).map_err(|error| self.fail(error))?;
+        installer
+            .commit(&plan)
+            .map_err(|_| self.fail(UpdateRuntimeError::InstallerFailed))?;
         journal_store
             .clear()
             .map_err(|_| self.fail(UpdateRuntimeError::JournalFailed))?;
@@ -1041,7 +1186,8 @@ impl UpdateSession {
     ///
     /// Returns an error outside the restart/health phases or when recovery
     /// persistence or the platform rollback fails.
-    pub fn rollback<I, J>(
+    #[cfg(test)]
+    fn rollback<I, J>(
         &mut self,
         installer: &mut I,
         journal_store: &mut J,
@@ -1167,7 +1313,8 @@ impl UpdateSession {
 ///
 /// Returns an error for corrupt persistence or journal/installer/rollback
 /// effect failures.
-pub fn recover_installation<I, J, R>(
+#[cfg(test)]
+fn recover_installation<I, J, R>(
     installer: &mut I,
     journal_store: &mut J,
     rollback_store: &mut R,
@@ -1234,32 +1381,9 @@ where
                 }
             }
         }
-        InstallPhase::Healthy => {
-            let observation = installer
-                .inspect(journal.plan())
-                .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
-            let current_floor = rollback_store
-                .load()
-                .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
-            if plan_is_below_floor(journal.plan(), &current_floor) {
-                return Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected));
-            }
-            if !matches!(
-                observation,
-                InstallObservation::Activated | InstallObservation::Committed
-            ) {
-                return Err(UpdateRuntimeError::CorruptPersistentState);
-            }
-            installer
-                .commit(journal.plan())
-                .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
-            rollback_store
-                .advance(&journal.plan.rollback_floor_after_install())
-                .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
-            journal_store
-                .clear()
-                .map_err(|_| UpdateRuntimeError::JournalFailed)?;
-            Ok(RecoveryStatus::Installed(journal.plan))
+        InstallPhase::Healthy => recover_healthy(installer, journal_store, rollback_store, journal),
+        InstallPhase::FloorAdvanced => {
+            recover_floor_advanced(installer, journal_store, rollback_store, journal)
         }
         InstallPhase::RollingBack => {
             installer
@@ -1273,6 +1397,86 @@ where
     }
 }
 
+#[cfg(test)]
+fn recover_healthy<I, J, R>(
+    installer: &mut I,
+    journal_store: &mut J,
+    rollback_store: &mut R,
+    journal: InstallJournal,
+) -> Result<RecoveryStatus, UpdateRuntimeError>
+where
+    I: AtomicInstaller,
+    J: RecoveryJournalStore,
+    R: RollbackStateStore,
+{
+    let observation = installer
+        .inspect(journal.plan())
+        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
+    let current_floor = rollback_store
+        .load()
+        .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
+    if plan_is_below_floor(journal.plan(), &current_floor) {
+        return Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected));
+    }
+    if !matches!(
+        observation,
+        InstallObservation::Activated | InstallObservation::Committed
+    ) {
+        return Err(UpdateRuntimeError::CorruptPersistentState);
+    }
+    rollback_store
+        .advance(&journal.plan.rollback_floor_after_install())
+        .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
+    let floor_advanced = journal.with_phase(InstallPhase::FloorAdvanced);
+    persist_journal(journal_store, &floor_advanced)?;
+    installer
+        .commit(journal.plan())
+        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
+    journal_store
+        .clear()
+        .map_err(|_| UpdateRuntimeError::JournalFailed)?;
+    Ok(RecoveryStatus::Installed(journal.plan))
+}
+
+#[cfg(test)]
+fn recover_floor_advanced<I, J, R>(
+    installer: &mut I,
+    journal_store: &mut J,
+    rollback_store: &mut R,
+    journal: InstallJournal,
+) -> Result<RecoveryStatus, UpdateRuntimeError>
+where
+    I: AtomicInstaller,
+    J: RecoveryJournalStore,
+    R: RollbackStateStore,
+{
+    let observation = installer
+        .inspect(journal.plan())
+        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
+    if !matches!(
+        observation,
+        InstallObservation::Activated | InstallObservation::Committed
+    ) {
+        return Err(UpdateRuntimeError::CorruptPersistentState);
+    }
+    let current_floor = rollback_store
+        .load()
+        .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
+    let required = journal.plan.rollback_floor_after_install();
+    if current_floor.minimum_epoch() < required.minimum_epoch()
+        || current_floor.minimum_version() < required.minimum_version()
+    {
+        return Err(UpdateRuntimeError::CorruptPersistentState);
+    }
+    installer
+        .commit(journal.plan())
+        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
+    journal_store
+        .clear()
+        .map_err(|_| UpdateRuntimeError::JournalFailed)?;
+    Ok(RecoveryStatus::Installed(journal.plan))
+}
+
 /// Durably records that the recovered activated candidate reached startup.
 ///
 /// This call must originate from the newly activated candidate after its own
@@ -1282,7 +1486,8 @@ where
 ///
 /// Rejects a missing/non-activated journal, inconsistent platform observation,
 /// or journal/installer effect failure.
-pub fn record_recovered_candidate_started<I, J>(
+#[cfg(test)]
+fn record_recovered_candidate_started<I, J>(
     installer: &mut I,
     journal_store: &mut J,
 ) -> Result<InstallPlan, UpdateRuntimeError>
@@ -1293,6 +1498,7 @@ where
     persist_candidate_started(installer, journal_store, None)
 }
 
+#[cfg(test)]
 fn persist_candidate_started<I, J>(
     installer: &mut I,
     journal_store: &mut J,
@@ -1331,7 +1537,8 @@ where
 ///
 /// Rejects a missing/non-started journal, inconsistent platform observation,
 /// stale rollback floor, or any durable effect failure.
-pub fn confirm_recovered_healthy<I, J, R>(
+#[cfg(test)]
+fn confirm_recovered_healthy<I, J, R>(
     installer: &mut I,
     journal_store: &mut J,
     rollback_store: &mut R,
@@ -1364,12 +1571,14 @@ where
     }
     let healthy = journal.with_phase(InstallPhase::Healthy);
     persist_journal(journal_store, &healthy)?;
-    installer
-        .commit(healthy.plan())
-        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
     rollback_store
         .advance(&healthy.plan.rollback_floor_after_install())
         .map_err(|_| UpdateRuntimeError::RollbackStateFailed)?;
+    let floor_advanced = healthy.with_phase(InstallPhase::FloorAdvanced);
+    persist_journal(journal_store, &floor_advanced)?;
+    installer
+        .commit(healthy.plan())
+        .map_err(|_| UpdateRuntimeError::InstallerFailed)?;
     journal_store
         .clear()
         .map_err(|_| UpdateRuntimeError::JournalFailed)?;
@@ -1382,7 +1591,8 @@ where
 /// # Errors
 ///
 /// Rejects a missing/non-activated journal or any durable effect failure.
-pub fn rollback_recovered<I, J>(
+#[cfg(test)]
+fn rollback_recovered<I, J>(
     installer: &mut I,
     journal_store: &mut J,
 ) -> Result<InstallPlan, UpdateRuntimeError>
@@ -1419,6 +1629,7 @@ where
     Ok(rolling_back.plan)
 }
 
+#[cfg(test)]
 fn persist_journal<J: RecoveryJournalStore>(
     store: &mut J,
     journal: &InstallJournal,
@@ -1434,6 +1645,7 @@ fn release_is_below_floor(release: &VerifiedRelease, floor: &RollbackState) -> b
         || release.manifest().version() < floor.minimum_version()
 }
 
+#[cfg(test)]
 fn plan_is_below_floor(plan: &InstallPlan, floor: &RollbackState) -> bool {
     plan.rollback_epoch < floor.minimum_epoch() || plan.version < *floor.minimum_version()
 }
@@ -1453,7 +1665,7 @@ fn validate_install_identifier(value: &str) -> Result<(), UpdateRuntimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ReleaseManifest;
+    use crate::{ReleaseManifest, SupervisionAction, SupervisionPhase};
     use sha2::{Digest as _, Sha256};
     use std::fmt::Write as _;
 
@@ -1489,6 +1701,7 @@ mod tests {
             } else {
                 "Nodavo.Package".to_owned()
             },
+            installed_version: Version::new(1, 0, 0),
         }
     }
 
@@ -1670,26 +1883,50 @@ mod tests {
         }
     }
 
+    struct FakeTransactionLock {
+        exclusive: bool,
+        checks: usize,
+    }
+
+    impl SupervisionTransactionLock for FakeTransactionLock {
+        fn ensure_exclusive(&mut self) -> Result<(), ExternalEffectError> {
+            self.checks += 1;
+            if self.exclusive {
+                Ok(())
+            } else {
+                Err(ExternalEffectError)
+            }
+        }
+    }
+
     struct FakeRollbackStore {
         state: RollbackState,
+        loads: usize,
         advances: usize,
+        fail_advance: bool,
     }
 
     impl FakeRollbackStore {
         fn new() -> Self {
             Self {
                 state: rollback_floor(),
+                loads: 0,
                 advances: 0,
+                fail_advance: false,
             }
         }
     }
 
     impl RollbackStateStore for FakeRollbackStore {
         fn load(&mut self) -> Result<RollbackState, ExternalEffectError> {
+            self.loads += 1;
             Ok(self.state.clone())
         }
 
         fn advance(&mut self, minimum: &RollbackState) -> Result<(), ExternalEffectError> {
+            if self.fail_advance {
+                return Err(ExternalEffectError);
+            }
             self.state = RollbackState::new(
                 self.state.minimum_epoch().max(minimum.minimum_epoch()),
                 self.state
@@ -1709,6 +1946,7 @@ mod tests {
         activates: usize,
         commits: usize,
         rollbacks: usize,
+        fail_commit: bool,
     }
 
     impl AtomicInstaller for FakeInstaller {
@@ -1732,6 +1970,9 @@ mod tests {
         }
 
         fn commit(&mut self, _plan: &InstallPlan) -> Result<(), ExternalEffectError> {
+            if self.fail_commit {
+                return Err(ExternalEffectError);
+            }
             self.commits += 1;
             self.observation = Some(InstallObservation::Committed);
             Ok(())
@@ -1888,6 +2129,186 @@ mod tests {
     }
 
     #[test]
+    fn staging_consent_does_not_authorize_installation_or_restart() {
+        let bytes = b"verified artifact";
+        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        session
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        let mut installer = FakeInstaller::default();
+        let mut journal = FakeJournal::default();
+        let mut rollback = FakeRollbackStore::new();
+
+        assert_eq!(
+            session.begin_install(
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                &mut installer,
+                &mut journal,
+                &mut rollback,
+            ),
+            Err(UpdateRuntimeError::InvalidTransition)
+        );
+        assert_eq!(installer.prepares, 0);
+        assert!(journal.encoded.is_none());
+        assert_eq!(rollback.advances, 0);
+
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        assert_eq!(session.status(), UpdateStatus::ReadyToInstall);
+        assert_eq!(
+            session.authorize_install(InstallConsent::InstallAndRestart),
+            Err(UpdateRuntimeError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn supervision_consumes_one_shot_authorization_under_lock_and_fresh_floor() {
+        let bytes = b"verified artifact";
+        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        session
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        let mut transaction_lock = FakeTransactionLock {
+            exclusive: true,
+            checks: 0,
+        };
+        let mut rollback = FakeRollbackStore::new();
+        let policy = SupervisionPolicy::new(2, 2, 30_000, 90_000, 60_000, 90_000, 30_000).unwrap();
+
+        let journal = session
+            .begin_supervision(
+                TransactionId::new([1; 32]).unwrap(),
+                AttemptId::new([2; 32]).unwrap(),
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                policy,
+                &mut transaction_lock,
+                &mut rollback,
+            )
+            .unwrap();
+        assert_eq!(journal.phase(), SupervisionPhase::Preparing);
+        assert!(matches!(
+            journal.next_action().unwrap(),
+            SupervisionAction::Prepare { .. }
+        ));
+        assert_eq!(session.status(), UpdateStatus::PreparingInstall);
+        assert_eq!(transaction_lock.checks, 1);
+        assert_eq!(rollback.loads, 1);
+        assert_eq!(
+            session.begin_supervision(
+                TransactionId::new([3; 32]).unwrap(),
+                AttemptId::new([4; 32]).unwrap(),
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                policy,
+                &mut transaction_lock,
+                &mut rollback,
+            ),
+            Err(UpdateRuntimeError::InvalidTransition)
+        );
+        assert_eq!(transaction_lock.checks, 1);
+        assert_eq!(rollback.loads, 1);
+
+        let mut stale = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        stale
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        stale
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        stale
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        let mut raised_floor = FakeRollbackStore {
+            state: RollbackState::new(8, Version::new(2, 1, 0)),
+            loads: 0,
+            advances: 0,
+            fail_advance: false,
+        };
+        assert_eq!(
+            stale.begin_supervision(
+                TransactionId::new([5; 32]).unwrap(),
+                AttemptId::new([6; 32]).unwrap(),
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                policy,
+                &mut transaction_lock,
+                &mut raised_floor,
+            ),
+            Err(UpdateRuntimeError::Manifest(UpdateError::RollbackRejected))
+        );
+        assert_eq!(raised_floor.loads, 1);
+        assert!(matches!(stale.status(), UpdateStatus::Failed(_)));
+    }
+
+    #[test]
+    fn supervision_requires_lock_before_loading_floor_or_consuming_effects() {
+        let bytes = b"verified artifact";
+        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        session
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        let mut transaction_lock = FakeTransactionLock {
+            exclusive: false,
+            checks: 0,
+        };
+        let mut rollback = FakeRollbackStore::new();
+
+        assert_eq!(
+            session.begin_supervision(
+                TransactionId::new([1; 32]).unwrap(),
+                AttemptId::new([2; 32]).unwrap(),
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                SupervisionPolicy::new(2, 2, 30_000, 90_000, 60_000, 90_000, 30_000).unwrap(),
+                &mut transaction_lock,
+                &mut rollback,
+            ),
+            Err(UpdateRuntimeError::InstallerFailed)
+        );
+        assert_eq!(transaction_lock.checks, 1);
+        assert_eq!(rollback.loads, 0);
+        assert_eq!(
+            session.status(),
+            UpdateStatus::Failed(UpdateRuntimeError::InstallerFailed)
+        );
+    }
+
+    #[test]
+    fn install_plan_rejects_floor_not_exactly_equal_to_candidate() {
+        let mut plan = InstallPlan::test_macos(Version::new(2, 0, 0), 7);
+        plan.rollback_floor_after_install = RollbackStateDisk {
+            minimum_epoch: 8,
+            minimum_version: Version::new(2, 0, 0),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(UpdateRuntimeError::CorruptPersistentState)
+        );
+
+        plan.rollback_floor_after_install = RollbackStateDisk {
+            minimum_epoch: 7,
+            minimum_version: Version::new(2, 0, 1),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(UpdateRuntimeError::CorruptPersistentState)
+        );
+    }
+
+    #[test]
     fn install_waits_for_restart_and_health_before_rollback_floor_advances() {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
@@ -1896,6 +2317,9 @@ mod tests {
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
         let mut installer = FakeInstaller::default();
         let mut journal = FakeJournal::default();
@@ -1936,6 +2360,110 @@ mod tests {
     }
 
     #[test]
+    fn floor_failure_preserves_activated_backup_and_healthy_journal_for_recovery() {
+        let bytes = b"verified artifact";
+        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        session
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        let mut installer = FakeInstaller::default();
+        let mut journal = FakeJournal::default();
+        let mut rollback = FakeRollbackStore::new();
+        session
+            .begin_install(
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                &mut installer,
+                &mut journal,
+                &mut rollback,
+            )
+            .unwrap();
+        session
+            .acknowledge_restart(&mut installer, &mut journal)
+            .unwrap();
+        rollback.fail_advance = true;
+
+        assert_eq!(
+            session.confirm_healthy(&mut installer, &mut journal, &mut rollback),
+            Err(UpdateRuntimeError::RollbackStateFailed)
+        );
+        assert_eq!(installer.commits, 0);
+        assert_eq!(installer.observation, Some(InstallObservation::Activated));
+        assert_eq!(
+            InstallJournal::decode(journal.encoded.as_deref().unwrap())
+                .unwrap()
+                .phase(),
+            InstallPhase::Healthy
+        );
+
+        rollback.fail_advance = false;
+        assert!(matches!(
+            recover_installation(&mut installer, &mut journal, &mut rollback),
+            Ok(RecoveryStatus::Installed(_))
+        ));
+        assert_eq!(installer.commits, 1);
+        assert_eq!(rollback.advances, 1);
+        assert!(journal.encoded.is_none());
+    }
+
+    #[test]
+    fn commit_failure_after_floor_advance_retries_retirement_without_lowering_floor() {
+        let bytes = b"verified artifact";
+        let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
+        session
+            .decide(UserConsent::ApproveDownloadAndInstall)
+            .unwrap();
+        session
+            .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
+        let mut installer = FakeInstaller::default();
+        let mut journal = FakeJournal::default();
+        let mut rollback = FakeRollbackStore::new();
+        session
+            .begin_install(
+                InstallTarget::macos_app_bundle("dev.nodavo.macos").unwrap(),
+                &mut installer,
+                &mut journal,
+                &mut rollback,
+            )
+            .unwrap();
+        session
+            .acknowledge_restart(&mut installer, &mut journal)
+            .unwrap();
+        installer.fail_commit = true;
+
+        assert_eq!(
+            session.confirm_healthy(&mut installer, &mut journal, &mut rollback),
+            Err(UpdateRuntimeError::InstallerFailed)
+        );
+        assert_eq!(rollback.advances, 1);
+        assert_eq!(installer.commits, 0);
+        assert_eq!(
+            InstallJournal::decode(journal.encoded.as_deref().unwrap())
+                .unwrap()
+                .phase(),
+            InstallPhase::FloorAdvanced
+        );
+
+        installer.fail_commit = false;
+        assert!(matches!(
+            recover_installation(&mut installer, &mut journal, &mut rollback),
+            Ok(RecoveryStatus::Installed(_))
+        ));
+        assert_eq!(rollback.advances, 1);
+        assert_eq!(installer.commits, 1);
+        assert!(journal.encoded.is_none());
+    }
+
+    #[test]
     fn install_target_must_match_authenticated_platform() {
         let bytes = b"verified artifact";
         let mut session = UpdateSession::new(verified_release(bytes, "macos"), rollback_floor());
@@ -1944,6 +2472,9 @@ mod tests {
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
 
         assert_eq!(
@@ -1963,6 +2494,9 @@ mod tests {
             .unwrap();
         same_platform
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        same_platform
+            .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
         assert_eq!(
             same_platform.begin_install(
@@ -1985,11 +2519,16 @@ mod tests {
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
             .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
         let mut installer = FakeInstaller::default();
         let mut journal = FakeJournal::default();
         let mut rollback = FakeRollbackStore {
             state: RollbackState::new(8, Version::parse("2.1.0").unwrap()),
+            loads: 0,
             advances: 0,
+            fail_advance: false,
         };
 
         assert_eq!(
@@ -2014,6 +2553,9 @@ mod tests {
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
         let mut installer = FakeInstaller::default();
         let mut journal = FakeJournal::default();
@@ -2093,6 +2635,9 @@ mod tests {
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
             .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
+            .unwrap();
         let mut installer = FakeInstaller::default();
         let mut journal = FakeJournal::default();
         let mut rollback = FakeRollbackStore::new();
@@ -2144,7 +2689,9 @@ mod tests {
         };
         let mut rollback = FakeRollbackStore {
             state: RollbackState::new(8, Version::parse("2.1.0").unwrap()),
+            loads: 0,
             advances: 0,
+            fail_advance: false,
         };
 
         assert_eq!(
@@ -2186,7 +2733,9 @@ mod tests {
         };
         let mut rollback = FakeRollbackStore {
             state: RollbackState::new(8, Version::parse("2.1.0").unwrap()),
+            loads: 0,
             advances: 0,
+            fail_advance: false,
         };
 
         assert_eq!(
@@ -2211,6 +2760,9 @@ mod tests {
             .unwrap();
         session
             .stage_download(&mut FakeDownloader::new(bytes), &mut FakeStage::default())
+            .unwrap();
+        session
+            .authorize_install(InstallConsent::InstallAndRestart)
             .unwrap();
         let mut installer = FakeInstaller::default();
         let mut journal = FakeJournal::default();
@@ -2248,6 +2800,17 @@ mod tests {
         );
         assert_eq!(
             InstallJournal::decode(&vec![b'x'; MAX_RECOVERY_JOURNAL_BYTES + 1]),
+            Err(UpdateRuntimeError::CorruptPersistentState)
+        );
+        let journal = InstallJournal {
+            phase: InstallPhase::Preparing,
+            plan: InstallPlan::test_macos(Version::new(2, 0, 0), 7),
+        };
+        let mut obsolete: serde_json::Value =
+            serde_json::from_slice(&journal.encode().unwrap()).unwrap();
+        obsolete["schema"] = serde_json::Value::from(1);
+        assert_eq!(
+            InstallJournal::decode(&serde_json::to_vec(&obsolete).unwrap()),
             Err(UpdateRuntimeError::CorruptPersistentState)
         );
     }

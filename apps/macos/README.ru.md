@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 14 -->
+<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 15 -->
 
 # Nodavo для macOS
 
@@ -36,11 +36,11 @@ Settings предоставляет текущий не активирующий
 
 Агент по умолчанию не настроен. Только сборка, в которую явно встроены закреплённые HTTPS endpoint манифеста и публичный ключ Ed25519, может обращаться к update service; репозиторий не содержит ни production endpoint, ни приватного signing key, а live production check или signing ceremony не заявляются. Текущий путь macOS/Unix использует нативный платформенный TLS без redirects и decompression, проверяет ограниченный подписанный манифест и same-origin артефакт, привязывает согласие к его canonical offer UUID и возобновляемо пишет проверенное по digest содержимое в приватный capability-rooted staging root с межпроцессной арендой, квотами, retention и fsync.
 
-Отсутствуют installer handoff, activation, перезапуск приложения или агента, health/rollback supervisor, защищённый production Keychain-журнал состояния обновлений и durable rollback floor. Staged content не выполняется. Для правильно подписанного release XPC проверяет точные Developer ID/Team ID identifiers и entitlements каждого сообщения UI-to-agent, а UI взаимно проверяет точный helper. Предыдущий claim socket audit-token отозван: он мог аутентифицировать post-exec task при чтении bytes, поставленных в очередь до exec. Development feature намеренно сохраняет только unsafe same-UID UDS. Live proof с production credentials Nodavo для signing, provisioning и notarization остаётся открытым release gate. Windows updater staging и UI integration также отсутствуют.
+Platform source умеет проверять и удерживать точное ограниченное sealed universal app tree, включая подписи app и nested agent, entitlements, notarization/System Policy, owner/mode/ACL rules, hardlink rejection, immutable contents и mutation detection. Он намеренно не предоставляет swap, activation или rollback API: локальная проверка показала, что unprivileged cross-parent exchange завершается ошибкой после sealing обоих trees против same-user mutation. В репозитории всё ещё нет installer handoff, перезапуска приложения или агента, health/rollback supervisor, защищённого production Keychain-журнала обновлений и durable rollback floor. Staged content не выполняется. Live proof с production credentials Nodavo для signing, provisioning и notarization остаётся открытым release gate.
 
 ## Упаковка
 
-Репозиторий может собрать universal-приложение `arm64` + `x86_64`, содержащее SwiftUI executable и пользовательский helper агента:
+Репозиторий может собрать universal-приложение `arm64` + `x86_64`, содержащее SwiftUI executable и пользовательский helper агента. Тот же development run создаёт явно не notarized universal update ZIP и точные metadata size/SHA-256 для validation tests; текущий продукт не умеет устанавливать ни один из этих artifacts:
 
 ```bash
 scripts/package-macos.sh --development --version 0.1.0 --build-number 1

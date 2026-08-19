@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 10 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 11 -->
 
 # Архитектура
 
@@ -45,13 +45,15 @@ flowchart TB
 | `nodavo-input` | Canonical HID events, mappings, coordinates и modifier state |
 | `nodavo-clipboard` | Text/HTML/image normalization, revisions, ownership и limits |
 | `nodavo-transfer` | Manifests, chunks, staging, BLAKE3, resume, quota и finalize |
-| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard, Keychain и signed local-IPC peer policy |
-| `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard и OLE APIs |
+| `nodavo-platform-macos` | Capture, injection, permissions, displays, pasteboard, Keychain, signed local-IPC policy и validation-only sealed update bundles |
+| `nodavo-platform-windows` | Capture, injection, sessions, displays, clipboard, OLE, private update staging и read-only Appx inspection |
 | `nodavo-local-ipc` | Authenticated UI ↔ agent protocol и OS access controls |
 | `nodavo-agent` | Process orchestration и lifecycle |
-| `nodavo-update` | Signed manifests, channels, verification и rollback metadata |
+| `nodavo-update` | Signed manifests, verification, staging contracts и effect-free reducer внешнего supervisor |
 
 Platform и transport boundaries используют dependency injection, чтобы тесты заменяли их детерминированными virtual adapters.
+
+Activation обновления намеренно находится вне работающих UI и agent. Source-only reducer supervisor разрешает по одному durable external effect и связывает точный evidence candidate, predecessor, process attempt, timeout, health и rollback floor. Platform crates пока останавливаются на границе validation/staging: macOS удерживает sealed signed universal tree, но не предоставляет replacement primitive, а Windows выполняет приватный staging и Appx inspection без deployment. Отдельно упакованный supervisor, защищённые persistent stores, activation adapters, restart/health IPC и физическая power-loss квалификация ещё отсутствуют.
 
 ## Модель транспорта
 

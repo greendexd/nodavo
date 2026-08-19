@@ -151,6 +151,7 @@ pub(crate) struct AgentRuntime {
     readiness_probe_gate: Mutex<()>,
     readiness_cache_completed_at: Mutex<Option<Instant>>,
     readiness_transition_epoch: AtomicU64,
+    update_exit_prepared: AtomicBool,
     session_safety: Arc<SessionSafetyState>,
     storage: Arc<dyn DevelopmentStorage>,
     material: Arc<DeviceMaterial>,
@@ -185,6 +186,7 @@ impl AgentRuntime {
             readiness_probe_gate: Mutex::new(()),
             readiness_cache_completed_at: Mutex::new(None),
             readiness_transition_epoch: AtomicU64::new(0),
+            update_exit_prepared: AtomicBool::new(false),
             session_safety: Arc::new(SessionSafetyState::default()),
             storage,
             material: Arc::new(material),
@@ -767,6 +769,18 @@ impl AgentRuntime {
         self.handle_safety_stop(SessionStop::Sleeping).await
     }
 
+    /// Permanently quiesces peer/session and transfer work before this process
+    /// hands control to an external update supervisor or exits normally.
+    ///
+    /// Unlike an emergency stop, success deliberately keeps the shared safety
+    /// barrier active and worker admission closed. A later session finalizer
+    /// therefore cannot publish `Ready`, and this process cannot accept a new
+    /// pairing/session generation after acknowledging shutdown.
+    pub(crate) async fn prepare_update_exit(&self) -> Result<AgentStatus, AgentError> {
+        self.prepare_update_exit_with_deadline(SAFETY_OPERATION_DEADLINE)
+            .await
+    }
+
     pub(crate) async fn request_remote_focus(
         &self,
         ttl_ms: u32,
@@ -863,6 +877,52 @@ impl AgentRuntime {
         }
     }
 
+    async fn prepare_update_exit_with_deadline(
+        &self,
+        deadline: Duration,
+    ) -> Result<AgentStatus, AgentError> {
+        {
+            let mut status = self.status.write().await;
+            if self.session_safety.failure_latched() {
+                return Err(AgentError::SafetyRecoveryFailed);
+            }
+            if self.update_exit_prepared.load(Ordering::Acquire) {
+                return Ok(status.clone());
+            }
+            if self.session_safety.operation_active() {
+                return Err(AgentError::Busy);
+            }
+            self.transfer_store.close_worker_admission_for_safety();
+            self.session_safety.set_operation_active(true);
+            status.phase = AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        }
+
+        let operation = timeout(
+            deadline,
+            self.handle_safety_stop_inner(SessionStop::Emergency),
+        )
+        .await;
+        if !matches!(operation, Ok(Ok(()))) {
+            self.fail_closed_safety_stop().await;
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
+
+        let mut status = self.status.write().await;
+        if self.session_safety.failure_latched() {
+            status.phase = AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+            return Err(AgentError::SafetyRecoveryFailed);
+        }
+        self.update_exit_prepared.store(true, Ordering::Release);
+        status.input_owner = InputOwner::Local;
+        status.focus_state = FocusState::Local;
+        status.connected_peer = None;
+        status.phase = AgentPhase::Stopping;
+        status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+        Ok(status.clone())
+    }
+
     async fn handle_safety_stop_inner(&self, reason: SessionStop) -> Result<(), AgentError> {
         match self.stop_session(reason).await {
             Ok(true) => {}
@@ -885,6 +945,14 @@ impl AgentRuntime {
             status.phase = AgentPhase::Stopping;
             status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
             return Err(AgentError::SafetyRecoveryFailed);
+        }
+        if self.update_exit_prepared.load(Ordering::Acquire) {
+            status.input_owner = InputOwner::Local;
+            status.focus_state = FocusState::Local;
+            status.connected_peer = None;
+            status.phase = AgentPhase::Stopping;
+            status.readiness.session_topology = SessionTopologyReadiness::NotConnected;
+            return Ok(status.clone());
         }
         self.transfer_store.reopen_worker_admission_after_safety();
         self.session_safety.set_operation_active(false);
@@ -2046,6 +2114,57 @@ mod tests {
         assert_eq!(status.phase, AgentPhase::Ready);
         assert!(!runtime.session_safety.operation_active());
         assert!(!runtime.session_safety.failure_latched());
+    }
+
+    #[tokio::test]
+    async fn update_exit_keeps_admission_and_ready_publication_permanently_closed() {
+        let runtime = readiness_runtime();
+        {
+            let mut status = runtime.status.write().await;
+            status.phase = AgentPhase::Connected;
+            status.connected_peer = Some("test-peer".to_owned());
+            status.input_owner = InputOwner::Remote;
+            status.focus_state = FocusState::ControlledByPeer;
+            status.readiness.session_topology = SessionTopologyReadiness::Ready;
+        }
+
+        let stopped = runtime.prepare_update_exit().await.unwrap();
+        assert_eq!(stopped.phase, AgentPhase::Stopping);
+        assert_eq!(stopped.connected_peer, None);
+        assert_eq!(stopped.input_owner, InputOwner::Local);
+        assert_eq!(stopped.focus_state, FocusState::Local);
+        assert!(runtime.update_exit_prepared.load(Ordering::Acquire));
+        assert!(runtime.session_safety.operation_active());
+        assert!(!runtime.session_safety.failure_latched());
+
+        runtime.publish_session_finished_status(false).await;
+        assert_eq!(runtime.status().await.phase, AgentPhase::Stopping);
+        let repeated_finalize = runtime.finish_safety_stop_success().await.unwrap();
+        assert_eq!(repeated_finalize.phase, AgentPhase::Stopping);
+        assert!(runtime.session_safety.operation_active());
+        assert!(matches!(
+            runtime.begin_session_operation().await,
+            Err(AgentError::Busy)
+        ));
+
+        let repeated = runtime.prepare_update_exit().await.unwrap();
+        assert_eq!(repeated.phase, AgentPhase::Stopping);
+    }
+
+    #[tokio::test]
+    async fn failed_update_exit_latches_safety_without_claiming_prepared() {
+        let runtime = readiness_runtime();
+        runtime.busy.store(true, Ordering::Release);
+        assert!(matches!(
+            runtime
+                .prepare_update_exit_with_deadline(Duration::ZERO)
+                .await,
+            Err(AgentError::SafetyRecoveryFailed)
+        ));
+        assert!(!runtime.update_exit_prepared.load(Ordering::Acquire));
+        assert!(runtime.session_safety.failure_latched());
+        assert!(runtime.session_safety.operation_active());
+        assert_eq!(runtime.status().await.phase, AgentPhase::Stopping);
     }
 
     #[tokio::test]

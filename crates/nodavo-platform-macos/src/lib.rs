@@ -12,6 +12,8 @@ use thiserror::Error;
 
 mod clipboard;
 mod keychain;
+#[cfg(target_os = "macos")]
+mod update;
 
 pub use clipboard::{
     MacClipboard, MacClipboardEffectExecutor, MacClipboardEffectOutcome, MacClipboardError,
@@ -21,6 +23,13 @@ pub use keychain::{
     DEVICE_SIGNING_SEED_ACCOUNT, KeychainError, KeychainSecret, MAX_KEYCHAIN_SECRET_BYTES,
     MacKeychain, NODAVO_AGENT_KEYCHAIN_SERVICE, StoreDisposition, TLS_PRIVATE_KEY_ACCOUNT,
     TRUST_DATABASE_ACCOUNT,
+};
+#[cfg(target_os = "macos")]
+pub use update::{
+    MacUpdateBundleIdentity, MacUpdateBundlePolicy, MacUpdateError, MacUpdateInstallRoot,
+    MacUpdatePrivateRoot, MacValidatedCandidateBundle, MacValidatedInstalledBundle,
+    NODAVO_AGENT_BUNDLE_IDENTIFIER, NODAVO_AGENT_BUNDLE_RELATIVE_PATH, NODAVO_AGENT_EXECUTABLE,
+    NODAVO_AGENT_LAUNCH_PLIST, NODAVO_APP_BUNDLE_IDENTIFIER, NODAVO_APP_EXECUTABLE,
 };
 
 pub const NODAVO_SYNTHETIC_EVENT_TAG: i64 = 0x4E_4F_44_41_56_4F;

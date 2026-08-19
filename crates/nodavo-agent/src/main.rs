@@ -501,10 +501,10 @@ async fn dispatch_ui_command(command: UiCommand, runtime: Arc<AgentRuntime>) -> 
             Ok(status) => AgentEvent::Status(status),
             Err(error) => agent_error_event(&error),
         },
-        UiCommand::Shutdown {} => {
-            runtime.disconnect_all();
-            AgentEvent::ShutdownAccepted
-        }
+        UiCommand::Shutdown {} => match runtime.prepare_update_exit().await {
+            Ok(_) => AgentEvent::ShutdownAccepted,
+            Err(error) => agent_error_event(&error),
+        },
     }
 }
 

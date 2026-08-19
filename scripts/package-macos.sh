@@ -203,6 +203,14 @@ MACOS_SOURCE="${REPOSITORY_ROOT}/apps/macos"
 PACKAGING_SOURCE="${MACOS_SOURCE}/Packaging"
 BUILD_ROOT="${REPOSITORY_ROOT}/target/package-macos/${VERSION}-${BUILD_NUMBER}-${MODE}"
 OUTPUT_DIRECTORY=${OUTPUT_DIRECTORY:-"${REPOSITORY_ROOT}/dist/macos"}
+
+RUST_PRODUCT_VERSION=$(cargo metadata --locked --no-deps --format-version 1 \
+    --manifest-path "${REPOSITORY_ROOT}/Cargo.toml" \
+    | python3 -c 'import json,sys; matches=[p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nodavo-agent"]; print(matches[0]) if len(matches) == 1 else sys.exit("nodavo-agent package metadata is missing or ambiguous")') \
+    || fail "could not read the exact nodavo-agent package version"
+[[ "$VERSION" == "$RUST_PRODUCT_VERSION" ]] \
+    || fail "--version ${VERSION} does not match nodavo-agent ${RUST_PRODUCT_VERSION}"
+
 mkdir -p "$OUTPUT_DIRECTORY"
 OUTPUT_DIRECTORY=$(cd "$OUTPUT_DIRECTORY" && pwd -P)
 
@@ -481,6 +489,101 @@ PY
     spctl --assess --type execute --verbose=4 "$APP_PATH"
 fi
 
+# The validation-only updater boundary accepts only a sealed bundle tree. Seal
+# after all signing/notarization mutations, then repeat the platform checks so
+# the emitted app, DMG, and update archive all carry the same immutable modes.
+chmod -R a-w "$APP_PATH"
+python3 - "$APP_PATH" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for candidate in (root, *root.rglob("*")):
+    if stat.S_IMODE(os.lstat(candidate).st_mode) & 0o222:
+        raise SystemExit(f"sealed application contains a writable node: {candidate}")
+PY
+codesign --verify --deep --strict --all-architectures --verbose=2 "$APP_PATH"
+if [[ "$MODE" == "release" ]]; then
+    xcrun stapler validate "$APP_PATH"
+    spctl --assess --type execute --verbose=4 "$APP_PATH"
+fi
+
+if [[ "$MODE" == "release" ]]; then
+    UPDATE_ARCHIVE_NAME="Nodavo-${VERSION}-${BUILD_NUMBER}-macos-universal.zip"
+    UPDATE_METADATA_NAME="Nodavo-${VERSION}-${BUILD_NUMBER}-macos-universal.update.json"
+else
+    UPDATE_ARCHIVE_NAME="Nodavo-${VERSION}-${BUILD_NUMBER}-macos-universal-development-NOT-NOTARIZED.zip"
+    UPDATE_METADATA_NAME="Nodavo-${VERSION}-${BUILD_NUMBER}-macos-universal-development-NOT-NOTARIZED.update.json"
+fi
+UPDATE_ARCHIVE_PATH="${BUILD_ROOT}/${UPDATE_ARCHIVE_NAME}"
+UPDATE_METADATA_PATH="${BUILD_ROOT}/${UPDATE_METADATA_NAME}"
+UPDATE_VERIFY_ROOT="${BUILD_ROOT}/update-archive-verify"
+rm -rf "$UPDATE_ARCHIVE_PATH" "$UPDATE_METADATA_PATH" "$UPDATE_VERIFY_ROOT"
+ditto -c -k --keepParent "$APP_PATH" "$UPDATE_ARCHIVE_PATH"
+mkdir -p "$UPDATE_VERIFY_ROOT"
+ditto -x -k "$UPDATE_ARCHIVE_PATH" "$UPDATE_VERIFY_ROOT"
+[[ -d "${UPDATE_VERIFY_ROOT}/Nodavo.app" ]] \
+    || fail "update archive does not contain the exact Nodavo.app root"
+[[ $(find "$UPDATE_VERIFY_ROOT" -mindepth 1 -maxdepth 1 -print \
+    | wc -l | tr -d '[:space:]') == 1 ]] \
+    || fail "update archive contains an unexpected top-level entry"
+python3 - "${UPDATE_VERIFY_ROOT}/Nodavo.app" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for candidate in (root, *root.rglob("*")):
+    if stat.S_IMODE(os.lstat(candidate).st_mode) & 0o222:
+        raise SystemExit(f"update archive contains a writable bundle node: {candidate}")
+PY
+codesign --verify --deep --strict --all-architectures --verbose=2 \
+    "${UPDATE_VERIFY_ROOT}/Nodavo.app"
+verify_universal "${UPDATE_VERIFY_ROOT}/Nodavo.app/Contents/MacOS/Nodavo"
+verify_universal \
+    "${UPDATE_VERIFY_ROOT}/Nodavo.app/Contents/Library/Helpers/NodavoAgent.app/Contents/MacOS/nodavo-agent"
+if [[ "$MODE" == "release" ]]; then
+    xcrun stapler validate "${UPDATE_VERIFY_ROOT}/Nodavo.app"
+    spctl --assess --type execute --verbose=4 "${UPDATE_VERIFY_ROOT}/Nodavo.app"
+fi
+
+python3 - "$UPDATE_ARCHIVE_PATH" "$UPDATE_METADATA_PATH" "$UPDATE_ARCHIVE_NAME" \
+    "$VERSION" "$BUILD_NUMBER" "$MODE" "$APP_BUNDLE_ID" "$AGENT_BUNDLE_ID" <<'PY'
+import hashlib
+import json
+import sys
+
+archive_path, output_path, archive_name, version, build, mode, app_id, agent_id = sys.argv[1:]
+digest = hashlib.sha256()
+size = 0
+with open(archive_path, "rb") as source:
+    while chunk := source.read(1024 * 1024):
+        size += len(chunk)
+        digest.update(chunk)
+if size <= 0:
+    raise SystemExit("update archive is empty")
+metadata = {
+    "schema": 1,
+    "product": "nodavo",
+    "platform": "macos",
+    "architectures": ["aarch64", "x86_64"],
+    "version": version,
+    "build": int(build),
+    "mode": mode,
+    "artifact": archive_name,
+    "artifact_size": size,
+    "artifact_sha256": digest.hexdigest(),
+    "bundle_identifier": app_id,
+    "agent_bundle_identifier": agent_id,
+}
+with open(output_path, "x", encoding="utf-8", newline="\n") as destination:
+    json.dump(metadata, destination, sort_keys=True, separators=(",", ":"))
+    destination.write("\n")
+PY
+
 DMG_ROOT="${BUILD_ROOT}/dmg-root"
 mkdir -p "$DMG_ROOT"
 ditto "$APP_PATH" "${DMG_ROOT}/Nodavo.app"
@@ -519,12 +622,20 @@ if [[ "$MODE" == "release" ]]; then
 else
     OUTPUT_APP="${OUTPUT_DIRECTORY}/Nodavo-${VERSION}-development-NOT-NOTARIZED.app"
 fi
-rm -rf "$OUTPUT_APP" "${OUTPUT_DIRECTORY}/${DMG_NAME}"
+rm -rf \
+    "$OUTPUT_APP" \
+    "${OUTPUT_DIRECTORY}/${DMG_NAME}" \
+    "${OUTPUT_DIRECTORY}/${UPDATE_ARCHIVE_NAME}" \
+    "${OUTPUT_DIRECTORY}/${UPDATE_METADATA_NAME}"
 ditto "$APP_PATH" "$OUTPUT_APP"
 ditto "$DMG_PATH" "${OUTPUT_DIRECTORY}/${DMG_NAME}"
+ditto "$UPDATE_ARCHIVE_PATH" "${OUTPUT_DIRECTORY}/${UPDATE_ARCHIVE_NAME}"
+ditto "$UPDATE_METADATA_PATH" "${OUTPUT_DIRECTORY}/${UPDATE_METADATA_NAME}"
 
 echo "App: ${OUTPUT_APP}"
 echo "DMG: ${OUTPUT_DIRECTORY}/${DMG_NAME}"
+echo "Update archive: ${OUTPUT_DIRECTORY}/${UPDATE_ARCHIVE_NAME}"
+echo "Update metadata: ${OUTPUT_DIRECTORY}/${UPDATE_METADATA_NAME}"
 if [[ "$MODE" == "development" ]]; then
     echo "Status: DEVELOPMENT ONLY — ad-hoc signed, not notarized, not for distribution."
 else

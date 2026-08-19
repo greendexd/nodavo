@@ -6,20 +6,64 @@
 #import <Security/Security.h>
 #import <xpc/xpc.h>
 
+#include <arpa/inet.h>
 #include <bsm/libbsm.h>
+#include <CommonCrypto/CommonDigest.h>
+#include <dirent.h>
+#include <dispatch/dispatch.h>
 #include <limits.h>
+#include <mach-o/fat.h>
+#include <mach/machine.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/acl.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+#include <unistd.h>
 
 enum {
     NDV_IPC_OK = 0,
     NDV_IPC_REJECTED = 1,
 };
+
+enum {
+    NDV_UPDATE_OK = 0,
+    NDV_UPDATE_ENTRY_REJECTED = 1,
+    NDV_UPDATE_LAYOUT_REJECTED = 2,
+    NDV_UPDATE_IDENTITY_REJECTED = 3,
+    NDV_UPDATE_SIGNATURE_REJECTED = 4,
+    NDV_UPDATE_SYSTEM_POLICY_REJECTED = 9,
+    NDV_UPDATE_VERSION_CAPACITY = 129,
+    NDV_UPDATE_BUILD_CAPACITY = 65,
+    NDV_UPDATE_CDHASH_BYTES = 20,
+    NDV_UPDATE_TREE_HASH_BYTES = CC_SHA256_DIGEST_LENGTH,
+    NDV_UPDATE_CRITICAL_HANDLES = 6,
+    NDV_UPDATE_MAX_TREE_ENTRIES = 65536,
+    NDV_UPDATE_MAX_TREE_DEPTH = 64,
+};
+
+typedef struct {
+    uint64_t device;
+    uint64_t inode;
+} NdvUpdateIdentity;
+
+typedef struct {
+    NdvUpdateIdentity identity;
+    uint8_t app_code_directory_hash[NDV_UPDATE_CDHASH_BYTES];
+    uint8_t agent_code_directory_hash[NDV_UPDATE_CDHASH_BYTES];
+    uint8_t tree_hash[NDV_UPDATE_TREE_HASH_BYTES];
+    uint8_t tree_generation_hash[NDV_UPDATE_TREE_HASH_BYTES];
+    int32_t critical_fds[NDV_UPDATE_CRITICAL_HANDLES];
+    uint8_t require_effective_user_owner;
+    char version[NDV_UPDATE_VERSION_CAPACITY];
+    char build[NDV_UPDATE_BUILD_CAPACITY];
+} NdvUpdateBundleClaims;
 
 enum {
     NDV_AUDIT_TOKEN_WORDS = 8,
@@ -80,6 +124,1128 @@ static bool ndv_copy_u32(id value, uint32_t *output) {
     }
     *output = (uint32_t)scalar;
     return true;
+}
+
+static bool ndv_update_valid_leaf(const char *leaf) {
+    if (leaf == NULL || leaf[0] == '\0' || strcmp(leaf, ".") == 0 ||
+        strcmp(leaf, "..") == 0 || strlen(leaf) > NAME_MAX) {
+        return false;
+    }
+    return strchr(leaf, '/') == NULL;
+}
+
+#define NDV_UPDATE_MAX_FILE_BYTES (1ULL << 30)
+#define NDV_UPDATE_MAX_TREE_BYTES (4ULL << 30)
+
+typedef struct {
+    char **values;
+    size_t count;
+    size_t capacity;
+} NdvUpdateNameList;
+
+typedef struct {
+    CC_SHA256_CTX stable;
+    CC_SHA256_CTX tree_generation;
+    uint64_t entries;
+    uint64_t bytes;
+    bool require_effective_user_owner;
+} NdvUpdateTreeHasher;
+
+static const char *const ndv_update_critical_paths[NDV_UPDATE_CRITICAL_HANDLES] = {
+    "Contents/MacOS/Nodavo",
+    "Contents/Info.plist",
+    "Contents/Library/Helpers/NodavoAgent.app",
+    "Contents/Library/Helpers/NodavoAgent.app/Contents/MacOS/nodavo-agent",
+    "Contents/Library/Helpers/NodavoAgent.app/Contents/Info.plist",
+    "Contents/Library/LaunchAgents/dev.nodavo.agent.plist",
+};
+
+static const bool ndv_update_critical_directories[NDV_UPDATE_CRITICAL_HANDLES] = {
+    false, false, true, false, false, false,
+};
+
+static bool ndv_update_no_extended_acl(int descriptor) {
+    errno = 0;
+    acl_t acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED);
+    if (acl == NULL) {
+        /* APFS reports ENOENT when the vnode has no extended ACL. */
+        return errno == ENOENT;
+    }
+    acl_entry_t entry = NULL;
+    errno = 0;
+    int entry_status = acl_get_entry(acl, ACL_FIRST_ENTRY, &entry);
+    bool empty = entry_status < 0 && errno == EINVAL;
+    acl_free(acl);
+    return empty;
+}
+
+static bool ndv_update_owner_is_allowed(uid_t owner,
+                                        bool require_effective_user_owner) {
+    uid_t effective_user = geteuid();
+    return require_effective_user_owner
+               ? owner == effective_user
+               : owner == effective_user || owner == 0;
+}
+
+static bool ndv_update_sealed_status(const struct stat *status,
+                                     bool directory,
+                                     bool require_effective_user_owner) {
+    if (status == NULL ||
+        (directory ? !S_ISDIR(status->st_mode) : !S_ISREG(status->st_mode)) ||
+        !ndv_update_owner_is_allowed(status->st_uid,
+                                     require_effective_user_owner) ||
+        (status->st_mode & 0222) != 0) {
+        return false;
+    }
+    return directory || status->st_nlink == 1;
+}
+
+static bool ndv_update_same_vnode(const struct stat *first,
+                                  const struct stat *second) {
+    return first->st_dev == second->st_dev &&
+           first->st_ino == second->st_ino &&
+           first->st_mode == second->st_mode &&
+           first->st_uid == second->st_uid &&
+           first->st_gid == second->st_gid &&
+           first->st_size == second->st_size &&
+           first->st_flags == second->st_flags &&
+           first->st_mtimespec.tv_sec == second->st_mtimespec.tv_sec &&
+           first->st_mtimespec.tv_nsec == second->st_mtimespec.tv_nsec &&
+           first->st_ctimespec.tv_sec == second->st_ctimespec.tv_sec &&
+           first->st_ctimespec.tv_nsec == second->st_ctimespec.tv_nsec;
+}
+
+static bool ndv_update_hash_bytes(CC_SHA256_CTX *context,
+                                  const void *bytes,
+                                  size_t length) {
+    const uint8_t *cursor = bytes;
+    while (length > 0) {
+        CC_LONG chunk = length > UINT32_MAX ? UINT32_MAX : (CC_LONG)length;
+        if (CC_SHA256_Update(context, cursor, chunk) != 1) {
+            return false;
+        }
+        cursor += chunk;
+        length -= chunk;
+    }
+    return true;
+}
+
+static bool ndv_update_hash_u64(CC_SHA256_CTX *context, uint64_t value) {
+    uint8_t encoded[8];
+    for (size_t index = 0; index < sizeof(encoded); ++index) {
+        encoded[sizeof(encoded) - index - 1] = (uint8_t)(value & 0xff);
+        value >>= 8;
+    }
+    return ndv_update_hash_bytes(context, encoded, sizeof(encoded));
+}
+
+static bool ndv_update_hash_stat(CC_SHA256_CTX *context,
+                                 const struct stat *status,
+                                 uint8_t kind,
+                                 bool include_generation) {
+    if (!ndv_update_hash_bytes(context, &kind, sizeof(kind)) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_dev) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_ino) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_mode) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_uid) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_gid) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_size) ||
+        !ndv_update_hash_u64(context, (uint64_t)status->st_flags)) {
+        return false;
+    }
+    return !include_generation ||
+           (ndv_update_hash_u64(context, (uint64_t)status->st_mtimespec.tv_sec) &&
+            ndv_update_hash_u64(context, (uint64_t)status->st_mtimespec.tv_nsec) &&
+            ndv_update_hash_u64(context, (uint64_t)status->st_ctimespec.tv_sec) &&
+            ndv_update_hash_u64(context, (uint64_t)status->st_ctimespec.tv_nsec));
+}
+
+static int ndv_update_compare_names(const void *left, const void *right) {
+    const char *const *left_name = left;
+    const char *const *right_name = right;
+    return strcmp(*left_name, *right_name);
+}
+
+static void ndv_update_free_names(NdvUpdateNameList *names) {
+    if (names == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < names->count; ++index) {
+        free(names->values[index]);
+    }
+    free(names->values);
+    names->values = NULL;
+    names->count = 0;
+    names->capacity = 0;
+}
+
+static bool ndv_update_list_names(int directory_fd, NdvUpdateNameList *out_names) {
+    memset(out_names, 0, sizeof(*out_names));
+    /* `dup` would share the directory-stream offset and poison later scans. */
+    int duplicate = openat(directory_fd,
+                           ".",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (duplicate < 0) {
+        return false;
+    }
+    DIR *directory = fdopendir(duplicate);
+    if (directory == NULL) {
+        close(duplicate);
+        return false;
+    }
+    bool valid = true;
+    errno = 0;
+    for (struct dirent *entry = readdir(directory);
+         entry != NULL;
+         entry = readdir(directory)) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            errno = 0;
+            continue;
+        }
+        if (!ndv_update_valid_leaf(entry->d_name) ||
+            out_names->count >= NDV_UPDATE_MAX_TREE_ENTRIES) {
+            valid = false;
+            break;
+        }
+        if (out_names->count == out_names->capacity) {
+            size_t next_capacity = out_names->capacity == 0
+                                       ? 16
+                                       : out_names->capacity * 2;
+            if (next_capacity > NDV_UPDATE_MAX_TREE_ENTRIES) {
+                next_capacity = NDV_UPDATE_MAX_TREE_ENTRIES;
+            }
+            char **grown = realloc(out_names->values,
+                                   next_capacity * sizeof(*grown));
+            if (grown == NULL) {
+                valid = false;
+                break;
+            }
+            out_names->values = grown;
+            out_names->capacity = next_capacity;
+        }
+        out_names->values[out_names->count] = strdup(entry->d_name);
+        if (out_names->values[out_names->count] == NULL) {
+            valid = false;
+            break;
+        }
+        out_names->count += 1;
+        errno = 0;
+    }
+    if (errno != 0) {
+        valid = false;
+    }
+    closedir(directory);
+    if (!valid) {
+        ndv_update_free_names(out_names);
+        return false;
+    }
+    qsort(out_names->values,
+          out_names->count,
+          sizeof(*out_names->values),
+          ndv_update_compare_names);
+    return true;
+}
+
+static bool ndv_update_hash_tree_fd(int descriptor,
+                                    bool directory,
+                                    const char *name,
+                                    uint32_t depth,
+                                    NdvUpdateTreeHasher *hasher);
+
+static bool ndv_update_hash_regular_file(int descriptor,
+                                         const struct stat *before,
+                                         NdvUpdateTreeHasher *hasher) {
+    if (before->st_size < 0 ||
+        (uint64_t)before->st_size > NDV_UPDATE_MAX_FILE_BYTES ||
+        hasher->bytes > NDV_UPDATE_MAX_TREE_BYTES - (uint64_t)before->st_size) {
+        return false;
+    }
+    uint8_t buffer[64 * 1024];
+    off_t offset = 0;
+    while (offset < before->st_size) {
+        size_t requested = (uint64_t)(before->st_size - offset) > sizeof(buffer)
+                               ? sizeof(buffer)
+                               : (size_t)(before->st_size - offset);
+        ssize_t count = pread(descriptor, buffer, requested, offset);
+        if (count <= 0 ||
+            !ndv_update_hash_bytes(&hasher->stable, buffer, (size_t)count)) {
+            return false;
+        }
+        offset += count;
+    }
+    hasher->bytes += (uint64_t)before->st_size;
+    return true;
+}
+
+static bool ndv_update_hash_tree_fd(int descriptor,
+                                    bool directory,
+                                    const char *name,
+                                    uint32_t depth,
+                                    NdvUpdateTreeHasher *hasher) {
+    if (descriptor < 0 || name == NULL || hasher == NULL ||
+        depth > NDV_UPDATE_MAX_TREE_DEPTH ||
+        hasher->entries >= NDV_UPDATE_MAX_TREE_ENTRIES) {
+        return false;
+    }
+    struct stat before;
+    memset(&before, 0, sizeof(before));
+    if (fstat(descriptor, &before) != 0 ||
+        !ndv_update_sealed_status(&before,
+                                  directory,
+                                  hasher->require_effective_user_owner) ||
+        !ndv_update_no_extended_acl(descriptor)) {
+        return false;
+    }
+    size_t name_length = strlen(name);
+    uint8_t kind = directory ? 'D' : 'F';
+    if (!ndv_update_hash_u64(&hasher->stable, name_length) ||
+        !ndv_update_hash_bytes(&hasher->stable, name, name_length) ||
+        !ndv_update_hash_stat(&hasher->stable, &before, kind, false) ||
+        !ndv_update_hash_u64(&hasher->tree_generation, name_length) ||
+        !ndv_update_hash_bytes(&hasher->tree_generation, name, name_length) ||
+        !ndv_update_hash_stat(&hasher->tree_generation,
+                              &before,
+                              kind,
+                              true)) {
+        return false;
+    }
+    hasher->entries += 1;
+
+    bool valid = true;
+    if (directory) {
+        NdvUpdateNameList names;
+        if (!ndv_update_list_names(descriptor, &names)) {
+            return false;
+        }
+        for (size_t index = 0; valid && index < names.count; ++index) {
+            struct stat named;
+            memset(&named, 0, sizeof(named));
+            if (fstatat(descriptor,
+                        names.values[index],
+                        &named,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
+                (!S_ISDIR(named.st_mode) && !S_ISREG(named.st_mode))) {
+                valid = false;
+                break;
+            }
+            bool child_directory = S_ISDIR(named.st_mode);
+            int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+            if (child_directory) {
+                flags |= O_DIRECTORY;
+            }
+            int child = openat(descriptor, names.values[index], flags);
+            struct stat opened;
+            memset(&opened, 0, sizeof(opened));
+            if (child < 0 || fstat(child, &opened) != 0 ||
+                named.st_dev != opened.st_dev || named.st_ino != opened.st_ino ||
+                !ndv_update_hash_tree_fd(child,
+                                         child_directory,
+                                         names.values[index],
+                                         depth + 1,
+                                         hasher)) {
+                valid = false;
+            }
+            if (child >= 0) {
+                close(child);
+            }
+        }
+        ndv_update_free_names(&names);
+    } else {
+        valid = ndv_update_hash_regular_file(descriptor, &before, hasher);
+    }
+
+    struct stat after;
+    memset(&after, 0, sizeof(after));
+    return valid && fstat(descriptor, &after) == 0 &&
+           ndv_update_same_vnode(&before, &after);
+}
+
+static bool ndv_update_observe_sealed_tree_fd(
+    int bundle_fd,
+    bool require_effective_user_owner,
+    uint8_t out_tree_hash[NDV_UPDATE_TREE_HASH_BYTES],
+    uint8_t out_tree_generation_hash[NDV_UPDATE_TREE_HASH_BYTES]) {
+    NdvUpdateTreeHasher hasher;
+    memset(&hasher, 0, sizeof(hasher));
+    hasher.require_effective_user_owner = require_effective_user_owner;
+    static const uint8_t stable_domain[] = "Nodavo sealed app tree v1";
+    static const uint8_t generation_domain[] = "Nodavo sealed tree generation v1";
+    if (CC_SHA256_Init(&hasher.stable) != 1 ||
+        CC_SHA256_Init(&hasher.tree_generation) != 1 ||
+        !ndv_update_hash_bytes(&hasher.stable,
+                               stable_domain,
+                               sizeof(stable_domain) - 1) ||
+        !ndv_update_hash_bytes(&hasher.tree_generation,
+                               generation_domain,
+                               sizeof(generation_domain) - 1) ||
+        !ndv_update_hash_tree_fd(bundle_fd, true, "", 0, &hasher) ||
+        CC_SHA256_Final(out_tree_hash, &hasher.stable) != 1 ||
+        CC_SHA256_Final(out_tree_generation_hash,
+                        &hasher.tree_generation) != 1) {
+        return false;
+    }
+    return true;
+}
+
+static int ndv_update_open_relative(int root_fd,
+                                    const char *relative_path,
+                                    bool final_directory) {
+    if (root_fd < 0 || relative_path == NULL || relative_path[0] == '/' ||
+        relative_path[0] == '\0' || strlen(relative_path) >= PATH_MAX) {
+        return -1;
+    }
+    char mutable_path[PATH_MAX];
+    strlcpy(mutable_path, relative_path, sizeof(mutable_path));
+    int current = fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (current < 0) {
+        return -1;
+    }
+    char *save = NULL;
+    char *component = strtok_r(mutable_path, "/", &save);
+    while (component != NULL) {
+        char *next = strtok_r(NULL, "/", &save);
+        if (!ndv_update_valid_leaf(component)) {
+            close(current);
+            return -1;
+        }
+        bool directory = next != NULL || final_directory;
+        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
+        if (directory) {
+            flags |= O_DIRECTORY;
+        }
+        int child = openat(current, component, flags);
+        close(current);
+        if (child < 0) {
+            return -1;
+        }
+        current = child;
+        component = next;
+    }
+    return current;
+}
+
+static void ndv_update_close_critical_fds(
+    int32_t descriptors[NDV_UPDATE_CRITICAL_HANDLES]) {
+    for (size_t index = 0; index < NDV_UPDATE_CRITICAL_HANDLES; ++index) {
+        if (descriptors[index] >= 0) {
+            close(descriptors[index]);
+            descriptors[index] = -1;
+        }
+    }
+}
+
+static bool ndv_update_open_critical_fds(
+    int bundle_fd,
+    int32_t out_descriptors[NDV_UPDATE_CRITICAL_HANDLES]) {
+    for (size_t index = 0; index < NDV_UPDATE_CRITICAL_HANDLES; ++index) {
+        out_descriptors[index] = -1;
+    }
+    for (size_t index = 0; index < NDV_UPDATE_CRITICAL_HANDLES; ++index) {
+        int descriptor = ndv_update_open_relative(
+            bundle_fd,
+            ndv_update_critical_paths[index],
+            ndv_update_critical_directories[index]);
+        if (descriptor < 0) {
+            ndv_update_close_critical_fds(out_descriptors);
+            return false;
+        }
+        out_descriptors[index] = descriptor;
+    }
+    return true;
+}
+
+static bool ndv_update_same_open_vnode(int first_fd, int second_fd) {
+    struct stat first;
+    struct stat second;
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    return first_fd >= 0 && second_fd >= 0 &&
+           fstat(first_fd, &first) == 0 && fstat(second_fd, &second) == 0 &&
+           first.st_dev == second.st_dev && first.st_ino == second.st_ino;
+}
+
+static bool ndv_update_copy_required_utf8(id value,
+                                          const char *expected,
+                                          char *output,
+                                          size_t capacity) {
+    if (expected == NULL || !ndv_copy_optional_utf8(value, output, capacity)) {
+        return false;
+    }
+    return strcmp(output, expected) == 0;
+}
+
+static bool ndv_update_identity_at(int directory_fd,
+                                   const char *leaf,
+                                   NdvUpdateIdentity *out_identity) {
+    if (directory_fd < 0 || !ndv_update_valid_leaf(leaf) ||
+        out_identity == NULL) {
+        return false;
+    }
+    struct stat status;
+    memset(&status, 0, sizeof(status));
+    if (fstatat(directory_fd, leaf, &status, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(status.st_mode)) {
+        return false;
+    }
+    out_identity->device = (uint64_t)status.st_dev;
+    out_identity->inode = (uint64_t)status.st_ino;
+    return true;
+}
+
+int32_t ndv_update_open_directory(const char *path_utf8,
+                                  bool require_private,
+                                  int *out_fd,
+                                  NdvUpdateIdentity *out_identity) {
+    if (path_utf8 == NULL || path_utf8[0] != '/' ||
+        (strlen(path_utf8) > 1 && path_utf8[strlen(path_utf8) - 1] == '/') ||
+        out_fd == NULL ||
+        out_identity == NULL) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    *out_fd = -1;
+    memset(out_identity, 0, sizeof(*out_identity));
+    int descriptor = open(path_utf8, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    struct stat status;
+    memset(&status, 0, sizeof(status));
+    if (fstat(descriptor, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        close(descriptor);
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    if (require_private) {
+        bool rejected = status.st_uid != geteuid() ||
+                        (status.st_mode & 0077) != 0 ||
+                        !ndv_update_no_extended_acl(descriptor);
+        if (rejected) {
+            close(descriptor);
+            return NDV_UPDATE_ENTRY_REJECTED;
+        }
+    }
+    out_identity->device = (uint64_t)status.st_dev;
+    out_identity->inode = (uint64_t)status.st_ino;
+    *out_fd = descriptor;
+    return NDV_UPDATE_OK;
+}
+
+static bool ndv_update_path_has_type(NSString *path, bool directory) {
+    struct stat status;
+    memset(&status, 0, sizeof(status));
+    if (lstat(path.fileSystemRepresentation, &status) != 0) {
+        return false;
+    }
+    return directory ? S_ISDIR(status.st_mode) : S_ISREG(status.st_mode);
+}
+
+static uint32_t ndv_update_fat_u32(uint32_t value, bool swap) {
+    return swap ? ntohl(value) : value;
+}
+
+static uint64_t ndv_update_fat_u64(uint64_t value, bool swap) {
+    return swap ? __builtin_bswap64(value) : value;
+}
+
+/* Production bundles must contain exactly one arm64 and one x86_64 slice. */
+static bool ndv_update_exact_universal_binary(NSString *path) {
+    int fd = open(path.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        return false;
+    }
+    struct stat status;
+    struct fat_header header;
+    bool valid = fstat(fd, &status) == 0 && S_ISREG(status.st_mode) &&
+                 pread(fd, &header, sizeof(header), 0) == sizeof(header);
+    bool is_64 = false;
+    bool swap = false;
+    if (valid) {
+        if (header.magic == FAT_MAGIC || header.magic == FAT_MAGIC_64) {
+            is_64 = header.magic == FAT_MAGIC_64;
+        } else if (header.magic == FAT_CIGAM || header.magic == FAT_CIGAM_64) {
+            swap = true;
+            is_64 = header.magic == FAT_CIGAM_64;
+        } else {
+            valid = false;
+        }
+    }
+    uint32_t count = valid ? ndv_update_fat_u32(header.nfat_arch, swap) : 0;
+    valid = valid && count == 2;
+    bool arm64 = false;
+    bool x86_64 = false;
+    for (uint32_t index = 0; valid && index < count; ++index) {
+        cpu_type_t cpu = 0;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+        if (is_64) {
+            struct fat_arch_64 architecture;
+            off_t position = sizeof(header) + (off_t)index * sizeof(architecture);
+            if (pread(fd, &architecture, sizeof(architecture), position) != sizeof(architecture)) {
+                valid = false;
+                break;
+            }
+            cpu = (cpu_type_t)ndv_update_fat_u32((uint32_t)architecture.cputype, swap);
+            offset = ndv_update_fat_u64(architecture.offset, swap);
+            size = ndv_update_fat_u64(architecture.size, swap);
+        } else {
+            struct fat_arch architecture;
+            off_t position = sizeof(header) + (off_t)index * sizeof(architecture);
+            if (pread(fd, &architecture, sizeof(architecture), position) != sizeof(architecture)) {
+                valid = false;
+                break;
+            }
+            cpu = (cpu_type_t)ndv_update_fat_u32((uint32_t)architecture.cputype, swap);
+            offset = ndv_update_fat_u32(architecture.offset, swap);
+            size = ndv_update_fat_u32(architecture.size, swap);
+        }
+        if (size == 0 || offset > (uint64_t)status.st_size ||
+            size > (uint64_t)status.st_size - offset) {
+            valid = false;
+        } else if (cpu == CPU_TYPE_ARM64 && !arm64) {
+            arm64 = true;
+        } else if (cpu == CPU_TYPE_X86_64 && !x86_64) {
+            x86_64 = true;
+        } else {
+            valid = false;
+        }
+    }
+    close(fd);
+    return valid && arm64 && x86_64;
+}
+
+static bool ndv_update_copy_code_hash(NSDictionary *information,
+                                      uint8_t output[NDV_UPDATE_CDHASH_BYTES]) {
+    id value = information[(__bridge NSString *)kSecCodeInfoUnique];
+    if (![value isKindOfClass:NSData.class] ||
+        [(NSData *)value length] != NDV_UPDATE_CDHASH_BYTES) {
+        return false;
+    }
+    memcpy(output, [(NSData *)value bytes], NDV_UPDATE_CDHASH_BYTES);
+    return true;
+}
+
+static bool ndv_update_exact_string(id value, const char *expected) {
+    return expected != NULL && [value isKindOfClass:NSString.class] &&
+           [(NSString *)value isEqualToString:@(expected)];
+}
+
+static bool ndv_update_exact_bool(id value, bool expected) {
+    return [value isKindOfClass:NSNumber.class] &&
+           [(NSNumber *)value boolValue] == expected;
+}
+
+/* Fixed, non-shell System Policy assessment. No caller controls the executable. */
+static bool ndv_update_assess_system_policy(NSString *bundle_path) {
+    NSString *tool_path = @"/usr/sbin/spctl";
+    if (access(tool_path.fileSystemRepresentation, X_OK) != 0) {
+        return false;
+    }
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:tool_path];
+    task.arguments = @[@"--assess", @"--type", @"execute", @"--ignore-cache",
+                       @"--no-cache", @"--", bundle_path];
+    task.environment = @{};
+    NSFileHandle *null_device = [NSFileHandle fileHandleWithNullDevice];
+    task.standardInput = null_device;
+    task.standardOutput = null_device;
+    task.standardError = null_device;
+    dispatch_semaphore_t completed = dispatch_semaphore_create(0);
+    task.terminationHandler = ^(__unused NSTask *finished) {
+        dispatch_semaphore_signal(completed);
+    };
+    NSError *launch_error = nil;
+    if (![task launchAndReturnError:&launch_error]) {
+        return false;
+    }
+    if (dispatch_semaphore_wait(completed,
+                                dispatch_time(DISPATCH_TIME_NOW,
+                                              30LL * NSEC_PER_SEC)) != 0) {
+        [task terminate];
+        return false;
+    }
+    return task.terminationReason == NSTaskTerminationReasonExit &&
+           task.terminationStatus == 0;
+}
+
+static int32_t ndv_update_validate_code(
+    NSString *path,
+    const char *requirement_utf8,
+    const char *identifier_utf8,
+    const char *executable_utf8,
+    const char *team_identifier_utf8,
+    const char *version_utf8,
+    const char *build_utf8,
+    const char *nullable_keychain_access_group_utf8,
+    bool require_stapled_notarization,
+    NSDictionary **out_secured_plist,
+    uint8_t out_code_directory_hash[NDV_UPDATE_CDHASH_BYTES]) {
+    SecStaticCodeRef code = NULL;
+    SecRequirementRef requirement = NULL;
+    CFDictionaryRef signing_information = NULL;
+    CFErrorRef validation_error = NULL;
+    int32_t result = NDV_UPDATE_SIGNATURE_REJECTED;
+    @try {
+        do {
+            if (SecStaticCodeCreateWithPath((__bridge CFURLRef)[NSURL fileURLWithPath:path],
+                                            kSecCSDefaultFlags,
+                                            &code) != errSecSuccess ||
+                code == NULL) {
+                break;
+            }
+            NSString *requirement_string = @(requirement_utf8);
+            if (SecRequirementCreateWithString((__bridge CFStringRef)requirement_string,
+                                               kSecCSDefaultFlags,
+                                               &requirement) != errSecSuccess ||
+                requirement == NULL) {
+                break;
+            }
+            SecCSFlags validation_flags =
+                kSecCSCheckAllArchitectures | kSecCSCheckNestedCode |
+                kSecCSStrictValidate | kSecCSRestrictSymlinks |
+                kSecCSRestrictToAppLike;
+            if (SecStaticCodeCheckValidityWithErrors(code,
+                                                     validation_flags,
+                                                     requirement,
+                                                     &validation_error) !=
+                errSecSuccess) {
+                break;
+            }
+            if (SecCodeCopySigningInformation(code,
+                                              kSecCSSigningInformation |
+                                                  kSecCSContentInformation,
+                                              &signing_information) != errSecSuccess ||
+                signing_information == NULL) {
+                break;
+            }
+            NSDictionary *information = (__bridge NSDictionary *)signing_information;
+            NSDictionary *secured_plist = information[(__bridge NSString *)kSecCodeInfoPList];
+            NSDictionary *entitlements =
+                information[(__bridge NSString *)kSecCodeInfoEntitlementsDict];
+            NSNumber *code_flags =
+                information[(__bridge NSString *)kSecCodeInfoFlags];
+            NSUInteger expected_entitlement_count =
+                nullable_keychain_access_group_utf8 == NULL ? 2 : 3;
+            if (![secured_plist isKindOfClass:NSDictionary.class] ||
+                ![entitlements isKindOfClass:NSDictionary.class] ||
+                entitlements.count != expected_entitlement_count ||
+                ![code_flags isKindOfClass:NSNumber.class] ||
+                (code_flags.unsignedIntValue & kSecCodeSignatureRuntime) == 0 ||
+                !ndv_update_exact_string(
+                    information[(__bridge NSString *)kSecCodeInfoIdentifier],
+                    identifier_utf8) ||
+                !ndv_update_exact_string(
+                    information[(__bridge NSString *)kSecCodeInfoTeamIdentifier],
+                    team_identifier_utf8) ||
+                !ndv_update_exact_string(secured_plist[@"CFBundleIdentifier"],
+                                         identifier_utf8) ||
+                !ndv_update_exact_string(secured_plist[@"CFBundleExecutable"],
+                                         executable_utf8) ||
+                !ndv_update_exact_string(secured_plist[@"CFBundlePackageType"], "APPL") ||
+                !ndv_update_exact_string(secured_plist[@"CFBundleShortVersionString"],
+                                         version_utf8) ||
+                !ndv_update_exact_string(secured_plist[@"CFBundleVersion"], build_utf8)) {
+                result = NDV_UPDATE_IDENTITY_REJECTED;
+                break;
+            }
+            NSString *application_identifier =
+                [NSString stringWithFormat:@"%s.%s",
+                                           team_identifier_utf8,
+                                           identifier_utf8];
+            if (![entitlements[@"com.apple.application-identifier"]
+                    isEqual:application_identifier] ||
+                !ndv_update_exact_string(
+                    entitlements[@"com.apple.developer.team-identifier"],
+                    team_identifier_utf8) ||
+                entitlements[@"com.apple.security.get-task-allow"] != nil) {
+                result = NDV_UPDATE_IDENTITY_REJECTED;
+                break;
+            }
+            id keychain_groups = entitlements[@"keychain-access-groups"];
+            if (nullable_keychain_access_group_utf8 == NULL) {
+                if (keychain_groups != nil) {
+                    result = NDV_UPDATE_IDENTITY_REJECTED;
+                    break;
+                }
+            } else {
+                NSString *expected_group = @(nullable_keychain_access_group_utf8);
+                if (![keychain_groups isKindOfClass:NSArray.class] ||
+                    [(NSArray *)keychain_groups count] != 1 ||
+                    ![[(NSArray *)keychain_groups firstObject] isEqual:expected_group]) {
+                    result = NDV_UPDATE_IDENTITY_REJECTED;
+                    break;
+                }
+            }
+            if (![information[(__bridge NSString *)kSecCodeInfoCertificates]
+                    isKindOfClass:NSArray.class] ||
+                [(NSArray *)information[(__bridge NSString *)kSecCodeInfoCertificates]
+                    count] == 0 ||
+                ![information[(__bridge NSString *)kSecCodeInfoCMS]
+                    isKindOfClass:NSData.class] ||
+                [(NSData *)information[(__bridge NSString *)kSecCodeInfoCMS] length] == 0) {
+                break;
+            }
+            id ticket = information[(__bridge NSString *)kSecCodeInfoStapledNotarizationTicket];
+            if ((require_stapled_notarization &&
+                 (![ticket isKindOfClass:NSData.class] || [(NSData *)ticket length] == 0)) ||
+                out_code_directory_hash == NULL ||
+                !ndv_update_copy_code_hash(information, out_code_directory_hash)) {
+                break;
+            }
+            if (out_secured_plist != NULL) {
+                *out_secured_plist = [secured_plist copy];
+            }
+            result = NDV_UPDATE_OK;
+        } while (false);
+    } @catch (__unused NSException *exception) {
+        result = NDV_UPDATE_SIGNATURE_REJECTED;
+    } @finally {
+        if (validation_error != NULL) {
+            CFRelease(validation_error);
+        }
+        if (signing_information != NULL) {
+            CFRelease(signing_information);
+        }
+        if (requirement != NULL) {
+            CFRelease(requirement);
+        }
+        if (code != NULL) {
+            CFRelease(code);
+        }
+    }
+    return result;
+}
+
+static bool ndv_update_validate_launch_agent(NSString *bundle_path) {
+    NSString *plist_path = [bundle_path
+        stringByAppendingPathComponent:
+            @"Contents/Library/LaunchAgents/dev.nodavo.agent.plist"];
+    if (!ndv_update_path_has_type(plist_path, false)) {
+        return false;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:plist_path
+                                          options:NSDataReadingMappedIfSafe
+                                            error:nil];
+    if (data == nil || data.length == 0 || data.length > 64 * 1024) {
+        return false;
+    }
+    id decoded = [NSPropertyListSerialization propertyListWithData:data
+                                                           options:NSPropertyListImmutable
+                                                            format:nil
+                                                             error:nil];
+    if (![decoded isKindOfClass:NSDictionary.class]) {
+        return false;
+    }
+    NSDictionary *plist = decoded;
+    NSDictionary *keep_alive = plist[@"KeepAlive"];
+    NSDictionary *mach_services = plist[@"MachServices"];
+    NSArray *associated = plist[@"AssociatedBundleIdentifiers"];
+    return plist.count == 10 &&
+           [associated isKindOfClass:NSArray.class] && associated.count == 1 &&
+           [associated.firstObject isEqual:@"dev.nodavo.macos"] &&
+           ndv_update_exact_string(plist[@"BundleProgram"],
+                                   "Contents/Library/Helpers/NodavoAgent.app/Contents/MacOS/nodavo-agent") &&
+           [keep_alive isKindOfClass:NSDictionary.class] &&
+           keep_alive.count == 1 &&
+           ndv_update_exact_bool(keep_alive[@"SuccessfulExit"], false) &&
+           ndv_update_exact_string(plist[@"Label"], "dev.nodavo.agent") &&
+           ndv_update_exact_string(plist[@"LimitLoadToSessionType"], "Aqua") &&
+           [mach_services isKindOfClass:NSDictionary.class] &&
+           mach_services.count == 1 &&
+           ndv_update_exact_bool(mach_services[@"dev.nodavo.agent.ipc"], true) &&
+           ndv_update_exact_string(plist[@"ProcessType"], "Interactive") &&
+           ndv_update_exact_bool(plist[@"RunAtLoad"], true) &&
+           [plist[@"ThrottleInterval"] isEqual:@30] &&
+           [plist[@"Umask"] isEqual:@63];
+}
+
+int32_t ndv_update_validate_nodavo_bundle(
+    int directory_fd,
+    const char *leaf_utf8,
+    const char *team_identifier_utf8,
+    const char *version_utf8,
+    const char *build_utf8,
+    const char *app_requirement_utf8,
+    const char *agent_requirement_utf8,
+    const char *keychain_access_group_utf8,
+    bool require_effective_user_owner,
+    NdvUpdateBundleClaims *out_claims) {
+    if (directory_fd < 0 || !ndv_update_valid_leaf(leaf_utf8) ||
+        team_identifier_utf8 == NULL || version_utf8 == NULL ||
+        build_utf8 == NULL || app_requirement_utf8 == NULL ||
+        agent_requirement_utf8 == NULL || keychain_access_group_utf8 == NULL ||
+        out_claims == NULL) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    memset(out_claims, 0, sizeof(*out_claims));
+    for (size_t index = 0; index < NDV_UPDATE_CRITICAL_HANDLES; ++index) {
+        out_claims->critical_fds[index] = -1;
+    }
+    out_claims->require_effective_user_owner =
+        require_effective_user_owner ? 1 : 0;
+    NdvUpdateIdentity before;
+    if (!ndv_update_identity_at(directory_fd, leaf_utf8, &before)) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    int bundle_fd = openat(directory_fd,
+                           leaf_utf8,
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (bundle_fd < 0) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    int32_t result = NDV_UPDATE_LAYOUT_REJECTED;
+    uint8_t tree_before[NDV_UPDATE_TREE_HASH_BYTES];
+    uint8_t generation_before[NDV_UPDATE_TREE_HASH_BYTES];
+    if (!ndv_update_observe_sealed_tree_fd(bundle_fd,
+                                           require_effective_user_owner,
+                                           tree_before,
+                                           generation_before) ||
+        !ndv_update_open_critical_fds(bundle_fd,
+                                      out_claims->critical_fds)) {
+        close(bundle_fd);
+        ndv_update_close_critical_fds(out_claims->critical_fds);
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    @autoreleasepool {
+        char bundle_path_bytes[PATH_MAX];
+        memset(bundle_path_bytes, 0, sizeof(bundle_path_bytes));
+        if (fcntl(bundle_fd, F_GETPATH, bundle_path_bytes) != 0) {
+            result = NDV_UPDATE_ENTRY_REJECTED;
+        } else {
+            NSString *bundle_path =
+                [[NSFileManager defaultManager]
+                    stringWithFileSystemRepresentation:bundle_path_bytes
+                                                length:strlen(bundle_path_bytes)];
+            NSString *app_executable =
+                [bundle_path stringByAppendingPathComponent:@"Contents/MacOS/Nodavo"];
+            NSString *app_info =
+                [bundle_path stringByAppendingPathComponent:@"Contents/Info.plist"];
+            NSString *agent_path = [bundle_path
+                stringByAppendingPathComponent:
+                    @"Contents/Library/Helpers/NodavoAgent.app"];
+            NSString *agent_executable = [agent_path
+                stringByAppendingPathComponent:@"Contents/MacOS/nodavo-agent"];
+            NSString *agent_info =
+                [agent_path stringByAppendingPathComponent:@"Contents/Info.plist"];
+            if (bundle_path == nil ||
+                !ndv_update_path_has_type(app_executable, false) ||
+                !ndv_update_exact_universal_binary(app_executable) ||
+                !ndv_update_path_has_type(app_info, false) ||
+                !ndv_update_path_has_type(agent_path, true) ||
+                !ndv_update_path_has_type(agent_executable, false) ||
+                !ndv_update_exact_universal_binary(agent_executable) ||
+                !ndv_update_path_has_type(agent_info, false) ||
+                !ndv_update_validate_launch_agent(bundle_path)) {
+                result = NDV_UPDATE_LAYOUT_REJECTED;
+            } else {
+                NSDictionary *app_plist = nil;
+                result = ndv_update_validate_code(bundle_path,
+                                                  app_requirement_utf8,
+                                                  "dev.nodavo.macos",
+                                                  "Nodavo",
+                                                  team_identifier_utf8,
+                                                  version_utf8,
+                                                  build_utf8,
+                                                  NULL,
+                                                  true,
+                                                  &app_plist,
+                                                  out_claims->app_code_directory_hash);
+                if (result == NDV_UPDATE_OK &&
+                    (!ndv_update_exact_string(app_plist[@"NodavoAgentBundleIdentifier"],
+                                              "dev.nodavo.agent") ||
+                     !ndv_update_exact_string(app_plist[@"NodavoAgentMachService"],
+                                              "dev.nodavo.agent.ipc") ||
+                     !ndv_update_exact_string(app_plist[@"NodavoAppleTeamIdentifier"],
+                                              team_identifier_utf8) ||
+                     !ndv_update_exact_string(app_plist[@"LSMinimumSystemVersion"],
+                                              "13.0") ||
+                     !ndv_update_exact_bool(app_plist[@"LSUIElement"], true) ||
+                     !ndv_update_exact_bool(app_plist[@"NodavoDevelopmentBuild"], false))) {
+                    result = NDV_UPDATE_IDENTITY_REJECTED;
+                }
+                if (result == NDV_UPDATE_OK) {
+                    NSDictionary *agent_plist = nil;
+                    result = ndv_update_validate_code(agent_path,
+                                                      agent_requirement_utf8,
+                                                      "dev.nodavo.agent",
+                                                      "nodavo-agent",
+                                                      team_identifier_utf8,
+                                                      version_utf8,
+                                                      build_utf8,
+                                                      keychain_access_group_utf8,
+                                                      false,
+                                                      &agent_plist,
+                                                      out_claims->agent_code_directory_hash);
+                    if (result == NDV_UPDATE_OK &&
+                        (!ndv_update_exact_string(agent_plist[@"NodavoKeychainAccessGroup"],
+                                                  keychain_access_group_utf8) ||
+                         !ndv_update_exact_string(agent_plist[@"LSMinimumSystemVersion"],
+                                                  "13.0") ||
+                         !ndv_update_exact_bool(agent_plist[@"LSBackgroundOnly"], true))) {
+                        result = NDV_UPDATE_IDENTITY_REJECTED;
+                    }
+                }
+                if (result == NDV_UPDATE_OK &&
+                    (!ndv_update_copy_required_utf8(app_plist[@"CFBundleShortVersionString"],
+                                                    version_utf8,
+                                                    out_claims->version,
+                                                    sizeof(out_claims->version)) ||
+                     !ndv_update_copy_required_utf8(app_plist[@"CFBundleVersion"],
+                                                    build_utf8,
+                                                    out_claims->build,
+                                                    sizeof(out_claims->build)))) {
+                    result = NDV_UPDATE_IDENTITY_REJECTED;
+                }
+                if (result == NDV_UPDATE_OK &&
+                    !ndv_update_assess_system_policy(bundle_path)) {
+                    result = NDV_UPDATE_SYSTEM_POLICY_REJECTED;
+                }
+            }
+        }
+    }
+    uint8_t tree_after[NDV_UPDATE_TREE_HASH_BYTES];
+    uint8_t generation_after[NDV_UPDATE_TREE_HASH_BYTES];
+    int32_t current_critical[NDV_UPDATE_CRITICAL_HANDLES];
+    for (size_t index = 0; index < NDV_UPDATE_CRITICAL_HANDLES; ++index) {
+        current_critical[index] = -1;
+    }
+    bool tree_unchanged =
+        result == NDV_UPDATE_OK &&
+        ndv_update_observe_sealed_tree_fd(bundle_fd,
+                                          require_effective_user_owner,
+                                          tree_after,
+                                          generation_after) &&
+        memcmp(tree_before, tree_after, sizeof(tree_before)) == 0 &&
+        memcmp(generation_before,
+               generation_after,
+               sizeof(generation_before)) == 0 &&
+        ndv_update_open_critical_fds(bundle_fd, current_critical);
+    for (size_t index = 0;
+         tree_unchanged && index < NDV_UPDATE_CRITICAL_HANDLES;
+         ++index) {
+        tree_unchanged = ndv_update_same_open_vnode(
+            out_claims->critical_fds[index],
+            current_critical[index]);
+    }
+    ndv_update_close_critical_fds(current_critical);
+    close(bundle_fd);
+    NdvUpdateIdentity after;
+    if (result == NDV_UPDATE_OK &&
+        (!tree_unchanged ||
+        (!ndv_update_identity_at(directory_fd, leaf_utf8, &after) ||
+         before.device != after.device || before.inode != after.inode))) {
+        result = NDV_UPDATE_ENTRY_REJECTED;
+    }
+    if (result == NDV_UPDATE_OK) {
+        out_claims->identity = before;
+        memcpy(out_claims->tree_hash, tree_before, sizeof(tree_before));
+        memcpy(out_claims->tree_generation_hash,
+               generation_before,
+               sizeof(generation_before));
+    } else {
+        ndv_update_close_critical_fds(out_claims->critical_fds);
+    }
+    return result;
+}
+
+int32_t ndv_update_observe_sealed_tree(
+    int directory_fd,
+    const char *leaf_utf8,
+    bool require_effective_user_owner,
+    uint8_t out_tree_hash[NDV_UPDATE_TREE_HASH_BYTES],
+    uint8_t out_tree_generation_hash[NDV_UPDATE_TREE_HASH_BYTES]) {
+    if (directory_fd < 0 || !ndv_update_valid_leaf(leaf_utf8) ||
+        out_tree_hash == NULL || out_tree_generation_hash == NULL) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    int bundle_fd = openat(directory_fd,
+                           leaf_utf8,
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (bundle_fd < 0) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    uint8_t first_tree_hash[NDV_UPDATE_TREE_HASH_BYTES];
+    uint8_t first_generation_hash[NDV_UPDATE_TREE_HASH_BYTES];
+    bool valid = ndv_update_observe_sealed_tree_fd(
+                     bundle_fd,
+                     require_effective_user_owner,
+                     first_tree_hash,
+                     first_generation_hash) &&
+                 ndv_update_observe_sealed_tree_fd(
+                     bundle_fd,
+                     require_effective_user_owner,
+                     out_tree_hash,
+                     out_tree_generation_hash) &&
+                 memcmp(first_tree_hash,
+                        out_tree_hash,
+                        sizeof(first_tree_hash)) == 0 &&
+                 memcmp(first_generation_hash,
+                        out_tree_generation_hash,
+                        sizeof(first_generation_hash)) == 0;
+    close(bundle_fd);
+    return valid ? NDV_UPDATE_OK : NDV_UPDATE_ENTRY_REJECTED;
+}
+
+int32_t ndv_update_test_code_hash_length(const char *path_utf8,
+                                         size_t *out_length) {
+    if (path_utf8 == NULL || out_length == NULL) {
+        return NDV_UPDATE_ENTRY_REJECTED;
+    }
+    *out_length = 0;
+    int32_t result = NDV_UPDATE_SIGNATURE_REJECTED;
+    @autoreleasepool {
+        NSString *path = [[NSFileManager defaultManager]
+            stringWithFileSystemRepresentation:path_utf8
+                                        length:strlen(path_utf8)];
+        SecStaticCodeRef code = NULL;
+        CFDictionaryRef signing_information = NULL;
+        if (path != nil &&
+            SecStaticCodeCreateWithPath((__bridge CFURLRef)[NSURL fileURLWithPath:path],
+                                        kSecCSDefaultFlags,
+                                        &code) == errSecSuccess &&
+            code != NULL &&
+            SecCodeCopySigningInformation(code,
+                                          kSecCSSigningInformation |
+                                              kSecCSContentInformation,
+                                          &signing_information) == errSecSuccess &&
+            signing_information != NULL) {
+            NSDictionary *information = (__bridge NSDictionary *)signing_information;
+            id value = information[(__bridge NSString *)kSecCodeInfoUnique];
+            if ([value isKindOfClass:NSData.class]) {
+                *out_length = [(NSData *)value length];
+                result = NDV_UPDATE_OK;
+            }
+        }
+        if (signing_information != NULL) {
+            CFRelease(signing_information);
+        }
+        if (code != NULL) {
+            CFRelease(code);
+        }
+    }
+    return result;
+}
+
+bool ndv_update_test_exact_universal_binary(const char *path_utf8) {
+    if (path_utf8 == NULL) {
+        return false;
+    }
+    @autoreleasepool {
+        NSString *path = [[NSFileManager defaultManager]
+            stringWithFileSystemRepresentation:path_utf8
+                                        length:strlen(path_utf8)];
+        return path != nil && ndv_update_exact_universal_binary(path);
+    }
+}
+
+bool ndv_update_test_assess_system_policy(const char *path_utf8) {
+    if (path_utf8 == NULL) {
+        return false;
+    }
+    @autoreleasepool {
+        NSString *path = [[NSFileManager defaultManager]
+            stringWithFileSystemRepresentation:path_utf8
+                                        length:strlen(path_utf8)];
+        return path != nil && ndv_update_assess_system_policy(path);
+    }
 }
 
 int32_t ndv_copy_local_peer_token(int socket_fd,

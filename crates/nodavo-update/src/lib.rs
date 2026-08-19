@@ -6,8 +6,10 @@
 //! and crash recovery can be tested without executing downloaded content.
 
 mod runtime;
+mod supervision;
 
 pub use runtime::*;
+pub use supervision::*;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -305,6 +307,7 @@ impl ReleaseVerifier {
             manifest: signed.manifest,
             artifact_sha256: digest,
             install_identity: self.policy.install_identity.clone(),
+            installed_version: self.policy.installed_version.clone(),
         })
     }
 
@@ -341,6 +344,7 @@ pub struct VerifiedRelease {
     manifest: ReleaseManifest,
     artifact_sha256: [u8; 32],
     install_identity: String,
+    installed_version: Version,
 }
 
 impl VerifiedRelease {
@@ -358,6 +362,12 @@ impl VerifiedRelease {
     #[must_use]
     pub fn install_identity(&self) -> &str {
         &self.install_identity
+    }
+
+    /// Locally authenticated version that consumed the signed manifest.
+    #[must_use]
+    pub const fn installed_version(&self) -> &Version {
+        &self.installed_version
     }
 
     /// Creates a bounded streaming verifier for bytes downloaded by the host.

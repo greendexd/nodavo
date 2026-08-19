@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: en; revision: 14 -->
+<!-- doc-id: macos-app; lang: en; revision: 15 -->
 
 # Nodavo for macOS
 
@@ -36,11 +36,11 @@ Settings exposes the current non-activating updater slice. A user can manually c
 
 The agent side is unconfigured by default. Only a build that explicitly embeds a pinned HTTPS manifest endpoint and Ed25519 public key can contact an update service; the repository contains neither a production endpoint nor the private signing key, and no live production check or signing ceremony is claimed. The current macOS/Unix path uses native platform TLS without redirects or decompression, verifies a bounded signed manifest and same-origin artifact, binds consent to its canonical offer UUID, and resumably writes digest-verified content to a private capability-rooted staging root with a cross-process lease, quotas, retention, and fsync.
 
-There is no installer handoff, activation, application or agent restart, health/rollback supervisor, protected production Keychain update journal, or durable rollback floor. Nothing staged is executed. For a correctly signed release, XPC enforces the exact Developer ID/Team ID identifiers and entitlements for every UI-to-agent message, while the UI reciprocally verifies the exact helper. The previous socket audit-token claim was withdrawn because it could authenticate a post-exec task while consuming bytes queued pre-exec. The development feature intentionally keeps only an unsafe same-UID UDS. Live proof with Nodavo production signing, provisioning, and notarization credentials remains an open release gate. Windows updater staging and UI integration are also absent.
+The platform source can validate and retain an exact bounded sealed universal app tree, including the app and nested agent signatures, entitlements, notarization/System Policy, owner/mode/ACL rules, hardlink rejection, immutable contents, and mutation detection. It intentionally exposes no swap, activation, or rollback API: local testing showed that unprivileged cross-parent exchange fails once both trees are sealed against same-user mutation. The repository still has no installer handoff, application or agent restart, health/rollback supervisor, protected production Keychain update journal, or durable rollback floor. Nothing staged is executed. Live proof with Nodavo production signing, provisioning, and notarization credentials remains an open release gate.
 
 ## Packaging
 
-The repository can build a universal `arm64` + `x86_64` application containing the SwiftUI executable and a per-user agent helper:
+The repository can build a universal `arm64` + `x86_64` application containing the SwiftUI executable and a per-user agent helper. The same development run also emits an explicitly non-notarized universal update ZIP and exact size/SHA-256 metadata for validation tests; neither artifact is installable by the current product:
 
 ```bash
 scripts/package-macos.sh --development --version 0.1.0 --build-number 1

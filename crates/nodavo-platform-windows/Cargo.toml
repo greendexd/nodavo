@@ -15,6 +15,7 @@ windows-ui-auth-release = []
 [dependencies]
 nodavo-input = { path = "../nodavo-input" }
 nodavo-protocol = { path = "../nodavo-protocol" }
+nodavo-update = { path = "../nodavo-update" }
 thiserror.workspace = true
 zeroize.workspace = true
 
@@ -32,7 +33,10 @@ windows = { workspace = true, features = [
     "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Packaging_Appx",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
@@ -40,11 +44,13 @@ windows = { workspace = true, features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
     "Win32_UI_HiDpi",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+windows-core = "0.62.2"
 
 [lints]
 workspace = true

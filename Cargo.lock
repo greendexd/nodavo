@@ -1147,9 +1147,11 @@ version = "0.1.0"
 dependencies = [
  "nodavo-input",
  "nodavo-protocol",
+ "nodavo-update",
  "thiserror",
  "tokio",
  "windows",
+ "windows-core",
  "zeroize",
 ]
 

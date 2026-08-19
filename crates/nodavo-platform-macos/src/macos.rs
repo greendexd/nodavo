@@ -25,7 +25,7 @@ use super::{DisplayGeometry, MacPlatformError, MacReadinessProbe, NODAVO_SYNTHET
 #[path = "macos/display.rs"]
 mod display;
 #[path = "macos/ffi.rs"]
-mod ffi;
+pub(crate) mod ffi;
 #[path = "macos/ipc_auth.rs"]
 mod ipc_auth;
 #[path = "macos/xpc_ipc.rs"]

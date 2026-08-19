@@ -1,0 +1,127 @@
+name: macOS development packaging
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "apps/macos/**"
+      - "crates/nodavo-agent/**"
+      - "crates/nodavo-platform-macos/**"
+      - "crates/nodavo-update/**"
+      - "scripts/package-macos.sh"
+      - ".github/workflows/macos-packaging.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+  push:
+    branches: [main, "codex/**"]
+    paths:
+      - "apps/macos/**"
+      - "crates/nodavo-agent/**"
+      - "crates/nodavo-platform-macos/**"
+      - "crates/nodavo-update/**"
+      - "scripts/package-macos.sh"
+      - ".github/workflows/macos-packaging.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  package-development:
+    name: Ad-hoc universal app, DMG, and update archive
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install the repository Rust toolchain and Apple targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build and verify development artifacts
+        run: |
+          build_number=$((GITHUB_RUN_NUMBER % 2147483647))
+          if [[ "$build_number" -eq 0 ]]; then build_number=1; fi
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; matches=[p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nodavo-agent"]; print(matches[0]) if len(matches) == 1 else sys.exit("nodavo-agent package metadata is missing or ambiguous")')
+          scripts/package-macos.sh \
+            --development \
+            --version "$version" \
+            --build-number "$build_number" \
+            --output "$GITHUB_WORKSPACE/target/macos-packages"
+
+      - name: Recompute update archive metadata
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+
+          root = pathlib.Path("target/macos-packages")
+          metadata_files = list(root.glob("*.update.json"))
+          if len(metadata_files) != 1:
+              raise SystemExit("expected exactly one macOS update metadata file")
+          metadata = json.loads(metadata_files[0].read_text(encoding="utf-8"))
+          expected_keys = {
+              "schema", "product", "platform", "architectures", "version", "build",
+              "mode", "artifact", "artifact_size", "artifact_sha256",
+              "bundle_identifier", "agent_bundle_identifier",
+          }
+          if set(metadata) != expected_keys:
+              raise SystemExit("macOS update metadata fields are not exact")
+          artifact = root / metadata["artifact"]
+          digest = hashlib.sha256()
+          size = 0
+          with artifact.open("rb") as source:
+              while chunk := source.read(1024 * 1024):
+                  size += len(chunk)
+                  digest.update(chunk)
+          if size <= 0 or metadata["artifact_size"] != size:
+              raise SystemExit("macOS update artifact size does not match metadata")
+          if metadata["artifact_sha256"] != digest.hexdigest():
+              raise SystemExit("macOS update artifact digest does not match metadata")
+          if metadata["mode"] != "development":
+              raise SystemExit("development workflow produced release-labeled metadata")
+          if metadata["architectures"] != ["aarch64", "x86_64"]:
+              raise SystemExit("development update artifact is not universal")
+          PY
+
+      - name: Assert the archived application tree is sealed
+        run: |
+          archive=$(find target/macos-packages -maxdepth 1 -name '*.zip' -print)
+          if [[ -z "$archive" ]] || [[ $(printf '%s\n' "$archive" | wc -l) -ne 1 ]]; then
+            echo "expected exactly one macOS update archive" >&2
+            exit 1
+          fi
+          verify_root="$RUNNER_TEMP/nodavo-update-archive"
+          mkdir -p "$verify_root"
+          ditto -x -k "$archive" "$verify_root"
+          python3 - "$verify_root/Nodavo.app" <<'PY'
+          import os
+          import pathlib
+          import stat
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          if not root.is_dir():
+              raise SystemExit("update archive has no exact Nodavo.app root")
+          for candidate in (root, *root.rglob("*")):
+              if stat.S_IMODE(os.lstat(candidate).st_mode) & 0o222:
+                  raise SystemExit(f"update archive contains a writable node: {candidate}")
+          PY
+
+      - name: Upload development-only package evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nodavo-macos-development-not-for-distribution
+          path: target/macos-packages/**
+          if-no-files-found: error
+          retention-days: 7
+
+# This workflow cannot produce a release. The package remains ad-hoc signed,
+# non-notarized, and explicitly marked NOT FOR DISTRIBUTION. Developer ID,
+# provisioning, notarization, stapling, Gatekeeper, and clean-machine updater
+# qualification remain separate fail-closed 1.0 gates.

@@ -1,6 +1,6 @@
 //! Safe Windows-specific orchestration over the isolated FFI wrappers.
 
-mod ffi;
+pub(crate) mod ffi;
 
 use std::fmt;
 use std::path::Path;
