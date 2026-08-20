@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 18 -->
+<!-- doc-id: macos-app; lang: ru; translation-of: README.md; revision: 19 -->
 
 # Nodavo для macOS
 
@@ -58,7 +58,9 @@ Platform source умеет проверять и удерживать точно
 scripts/package-macos.sh --development --version 0.1.0 --build-number 1
 ```
 
-Этот development-артефакт подписан ad-hoc, не нотариализован, не имеет provisioned-доступа к Keychain, не регистрирует встроенный LaunchAgent, компилирует unsafe same-user UDS bypass, рендерит Mach service выключенным и помечен как непригодный для распространения. Packaging подтверждает эти свойства. Это проверка структуры bundle, а не release.
+Этот development-артефакт подписан ad-hoc, не нотариализован, не имеет provisioned-доступа к Keychain, не регистрирует встроенный LaunchAgent, компилирует unsafe same-user UDS bypass, рендерит Mach service выключенным и помечен как непригодный для распространения. Packaging подтверждает эти свойства. Это не release.
+
+Локальная и GitHub development-упаковка также запускают точный встроенный helper с изолированным state, loopback networking, выключенным mDNS и изолированным UDS, после чего вызывают точный packaged SwiftUI executable с development-only entry point `--passive-smoke`. Этот entry point ровно по одному разу вызывает каждый строгий read-only production client method: `status()`, `focusStatus()` (второй ограниченный `get_status`), `listTrustedPeers()` и `listTransfers()`. Он выводит один ограниченный результат без пользовательского контента. Release builds не содержат и не принимают этот entry point. Это доказывает, что packaged development UI executable может общаться со своим встроенным helper по unsafe development UDS contract; проверка не охватывает XPC, Developer ID signing, notarization, TCC, capture или injection ввода, pairing, реальный peer, строки placement, публикацию файлов и физическое оборудование.
 
 Release-упаковка завершается с ошибкой, если вызывающая сторона явно не передала Developer ID identity, Team ID, отдельные provisioning profiles для `dev.nodavo.macos` и `dev.nodavo.agent`, а также профиль Keychain для `notarytool`:
 

@@ -1,4 +1,4 @@
-<!-- doc-id: macos-app; lang: en; revision: 18 -->
+<!-- doc-id: macos-app; lang: en; revision: 19 -->
 
 # Nodavo for macOS
 
@@ -58,7 +58,9 @@ The repository can build a universal `arm64` + `x86_64` application containing t
 scripts/package-macos.sh --development --version 0.1.0 --build-number 1
 ```
 
-This development artifact is ad-hoc signed, not notarized, has no provisioned Keychain access, does not register its bundled LaunchAgent, compiles the unsafe same-user UDS bypass, renders the Mach service disabled, and is labeled as not for distribution. Packaging asserts those properties. It is a bundle-layout test, not a release.
+This development artifact is ad-hoc signed, not notarized, has no provisioned Keychain access, does not register its bundled LaunchAgent, compiles the unsafe same-user UDS bypass, renders the Mach service disabled, and is labeled as not for distribution. Packaging asserts those properties. It is not a release.
+
+Local and GitHub development packaging also start the exact embedded helper with isolated state, loopback networking, mDNS disabled, and an isolated UDS, then invoke the exact packaged SwiftUI executable with the development-only `--passive-smoke` entry point. That entry point calls each strict read-only production client method exactly once: `status()`, `focusStatus()` (a second bounded `get_status`), `listTrustedPeers()`, and `listTransfers()`. It emits one bounded content-free result. Release builds do not contain or accept this entry point. This proves the packaged development UI executable can speak its unsafe development UDS contract to its embedded helper; it does not exercise XPC, Developer ID signing, notarization, TCC, input capture or injection, pairing, a real peer, placement rows, file publication, or physical hardware.
 
 Release packaging fails closed unless the caller explicitly supplies a Developer ID identity, Team ID, separate provisioning profiles for `dev.nodavo.macos` and `dev.nodavo.agent`, and a `notarytool` Keychain profile:
 

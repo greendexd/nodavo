@@ -1,4 +1,4 @@
-<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 19 -->
+<!-- doc-id: windows-app; lang: ru; translation-of: README.md; revision: 20 -->
 
 # Nodavo для Windows
 
@@ -73,7 +73,9 @@ pwsh -NoProfile -File scripts/package-windows.ps1 `
 
 Пакет объявляет только доступ к LAN (`privateNetworkClientServer`) и capability `runFullTrust`, необходимую desktop-пакету `mediumIL`. Он не запрашивает broad filesystem, location, camera, microphone, enterprise authentication, службу, UAC или secure desktop. Включённый `app.manifest` явно запрашивает `asInvoker` с `uiAccess=false`.
 
-Отдельный workflow упаковки Windows доказывает только способность self-signed development-пути собрать и проверить x64/ARM64 bundle на Windows runner. Срок хранения такого артефакта короткий, а в имени указано, что он не предназначен для распространения. У workflow нет release credentials, и он не может создать релиз.
+После завершения всех сборок отдельный workflow упаковки Windows импортирует только точный публичный development-certificate в `LocalMachine\\TrustedPeople`, устанавливает точный self-signed development MSIXBundle и проверяет identity, publisher, PFN, version, x64 architecture и application executable установленного package, а также единственный выключенный `windows.startupTask` для точного agent. Затем он запускает ограниченный `--self-check` точного установленного agent через официальный API `Invoke-CommandInDesktopPackage` и требует точный development-auth result. Cleanup удаляет точные package и certificate и проверяет их отсутствие до upload. Этот gate прошёл на hosted Windows runner. Срок хранения артефакта короткий, а в имени указано, что он не предназначен для распространения. У workflow нет release credentials, и он не может создать релиз.
+
+Этот headless gate не запускает интерактивный UI и не доказывает поведение `Package.Current`, взаимную named-pipe/status authentication, запуск agent из UI, включение StartupTask или sign-in activation, default interactive desktop, поведение peer/session, input, transfer, ARM64 execution, release signing и физическое оборудование.
 
 ## Контракт локального IPC
 
@@ -109,7 +111,7 @@ Windows updater source теперь содержит production-inert boundary s
 
 ## Текущие ограничения
 
-На текущем macOS-компьютере исходники нельзя компилировать, линковать или запускать под Windows. WinUI x64 compile-проверяется в Windows CI, а обязательным свидетельством сборки полного development bundle x64/ARM64 служит workflow упаковки. CI остаётся подтверждением компиляции/упаковки, но не интерактивного runtime.
+На текущем macOS-компьютере исходники нельзя компилировать, линковать или запускать под Windows. WinUI x64 compile-проверяется в Windows CI, а workflow упаковки собирает полный development bundle x64/ARM64 и задаёт описанный выше точный gate установленного package/self-check agent. CI всё ещё не предоставляет интерактивный default desktop и не квалифицирует runtime между UI и agent.
 
 В исходниках Rust теперь есть connection-bound guard package, process/token, executable и подписанта Authenticode в дополнение к проверкам того же пользователя/сеанса и защищённому DPAPI-хранилищу идентификаторов/доверия. В этой оболочке есть соответствующие сценарии сопряжения, управления доверием, точного редактирования расположения для каждого peer, явного admission передачи, ограниченного decoding progress/session feed, сверки отмены, on-demand запуска из пакета и opt-in startup task. Они компилируются или проходят проверки исходников/XML, но ещё не запускались вместе на квалифицированных настоящих Windows x64 и ARM64, поэтому успешный runtime не заявляется. Экран передачи не доказывает сквозную доставку, постоянную историю или поддержку resume. Установленный lifecycle/autostart, физическое поведение расположения/маршрутизации, UX буфера, UX resume передачи, трей, диагностика, updater UI/activation и production signing остаются неквалифицированными или ещё разрабатываются. `Package.appxmanifest` предназначен только для разработки и использует отдельный identity, поэтому его нельзя перепутать с публичным релизом или обновить им релиз.
 

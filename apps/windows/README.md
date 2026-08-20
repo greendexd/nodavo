@@ -1,4 +1,4 @@
-<!-- doc-id: windows-app; lang: en; revision: 19 -->
+<!-- doc-id: windows-app; lang: en; revision: 20 -->
 
 # Nodavo for Windows
 
@@ -73,7 +73,9 @@ Release packaging validates the public certificate, exact PFN, online revocation
 
 The package declares only LAN access (`privateNetworkClientServer`) and the `runFullTrust` capability required by a desktop `mediumIL` package. It does not request broad filesystem, location, camera, microphone, enterprise-authentication, service, UAC, or secure-desktop capability. The included `app.manifest` explicitly requests `asInvoker` with `uiAccess=false`.
 
-The separate Windows packaging workflow proves only that the self-signed development path can assemble and verify an x64/ARM64 bundle on a Windows runner. Its artifact retention is short and its name says that it is not for distribution. The workflow has no release credentials and cannot produce a release.
+After every build has completed, the separate Windows packaging workflow imports only the exact public development certificate into `LocalMachine\\TrustedPeople`, installs the exact self-signed development MSIXBundle, and validates the installed identity, publisher, PFN, version, x64 architecture, application executable, and the single disabled `windows.startupTask` for the exact agent. It then invokes the exact installed agent's bounded `--self-check` through the official `Invoke-CommandInDesktopPackage` API and requires the exact development-auth result. Cleanup removes the exact package and certificate and verifies both are absent before upload. This gate has passed on the hosted Windows runner. The artifact retention is short and its name says that it is not for distribution. The workflow has no release credentials and cannot produce a release.
+
+This headless gate does not launch the interactive UI and does not prove `Package.Current` behavior, mutual named-pipe/status authentication, agent launch from the UI, StartupTask enablement or sign-in activation, a default interactive desktop, peer/session behavior, input, transfer, ARM64 execution, release signing, or physical hardware.
 
 ## Local IPC contract
 
@@ -109,7 +111,7 @@ Windows updater source now includes a production-inert staging and inspection bo
 
 ## Current limitations
 
-This source cannot be compiled, linked, or run on the current macOS development host. The x64 WinUI source is compile-checked by Windows CI, while the packaging workflow is the required build evidence for the complete x64/ARM64 development bundle. CI remains compile/package evidence rather than interactive runtime qualification.
+This source cannot be compiled, linked, or run on the current macOS development host. The x64 WinUI source is compile-checked by Windows CI, while the packaging workflow builds the complete x64/ARM64 development bundle and defines the exact installed-package/agent-self-check gate described above. CI still does not provide an interactive default desktop or qualify the UI-to-agent runtime.
 
 The Rust source now includes a connection-bound package, process/token, executable, and Authenticode-signer guard in addition to same-user/session checks and DPAPI-protected identity/trust storage. This shell includes the matching pairing, trust-management, exact per-peer placement editing, explicit transfer admission, bounded progress/session-feed decoding, cancellation reconciliation, packaged on-demand launch, and opt-in startup-task flows. They compile or pass source/XML checks, but have not yet been run together on qualified real Windows x64 and ARM64 systems; runtime success is therefore not claimed. The transfer screen does not prove end-to-end delivery, durable history, or resume support. Installed lifecycle/autostart behavior, physical placement/routing behavior, clipboard UX, transfer resume UX, tray integration, diagnostics, updater UI/activation, and production signing remain unqualified or under implementation. `Package.appxmanifest` is development-only and uses a separate identity so it cannot be confused with or upgrade over a public release.
 
