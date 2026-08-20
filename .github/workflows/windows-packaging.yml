@@ -169,45 +169,176 @@ jobs:
               if (-not (Test-Path -LiteralPath $agent -PathType Leaf)) {
                   throw "Installed package does not contain the exact agent executable."
               }
-              $processInfo = [Diagnostics.ProcessStartInfo]::new()
-              $processInfo.FileName = $agent
-              $processInfo.ArgumentList.Add('--self-check')
-              $processInfo.UseShellExecute = $false
-              $processInfo.CreateNoWindow = $true
-              $processInfo.RedirectStandardOutput = $true
-              $processInfo.RedirectStandardError = $true
-              $selfCheckProcess = [Diagnostics.Process]::new()
-              $selfCheckProcess.StartInfo = $processInfo
-              $selfCheckStarted = $false
-              try {
-                  if (-not $selfCheckProcess.Start()) {
-                      throw "Installed agent self-check did not start."
+              $selfCheckRoot = Join-Path $env:RUNNER_TEMP (
+                  "nodavo-installed-self-check-" + [Guid]::NewGuid().ToString('N'))
+              $null = New-Item -ItemType Directory -Path $selfCheckRoot
+              $selfCheckScript = Join-Path $selfCheckRoot 'invoke.ps1'
+              $selfCheckRequest = Join-Path $selfCheckRoot 'request.json'
+              $selfCheckOutputPath = Join-Path $selfCheckRoot 'stdout.txt'
+              $selfCheckErrorPath = Join-Path $selfCheckRoot 'stderr.txt'
+              $selfCheckExitPath = Join-Path $selfCheckRoot 'exit.txt'
+              $selfCheckDonePath = Join-Path $selfCheckRoot 'done.txt'
+              $selfCheckPidPath = Join-Path $selfCheckRoot 'pid.txt'
+              @'
+          param([Parameter(Mandatory = $true)][string]$RequestPath)
+          $ErrorActionPreference = 'Stop'
+          $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
+          $wrapperProcess = Get-Process -Id $PID
+          [IO.File]::WriteAllText(
+              $request.pidPath,
+              "$PID`:$($wrapperProcess.StartTime.ToUniversalTime().Ticks)")
+          $process = $null
+          try {
+              $process = Start-Process `
+                  -FilePath $request.agentPath `
+                  -ArgumentList '--self-check' `
+                  -WorkingDirectory (Split-Path -Parent $request.agentPath) `
+                  -RedirectStandardOutput $request.outputPath `
+                  -RedirectStandardError $request.errorPath `
+                  -NoNewWindow `
+                  -PassThru
+              if (-not $process.WaitForExit(10000)) {
+                  $process.Kill($true)
+                  if (-not $process.WaitForExit(5000)) {
+                      throw 'stop failed'
                   }
-                  $selfCheckStarted = $true
-                  if (-not $selfCheckProcess.WaitForExit(10000)) {
-                      throw "Installed agent self-check timed out."
-                  }
-                  $selfCheckOutput = $selfCheckProcess.StandardOutput.ReadToEnd().Trim()
-                  $selfCheckError = $selfCheckProcess.StandardError.ReadToEnd().Trim()
-                  if ($selfCheckProcess.ExitCode -ne 0 -or
-                      $selfCheckError.Length -ne 0 -or
-                      $selfCheckOutput -cne
-                          'nodavo-agent: core runtime available; windows-ui-auth=development') {
-                      throw "Installed agent self-check failed."
-                  }
+                  [IO.File]::WriteAllText($request.exitPath, '124')
+              } else {
+                  [IO.File]::WriteAllText(
+                      $request.exitPath,
+                      [string]$process.ExitCode)
               }
-              finally {
+          }
+          catch {
+              [IO.File]::WriteAllText($request.exitPath, '125')
+          }
+          finally {
+              if ($null -ne $process) {
                   try {
-                      if ($selfCheckStarted -and -not $selfCheckProcess.HasExited) {
-                          $selfCheckProcess.Kill($true)
-                          if (-not $selfCheckProcess.WaitForExit(5000)) {
-                              throw "Installed agent self-check could not be stopped."
-                          }
+                      if (-not $process.HasExited) {
+                          $process.Kill($true)
+                          $null = $process.WaitForExit(5000)
                       }
                   }
                   finally {
-                      $selfCheckProcess.Dispose()
+                      $process.Dispose()
                   }
+              }
+          }
+          [IO.File]::WriteAllText($request.donePath, 'done')
+          '@ | Set-Content -LiteralPath $selfCheckScript -Encoding utf8NoBOM
+              @{
+                  agentPath = $agent
+                  outputPath = $selfCheckOutputPath
+                  errorPath = $selfCheckErrorPath
+                  exitPath = $selfCheckExitPath
+                  donePath = $selfCheckDonePath
+                  pidPath = $selfCheckPidPath
+              } | ConvertTo-Json -Compress |
+                  Set-Content -LiteralPath $selfCheckRequest -Encoding utf8NoBOM
+              foreach ($generatedPath in @(
+                  $selfCheckScript, $selfCheckRequest, $agent)) {
+                  if ($generatedPath.Contains('"')) {
+                      throw "Installed self-check path cannot be quoted safely."
+                  }
+              }
+              $runnerPowerShell = [Environment]::ProcessPath
+              $resolveExactWrapper = {
+                  param([string]$PidPath, [string]$ExpectedExecutable)
+                  if (-not (Test-Path -LiteralPath $PidPath)) {
+                      return $null
+                  }
+                  $pidParts = (Get-Content -LiteralPath $PidPath -Raw).Split(':')
+                  if ($pidParts.Count -ne 2 -or
+                      $pidParts[0] -notmatch '^[1-9][0-9]*$' -or
+                      $pidParts[1] -notmatch '^[1-9][0-9]*$') {
+                      throw "Installed self-check wrapper identity is malformed."
+                  }
+                  $candidate = Get-Process -Id ([int]$pidParts[0]) `
+                      -ErrorAction SilentlyContinue
+                  if ($null -eq $candidate) {
+                      return $null
+                  }
+                  try {
+                      if ($candidate.Path -cne $ExpectedExecutable -or
+                          $candidate.StartTime.ToUniversalTime().Ticks -ne
+                              [long]$pidParts[1]) {
+                          throw "Installed self-check wrapper identity changed."
+                      }
+                  }
+                  catch [System.InvalidOperationException] {
+                      return $null
+                  }
+                  return $candidate
+              }
+              $selfCheckArguments =
+                  "-NoLogo -NoProfile -NonInteractive -File `"$selfCheckScript`" " +
+                  "-RequestPath `"$selfCheckRequest`""
+              Invoke-CommandInDesktopPackage `
+                  -PackageFamilyName $package.PackageFamilyName `
+                  -AppId $applications[0].GetAttribute('Id') `
+                  -Command $runnerPowerShell `
+                  -Args $selfCheckArguments `
+                  -PreventBreakaway `
+                  -ErrorAction Stop
+              $selfCheckDeadline = [DateTime]::UtcNow.AddSeconds(20)
+              while (-not (Test-Path -LiteralPath $selfCheckDonePath) -and
+                  [DateTime]::UtcNow -lt $selfCheckDeadline) {
+                  Start-Sleep -Milliseconds 100
+              }
+              if (-not (Test-Path -LiteralPath $selfCheckDonePath)) {
+                  $staleWrapper = & $resolveExactWrapper `
+                      $selfCheckPidPath $runnerPowerShell
+                  if ($null -ne $staleWrapper) {
+                      try {
+                          $staleWrapper.Kill($true)
+                          if (-not $staleWrapper.WaitForExit(5000)) {
+                              throw "Installed self-check wrapper could not be stopped."
+                          }
+                      }
+                      finally {
+                          $staleWrapper.Dispose()
+                      }
+                  }
+                  throw "Installed agent self-check timed out."
+              }
+              if (-not (Test-Path -LiteralPath $selfCheckPidPath)) {
+                  throw "Installed self-check wrapper identity is missing."
+              }
+              $completedWrapper = & $resolveExactWrapper `
+                  $selfCheckPidPath $runnerPowerShell
+              if ($null -ne $completedWrapper) {
+                  try {
+                      if (-not $completedWrapper.WaitForExit(5000)) {
+                          $completedWrapper.Kill($true)
+                          if (-not $completedWrapper.WaitForExit(5000)) {
+                              throw "Installed self-check wrapper could not be stopped."
+                          }
+                          throw "Installed self-check wrapper did not exit cleanly."
+                      }
+                  }
+                  finally {
+                      $completedWrapper.Dispose()
+                  }
+              }
+              $selfCheckExit = Get-Content -LiteralPath $selfCheckExitPath -Raw
+              $selfCheckOutputInfo = Get-Item -LiteralPath $selfCheckOutputPath `
+                  -ErrorAction SilentlyContinue
+              $selfCheckErrorInfo = Get-Item -LiteralPath $selfCheckErrorPath `
+                  -ErrorAction SilentlyContinue
+              if ($null -eq $selfCheckOutputInfo -or
+                  $selfCheckOutputInfo.Length -gt 256 -or
+                  $null -eq $selfCheckErrorInfo -or
+                  $selfCheckErrorInfo.Length -ne 0) {
+                  throw "Installed agent self-check output was missing or oversized."
+              }
+              $selfCheckOutput = [IO.File]::ReadAllText($selfCheckOutputPath)
+              $expectedSelfCheck =
+                  'nodavo-agent: core runtime available; windows-ui-auth=development'
+              if ($selfCheckExit -cne '0' -or
+                  ($selfCheckOutput -cne "$expectedSelfCheck`n" -and
+                      $selfCheckOutput -cne "$expectedSelfCheck`r`n")) {
+                  throw "Installed agent self-check failed."
               }
           }
           catch {
@@ -215,6 +346,16 @@ jobs:
           }
           finally {
               $cleanupErrors = [Collections.Generic.List[string]]::new()
+              try {
+                  if ($null -ne $selfCheckRoot -and
+                      (Test-Path -LiteralPath $selfCheckRoot)) {
+                      Remove-Item -LiteralPath $selfCheckRoot -Recurse -Force `
+                          -ErrorAction Stop
+                  }
+              }
+              catch {
+                  $cleanupErrors.Add('installed self-check evidence removal failed')
+              }
               try {
                   $installedPackages = @(
                       Get-AppxPackage -Name $metadata.packageIdentityName

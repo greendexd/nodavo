@@ -767,9 +767,32 @@ assert "$extensions[0].GetAttribute('EntryPoint')" in packaging_workflow
 assert "'Windows.FullTrustApplication'" in packaging_workflow
 assert "$startupTasks[0].GetAttribute('TaskId')" in packaging_workflow
 assert "$startupTasks[0].GetAttribute('Enabled') -cne 'false'" in packaging_workflow
-assert "$selfCheckProcess.WaitForExit(10000)" in packaging_workflow
-assert "$selfCheckProcess.Kill($true)" in packaging_workflow
-assert "$selfCheckProcess.WaitForExit(5000)" in packaging_workflow
+assert "Invoke-CommandInDesktopPackage" in packaging_workflow
+assert "-PackageFamilyName $package.PackageFamilyName" in packaging_workflow
+assert "-AppId $applications[0].GetAttribute('Id')" in packaging_workflow
+assert "-PreventBreakaway" in packaging_workflow
+assert "-FilePath $request.agentPath" in packaging_workflow
+assert "-WorkingDirectory (Split-Path -Parent $request.agentPath)" in packaging_workflow
+assert "-RedirectStandardOutput $request.outputPath" in packaging_workflow
+assert "-RedirectStandardError $request.errorPath" in packaging_workflow
+assert "$process.WaitForExit(10000)" in packaging_workflow
+assert "$process.Kill($true)" in packaging_workflow
+assert "$process.WaitForExit(5000)" in packaging_workflow
+assert "[DateTime]::UtcNow.AddSeconds(20)" in packaging_workflow
+assert "[IO.File]::WriteAllText($request.donePath, 'done')" in packaging_workflow
+assert "$selfCheckOutputInfo.Length -gt 256" in packaging_workflow
+assert "$selfCheckErrorInfo.Length -ne 0" in packaging_workflow
+assert "$staleWrapper.Kill($true)" in packaging_workflow
+assert "$staleWrapper.WaitForExit(5000)" in packaging_workflow
+assert "$staleWrapper.Dispose()" in packaging_workflow
+assert "$completedWrapper.WaitForExit(5000)" in packaging_workflow
+assert "$completedWrapper.Kill($true)" in packaging_workflow
+assert "$completedWrapper.Dispose()" in packaging_workflow
+assert "Installed self-check wrapper identity is missing." in packaging_workflow
+assert "$selfCheckOutput -cne \"$expectedSelfCheck`n\"" in packaging_workflow
+assert "$selfCheckOutput -cne \"$expectedSelfCheck`r`n\"" in packaging_workflow
+assert ".Trim()" not in packaging_workflow[agent_self_check:package_cleanup]
+assert "installed self-check evidence removal failed" in packaging_workflow
 assert "& $agent --self-check" not in packaging_workflow
 assert "$primaryError = $_" in packaging_workflow
 assert "$primaryError.Exception.Message" in packaging_workflow
