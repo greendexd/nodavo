@@ -17,6 +17,11 @@
                     Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                     TextAlignment="Center"
                     TextWrapping="Wrap" />
+                <TextBlock
+                    x:Uid="TransferReceiveDestination"
+                    Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                    TextAlignment="Center"
+                    TextWrapping="Wrap" />
                 <InfoBar
                     x:Name="TransferStatus"
                     IsClosable="False"

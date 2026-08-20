@@ -33,6 +33,13 @@ enum {
 };
 
 enum {
+    NDV_RECEIVE_DESTINATION_OK = 0,
+    NDV_RECEIVE_DESTINATION_UNAVAILABLE = 1,
+    NDV_RECEIVE_DESTINATION_PERMISSION_DENIED = 2,
+    NDV_RECEIVE_DESTINATION_INVALID = 3,
+};
+
+enum {
     NDV_UPDATE_OK = 0,
     NDV_UPDATE_ENTRY_REJECTED = 1,
     NDV_UPDATE_LAYOUT_REJECTED = 2,
@@ -92,6 +99,161 @@ typedef struct {
 
 _Static_assert(sizeof(audit_token_t) == sizeof(NdvAuditToken),
                "audit token ABI size mismatch");
+
+static bool ndv_update_no_extended_acl(int descriptor);
+
+static bool ndv_receive_destination_permission_error(NSError *error) {
+    if (error == nil) {
+        return false;
+    }
+    if ([error.domain isEqualToString:NSCocoaErrorDomain]) {
+        return error.code == NSFileReadNoPermissionError ||
+               error.code == NSFileWriteNoPermissionError;
+    }
+    if ([error.domain isEqualToString:NSPOSIXErrorDomain]) {
+        return error.code == EACCES || error.code == EPERM;
+    }
+    return false;
+}
+
+int32_t ndv_resolve_user_downloads_directory(char *output_utf8,
+                                             size_t output_capacity) {
+    if (output_utf8 == NULL || output_capacity < 2) {
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    memset(output_utf8, 0, output_capacity);
+    @autoreleasepool {
+        NSError *error = nil;
+        NSURL *downloads = [[NSFileManager defaultManager]
+            URLForDirectory:NSDownloadsDirectory
+                   inDomain:NSUserDomainMask
+          appropriateForURL:nil
+                     create:NO
+                      error:&error];
+        if (downloads == nil) {
+            return ndv_receive_destination_permission_error(error)
+                       ? NDV_RECEIVE_DESTINATION_PERMISSION_DENIED
+                       : NDV_RECEIVE_DESTINATION_UNAVAILABLE;
+        }
+        if (!downloads.isFileURL ||
+            ![downloads getFileSystemRepresentation:output_utf8
+                                           maxLength:output_capacity] ||
+            output_utf8[0] == '\0') {
+            memset(output_utf8, 0, output_capacity);
+            return NDV_RECEIVE_DESTINATION_INVALID;
+        }
+        return NDV_RECEIVE_DESTINATION_OK;
+    }
+}
+
+static int32_t ndv_receive_destination_status_for_errno(int error) {
+    if (error == EACCES || error == EPERM) {
+        return NDV_RECEIVE_DESTINATION_PERMISSION_DENIED;
+    }
+    if (error == ELOOP || error == ENOTDIR || error == EINVAL ||
+        error == ENAMETOOLONG) {
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    return NDV_RECEIVE_DESTINATION_UNAVAILABLE;
+}
+
+static int32_t ndv_open_absolute_directory_no_follow(const char *path_utf8,
+                                                     int *out_descriptor) {
+    if (path_utf8 == NULL || out_descriptor == NULL) {
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    *out_descriptor = -1;
+    size_t path_length = strnlen(path_utf8, 4096);
+    if (path_length < 2 || path_length >= 4096 || path_utf8[0] != '/' ||
+        path_utf8[path_length - 1] == '/') {
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    int current = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (current < 0) {
+        return ndv_receive_destination_status_for_errno(errno);
+    }
+    const char *cursor = path_utf8 + 1;
+    while (*cursor != '\0') {
+        const char *separator = strchr(cursor, '/');
+        size_t length = separator == NULL
+                            ? strlen(cursor)
+                            : (size_t)(separator - cursor);
+        if (length == 0 || length > NAME_MAX ||
+            (length == 1 && cursor[0] == '.') ||
+            (length == 2 && cursor[0] == '.' && cursor[1] == '.')) {
+            close(current);
+            return NDV_RECEIVE_DESTINATION_INVALID;
+        }
+        char component[NAME_MAX + 1];
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+        int next = openat(current,
+                          component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (next < 0) {
+            int saved_error = errno;
+            close(current);
+            return ndv_receive_destination_status_for_errno(saved_error);
+        }
+        close(current);
+        current = next;
+        if (separator == NULL) {
+            break;
+        }
+        cursor = separator + 1;
+    }
+    *out_descriptor = current;
+    return NDV_RECEIVE_DESTINATION_OK;
+}
+
+int32_t ndv_prepare_receive_destination(const char *downloads_path_utf8,
+                                        int32_t *out_descriptor) {
+    if (out_descriptor == NULL) {
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    *out_descriptor = -1;
+    int downloads = -1;
+    int32_t status = ndv_open_absolute_directory_no_follow(downloads_path_utf8,
+                                                           &downloads);
+    if (status != NDV_RECEIVE_DESTINATION_OK) {
+        return status;
+    }
+    bool created = false;
+    if (mkdirat(downloads, "Nodavo", 0700) == 0) {
+        created = true;
+    } else if (errno != EEXIST) {
+        int saved_error = errno;
+        close(downloads);
+        return ndv_receive_destination_status_for_errno(saved_error);
+    }
+    int destination = openat(downloads,
+                             "Nodavo",
+                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int saved_error = errno;
+    close(downloads);
+    if (destination < 0) {
+        return ndv_receive_destination_status_for_errno(saved_error);
+    }
+    if (created && fchmod(destination, 0700) != 0) {
+        saved_error = errno;
+        close(destination);
+        return ndv_receive_destination_status_for_errno(saved_error);
+    }
+    struct stat metadata;
+    if (fstat(destination, &metadata) != 0) {
+        saved_error = errno;
+        close(destination);
+        return ndv_receive_destination_status_for_errno(saved_error);
+    }
+    if (!S_ISDIR(metadata.st_mode) || metadata.st_uid != geteuid() ||
+        (metadata.st_mode & 0777) != 0700 ||
+        !ndv_update_no_extended_acl(destination)) {
+        close(destination);
+        return NDV_RECEIVE_DESTINATION_INVALID;
+    }
+    *out_descriptor = destination;
+    return NDV_RECEIVE_DESTINATION_OK;
+}
 
 static bool ndv_copy_optional_utf8(id value, char *output, size_t capacity) {
     if (output == NULL || capacity == 0) {

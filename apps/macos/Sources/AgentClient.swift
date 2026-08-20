@@ -581,6 +581,7 @@ enum AgentResponseDecoder {
         "peer_not_found",
         "storage_unavailable",
         "grant_epoch_exhausted",
+        "receive_destination_unavailable",
         "placement_apply_failed",
         "pairing_failed",
         "not_connected",

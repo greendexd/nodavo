@@ -112,6 +112,31 @@ jobs:
               if stat.S_IMODE(os.lstat(candidate).st_mode) & 0o222:
                   raise SystemExit(f"update archive contains a writable node: {candidate}")
           PY
+          helper="$verify_root/Nodavo.app/Contents/Library/Helpers/NodavoAgent.app"
+          usage=$(plutil -extract NSDownloadsFolderUsageDescription raw \
+            "$helper/Contents/Info.plist")
+          [[ "$usage" == \
+            "Nodavo saves files received from explicitly paired devices in Downloads/Nodavo." ]]
+          for localization in en ru; do
+            plutil -extract NSDownloadsFolderUsageDescription raw \
+              "$helper/Contents/Resources/${localization}.lproj/InfoPlist.strings" \
+              | grep -q '[^[:space:]]'
+          done
+          ui_entitlements="$RUNNER_TEMP/nodavo-ui-entitlements.plist"
+          agent_entitlements="$RUNNER_TEMP/nodavo-agent-entitlements.plist"
+          codesign -d --entitlements :- "$verify_root/Nodavo.app" \
+            >"$ui_entitlements" 2>/dev/null
+          codesign -d --entitlements :- "$helper" \
+            >"$agent_entitlements" 2>/dev/null
+          python3 - "$ui_entitlements" "$agent_entitlements" <<'PY'
+          import plistlib
+          import sys
+
+          for path in sys.argv[1:]:
+              with open(path, "rb") as source:
+                  if plistlib.load(source):
+                      raise SystemExit("development package gained a broad entitlement")
+          PY
 
       - name: Upload development-only package evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

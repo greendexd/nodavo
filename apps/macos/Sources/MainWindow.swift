@@ -230,6 +230,7 @@ private struct DevicesView: View {
         case .comparing: "number"
         case .paired: "checkmark.shield"
         case .declined: "xmark.shield"
+        case .receiveDestinationUnavailable: "folder.badge.questionmark"
         case .failed: "exclamationmark.triangle"
         }
     }
@@ -459,6 +460,16 @@ private struct TransfersView: View {
 
     var body: some View {
         Form {
+            Section("transfer_receive_destination") {
+                #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+                Label("transfer_receive_destination_development_help", systemImage: "folder")
+                    .foregroundStyle(.secondary)
+                #else
+                Label("transfer_receive_destination_help", systemImage: "folder")
+                    .foregroundStyle(.secondary)
+                #endif
+            }
+
             Section("transfer_selection") {
                 Text("transfer_selection_help")
                     .foregroundStyle(.secondary)

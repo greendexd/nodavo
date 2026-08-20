@@ -1,4 +1,4 @@
-<!-- doc-id: security-model; lang: en; revision: 19 -->
+<!-- doc-id: security-model; lang: en; revision: 20 -->
 
 # Security model
 
@@ -102,6 +102,8 @@ The current pre-alpha agent also contains an explicitly development-only, versio
 - Per-peer quotas, cancellation, backpressure, and rate limits limit denial of service.
 
 The pre-alpha receiver writes through capability-rooted, no-follow directory and file handles. Its staging root is private before any content name is created: Unix permissions are verified, while Windows creates an owner-only protected DACL atomically through a root-relative handle and rejects permissive, inherited, foreign-owned, reparse, or structurally ambiguous state. One process-wide operation lease serializes begin/resume/finalize/discard. Progress is acknowledged only after file and journal flushes; supported platforms also sync every mutated destination directory deepest-first and the destination root last. Windows exposes that directory-entry crash flushing is unsupported, so an untracked resume after an agent restart is rejected rather than advertised as power-loss durable.
+
+The release receive authority is a fixed `Downloads/Nodavo` directory, not a path supplied over IPC or the network. macOS resolves the user-domain Downloads folder with `NSFileManager` and rejects any extended ACL on the final directory; Windows uses `SHGetKnownFolderPath(FOLDERID_Downloads)` for the current user and rejects non-fixed volumes. Both platform boundaries reject unsafe namespace components and reparse points, create or validate an owner-private exact leaf, and transfer an already-open no-follow directory handle to the generic receiver. The receiver independently revalidates owner/privacy policy, forgets the ambient path, and retains only the capability for publication, revocation, and offline cleanup. A missing or denied destination fails an inbound Files pairing/grant before the trust record or grant epoch is committed; it does not block an input-only peer. Existing hidden pre-alpha receive state is neither migrated nor deleted. Absolute receive paths never enter public status, errors, transfer snapshots, or logs, and received content is never opened automatically.
 
 Outbound selection is anchored by no-follow handles before canonicalization. Enumeration, manifest accounting, hashing, chunks, roots, stable file identities, and cooperative cancellation are bounded. Links, reparse points, sparse/special files, overlapping roots, hard-link aliases, mutations, cycles, and cross-platform path collisions fail closed. Publication never overwrites an existing destination. If a late multi-file publication or cleanup failure makes safe rollback ambiguous, the staging owner is poisoned and already published Nodavo identities are retained for explicit remediation instead of deleting a possibly substituted pathname.
 

@@ -1,2 +1,3 @@
 "CFBundleDisplayName" = "Nodavo";
+"NSDownloadsFolderUsageDescription" = "Nodavo сохраняет файлы, полученные от явно сопряжённых устройств, в папку «Загрузки/Nodavo».";
 "NSLocalNetworkUsageDescription" = "Nodavo обнаруживает явно сопряжённые устройства и подключается к ним в локальной сети.";

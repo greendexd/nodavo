@@ -586,6 +586,38 @@ import Testing
     }
 }
 
+@Test func receiveDestinationErrorIsStrictAndHasAContentFreePresentation() throws {
+    let payload = Data(
+        #"{"event":"error","code":"receive_destination_unavailable","message":"the receive destination is unavailable"}"#.utf8
+    )
+    let decoded = try #require(try AgentResponseDecoder.agentError(payload))
+    #expect(ReceiveDestinationFailurePresentation.matches(decoded))
+    #expect(!ReceiveDestinationFailurePresentation.matches(
+        AgentClientError.agent(code: "storage_unavailable", message: "unavailable")
+    ))
+    #expect(!ReceiveDestinationFailurePresentation.matches(AgentClientError.invalidResponse))
+
+    #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+    #expect(
+        ReceiveDestinationFailurePresentation.pairingLocalizationKey
+            == "pairing_receive_destination_unavailable_development"
+    )
+    #expect(
+        ReceiveDestinationFailurePresentation.grantLocalizationKey
+            == "trusted_devices_receive_destination_unavailable_development"
+    )
+    #else
+    #expect(
+        ReceiveDestinationFailurePresentation.pairingLocalizationKey
+            == "pairing_receive_destination_unavailable"
+    )
+    #expect(
+        ReceiveDestinationFailurePresentation.grantLocalizationKey
+            == "trusted_devices_receive_destination_unavailable"
+    )
+    #endif
+}
+
 @Test func transferAdmissionRejectsRawDuplicateKeysIncludingEscapedAliases() {
     for payload in [
         #"{"event":"transfer_queued","event":"transfer_queued","transfer_id":"123e4567-e89b-12d3-a456-426614174000"}"#,

@@ -28,11 +28,14 @@ mod display;
 pub(crate) mod ffi;
 #[path = "macos/ipc_auth.rs"]
 mod ipc_auth;
+#[path = "macos/receive_destination.rs"]
+mod receive_destination;
 #[path = "macos/xpc_ipc.rs"]
 mod xpc_ipc;
 
 pub use display::{MacDisplayMonitor, MacDisplaySnapshot};
 pub use ipc_auth::{MacIpcAuthError, MacIpcPeerGuard};
+pub use receive_destination::{MacReceiveDestination, prepare_receive_destination};
 pub use xpc_ipc::{
     MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES, MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS,
     MacLocalIpcAuthMode, MacXpcError, MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply,

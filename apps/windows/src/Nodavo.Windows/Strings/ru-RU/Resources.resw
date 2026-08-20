@@ -73,6 +73,8 @@
   <data name="TrustedPermissionFailedMessage" xml:space="preserve"><value>Изменение не подтверждено, переключатель возвращён в прежнее состояние.</value></data>
   <data name="TrustedPermissionRejectedTitle" xml:space="preserve"><value>Разрешение отклонено</value></data>
   <data name="TrustedPermissionRejectedMessage" xml:space="preserve"><value>Агент вернул явную ошибку, поэтому сохраняется предыдущее авторитетное состояние переключателя.</value></data>
+  <data name="TrustedReceiveDestinationUnavailableTitle" xml:space="preserve"><value>Папка входящих файлов недоступна</value></data>
+  <data name="TrustedReceiveDestinationUnavailableMessage" xml:space="preserve"><value>Разрешение файлов не изменено, потому что Nodavo не смог безопасно подготовить Downloads/Nodavo. Другие разрешения и работа только с вводом не затронуты.</value></data>
   <data name="TrustedPermissionReconcilingTitle" xml:space="preserve"><value>Результат изменения неизвестен</value></data>
   <data name="TrustedPermissionReconcilingMessage" xml:space="preserve"><value>Подтверждение потеряно или некорректно. Элементы отключены, пока Nodavo ждёт завершения ограниченного окна агента и заново загружает авторитетное доверие.</value></data>
   <data name="TrustedPermissionReconciledAppliedTitle" xml:space="preserve"><value>Разрешение подтверждено после загрузки</value></data>
@@ -141,6 +143,7 @@
   <data name="PairingFailedTitle" xml:space="preserve"><value>Сопряжение не завершено</value></data>
   <data name="PairingFailed" xml:space="preserve"><value>Проверьте, что оба агента запущены в одной локальной сети, и повторите попытку.</value></data>
   <data name="PairingRejected" xml:space="preserve"><value>Агент отклонил запрос или уже выполняется другое сопряжение.</value></data>
+  <data name="PairingReceiveDestinationUnavailable" xml:space="preserve"><value>Nodavo не смог безопасно подготовить Downloads/Nodavo, поэтому сопряжение не сохранено. Исправьте доступ к Downloads и повторите попытку.</value></data>
   <data name="PairingDeclined" xml:space="preserve"><value>Другой компьютер отклонил запрос или не подтвердил код.</value></data>
   <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Введите IP-адрес с портом или корректный экземпляр mDNS.</value></data>
   <data name="PairingTimedOut" xml:space="preserve"><value>Другой компьютер не ответил до завершения защищённого тайм-аута сопряжения.</value></data>
@@ -191,6 +194,7 @@
   <data name="LayoutOutcomeUnknownMessage" xml:space="preserve"><value>Этот точный peer остаётся заблокирован. Перед следующей отправкой расположения обновление должно успешно загрузить авторитетный список доверия.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Передачи</value></data>
   <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Ставьте в очередь только файлы и папки, которые явно выбрали на этом ПК.</value></data>
+  <data name="TransferReceiveDestination.Text" xml:space="preserve"><value>Папка входящих файлов: Downloads/Nodavo. Если Nodavo не может безопасно подготовить эту защищённую папку, приём файлов остаётся недоступен. Полученные файлы никогда не открываются автоматически.</value></data>
   <data name="TransferAddFiles.Content" xml:space="preserve"><value>Добавить файлы…</value></data>
   <data name="TransferAddFolder.Content" xml:space="preserve"><value>Добавить папку…</value></data>
   <data name="TransferRemoveSelection.Content" xml:space="preserve"><value>Удалить выбранное</value></data>

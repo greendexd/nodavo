@@ -2,8 +2,10 @@
 
 pub(crate) mod ffi;
 
+use std::ffi::OsString;
 use std::fmt;
-use std::path::Path;
+use std::os::windows::fs::MetadataExt as _;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
@@ -44,6 +46,138 @@ const DISPLAY_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const CAPTURE_JOIN_TIMEOUT: Duration = Duration::from_millis(50);
+const RECEIVED_FILES_DIRECTORY_NAME: &str = "Nodavo";
+
+/// Resolves and retains the fixed current-user `Downloads/Nodavo` directory.
+///
+/// The Downloads base comes only from `SHGetKnownFolderPath(FOLDERID_Downloads)`;
+/// environment variables are never consulted. Every existing namespace
+/// component is opened without following its final reparse point and without
+/// delete sharing. The Downloads location must be on a fixed local volume. The
+/// exact `Nodavo` leaf is created with a protected current-user-only DACL at
+/// birth or an existing leaf must already satisfy that same owner/DACL policy.
+///
+/// The returned owned directory handle is the capability. Callers must perform
+/// relative operations through this handle and must not reopen an ambient path.
+///
+/// # Errors
+///
+/// Fails closed for missing or redirected non-local Downloads folders, reparse
+/// points, malformed paths, unsafe existing permissions, or native failures.
+pub fn resolve_downloads_nodavo_directory() -> Result<std::fs::File, WindowsPlatformError> {
+    let downloads = ffi::current_user_downloads_directory()?;
+    retain_downloads_nodavo_directory(&downloads)
+}
+
+fn retain_downloads_nodavo_directory(
+    downloads: &Path,
+) -> Result<std::fs::File, WindowsPlatformError> {
+    let (drive_root, components) = local_fixed_path(downloads)?;
+    let drive_handle = ffi::open_retained_update_directory(&drive_root)?;
+    validate_namespace_directory(&drive_handle)?;
+    let volume_root = ffi::canonical_fixed_volume_root(&drive_handle)?;
+    if volume_root.components().any(|component| {
+        matches!(
+            component,
+            Component::Normal(_) | Component::ParentDir | Component::CurDir
+        )
+    }) {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+
+    let mut retained_namespace = vec![drive_handle];
+    let mut lookup = volume_root;
+    for component in components {
+        lookup.push(component);
+        let handle = ffi::open_retained_update_directory(&lookup)?;
+        validate_namespace_directory(&handle)?;
+        retained_namespace.push(handle);
+    }
+
+    lookup.push(RECEIVED_FILES_DIRECTORY_NAME);
+    let leaf = if let Ok(handle) = ffi::open_retained_receive_directory(&lookup) {
+        handle
+    } else {
+        ffi::create_private_receive_directory(&lookup)?;
+        ffi::open_retained_receive_directory(&lookup)?
+    };
+    validate_namespace_directory(&leaf)?;
+    ffi::validate_private_receive_handle(&leaf)?;
+    drop(retained_namespace);
+    Ok(leaf)
+}
+
+fn validate_namespace_directory(file: &std::fs::File) -> Result<(), WindowsPlatformError> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_attributes()
+            & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+            != 0
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    Ok(())
+}
+
+fn local_fixed_path(path: &Path) -> Result<(PathBuf, Vec<OsString>), WindowsPlatformError> {
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(WindowsPlatformError::NativeApi);
+    };
+    let (Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) = prefix.kind() else {
+        return Err(WindowsPlatformError::NativeApi);
+    };
+    if components.next() != Some(Component::RootDir) {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let drive = char::from(drive).to_ascii_uppercase();
+    let mut normal = Vec::new();
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(WindowsPlatformError::NativeApi);
+        };
+        if !valid_namespace_component(component) {
+            return Err(WindowsPlatformError::NativeApi);
+        }
+        normal.push(component.to_os_string());
+    }
+    if normal.is_empty() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    Ok((PathBuf::from(format!(r"{drive}:\")), normal))
+}
+
+fn valid_namespace_component(value: &std::ffi::OsStr) -> bool {
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.ends_with('.')
+        || value.ends_with(' ')
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+    {
+        return false;
+    }
+    let base = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    !matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+        && !(base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'))
+}
 
 /// Returns the private agent pipe name expected by the Windows shell.
 ///
@@ -2104,11 +2238,41 @@ impl WindowsClipboard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use nodavo_input::{DisplayId, NormalizedAxis, NormalizedPosition};
     use tokio::net::windows::named_pipe::ClientOptions;
 
     use super::*;
     use crate::display_runtime::{NativeDisplayGeometry, NativeDisplayKey};
+
+    static NEXT_RECEIVE_ROOT: AtomicU64 = AtomicU64::new(0);
+    const FAKE_ENVIRONMENT_CHILD: &str = "NODAVO_RECEIVE_FAKE_ENV_CHILD";
+
+    struct TemporaryReceiveRoot(PathBuf);
+
+    impl TemporaryReceiveRoot {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "nodavo-windows-receive-root-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT_RECEIVE_ROOT.fetch_add(1, AtomicOrdering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TemporaryReceiveRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn observed_display(key: u16, dpi: u32) -> NativeDisplayGeometry {
         NativeDisplayGeometry {
@@ -2122,6 +2286,108 @@ mod tests {
             rotation: nodavo_protocol::DisplayRotation::Degrees0,
             primary: true,
         }
+    }
+
+    #[test]
+    fn downloads_resolver_abi_returns_only_an_owned_directory_handle() {
+        let resolver: fn() -> Result<std::fs::File, WindowsPlatformError> =
+            resolve_downloads_nodavo_directory;
+        let native_resolver: fn() -> Result<PathBuf, WindowsPlatformError> =
+            ffi::current_user_downloads_directory;
+        let _ = (resolver, native_resolver);
+    }
+
+    #[test]
+    fn known_folder_resolution_ignores_profile_environment_spoofing() {
+        if let Some(fake) = std::env::var_os(FAKE_ENVIRONMENT_CHILD) {
+            let observed = ffi::current_user_downloads_directory().unwrap();
+            assert_ne!(observed, PathBuf::from(fake).join("Downloads"));
+            return;
+        }
+        let fake = TemporaryReceiveRoot::new();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("known_folder_resolution_ignores_profile_environment_spoofing")
+            .arg("--nocapture")
+            .env("USERPROFILE", &fake.0)
+            .env("HOME", &fake.0)
+            .env(FAKE_ENVIRONMENT_CHILD, &fake.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn receive_destination_path_policy_is_fixed_local_and_lexical() {
+        assert!(local_fixed_path(Path::new(r"C:\Users\Alice\Downloads")).is_ok());
+        for unsafe_path in [
+            Path::new("relative"),
+            Path::new(r"\\server\share\Downloads"),
+            Path::new(r"C:\safe\..\Downloads"),
+            Path::new(r"C:\Downloads\NUL"),
+            Path::new(r"C:\Downloads\trailing."),
+        ] {
+            assert_eq!(
+                local_fixed_path(unsafe_path),
+                Err(WindowsPlatformError::NativeApi)
+            );
+        }
+    }
+
+    #[test]
+    fn receive_destination_creates_exact_private_leaf_and_retains_it() {
+        let base = TemporaryReceiveRoot::new();
+        let retained = retain_downloads_nodavo_directory(&base.0).unwrap();
+        validate_namespace_directory(&retained).unwrap();
+        ffi::validate_private_receive_handle(&retained).unwrap();
+        let canonical = ffi::canonical_volume_path(&retained).unwrap();
+        assert_eq!(
+            canonical.file_name().and_then(std::ffi::OsStr::to_str),
+            Some(RECEIVED_FILES_DIRECTORY_NAME)
+        );
+        assert!(std::fs::rename(base.0.join("Nodavo"), base.0.join("moved")).is_err());
+        drop(retained);
+    }
+
+    #[test]
+    fn retained_native_handle_is_accepted_by_transfer_receive_root() {
+        let base = TemporaryReceiveRoot::new();
+        let retained = retain_downloads_nodavo_directory(&base.0).unwrap();
+        let receive_root =
+            nodavo_transfer::ReceiveRoot::from_retained_directory_handle(retained).unwrap();
+        let staging =
+            nodavo_transfer::FileSystemStagingArea::new_scoped_in(&receive_root, [0x5a; 32])
+                .unwrap();
+        drop(staging);
+        drop(receive_root);
+    }
+
+    #[test]
+    fn receive_destination_rejects_an_existing_inherited_dacl() {
+        let base = TemporaryReceiveRoot::new();
+        std::fs::create_dir(base.0.join(RECEIVED_FILES_DIRECTORY_NAME)).unwrap();
+        assert!(retain_downloads_nodavo_directory(&base.0).is_err());
+    }
+
+    #[test]
+    fn receive_destination_rejects_the_non_inheritable_update_dacl() {
+        let base = TemporaryReceiveRoot::new();
+        let leaf = base.0.join(RECEIVED_FILES_DIRECTORY_NAME);
+        ffi::create_private_update_directory(&leaf).unwrap();
+        let retained = ffi::open_retained_receive_directory(&leaf).unwrap();
+        ffi::validate_private_update_handle(&retained).unwrap();
+        assert!(ffi::validate_private_receive_handle(&retained).is_err());
+        drop(retained);
+        assert!(retain_downloads_nodavo_directory(&base.0).is_err());
+    }
+
+    #[test]
+    fn receive_destination_rejects_a_reparse_leaf() {
+        let base = TemporaryReceiveRoot::new();
+        let target = base.0.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::windows::fs::symlink_dir(&target, base.0.join(RECEIVED_FILES_DIRECTORY_NAME))
+            .unwrap();
+        assert!(retain_downloads_nodavo_directory(&base.0).is_err());
     }
 
     #[test]

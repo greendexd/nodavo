@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 13 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 14 -->
 
 # Архитектура
 
@@ -107,6 +107,8 @@ Private keys хранятся в macOS Keychain и Windows DPAPI/CNG-backed stor
 Clipboard synchronization использует revisions и content addressing для предотвращения loops. Контент передаётся только при включённой capability. Планируемые типы: UTF-8 text, HTML, PNG/BMP и file lists.
 
 Файлы пишутся в private staging directory, ограничиваются quota, проверяются против traversal/unsafe links и хэшируются BLAKE3. Ограниченный durable-журнал хранит только точные contiguous offsets; возобновление после перезапуска требует тот же аутентифицированный manifest и обрезает недолговечный tail. Финальная публикация отказывается перезаписывать существующее назначение. Полученный контент не открывается автоматически.
+
+Release builds публикуют в фиксированный пользовательский каталог `Загрузки/Nodavo`. Platform adapter разрешает «Загрузки» через OS known-folder API, проходит или проверяет namespace без следования reparse points, создаёт точный private leaf и передаёт агенту только уже открытый directory handle. Глобальный transfer store удерживает эту capability для sessions и offline cleanup; каждый authenticated peer по-прежнему получает отдельный private staging namespace под ней, поэтому staging и финальная publication остаются на одной filesystem. Первичное pairing и включение ранее выключенного Files grant проверяют root до изменений persistent authority. Input-only session использует inert receive backend и никогда не разрешает «Загрузки». Включение Files во время активной session сохраняет grant, затем переподключает именно этого peer, чтобы уже созданный inert backend нельзя было обновить на месте.
 
 Transfer execution и public presentation имеют разных owners. Short-held process registry допускает не более 128 nonterminal rows и хранит не более 32 terminal rows; он выдаёт случайный local UUID, который не попадает в peer protocol, и никогда не раскрывает wire transfer UUID. Public snapshot содержит только direction, phase, ограниченные byte counters, возможность cancellation и фиксированную failure category. Outbound bytes продвигаются после принятия reliable frame, inbound bytes — после durable staging write, а completion — только после durable publication и нужного authenticated acknowledgement. Targeted cancellation линеаризуется с finalization и сообщает `cancelled` только после успешного local cleanup.
 

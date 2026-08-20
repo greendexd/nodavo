@@ -17,6 +17,7 @@ internal static class LifecycleTests
         AgentServerAuthPolicyRejectsIncompleteOrAlteredMetadata();
         StatusReadinessDecoderIsStrictAndRedacted();
         AgentErrorEnvelopeDecoderIsStrictAndRedacted();
+        ReceiveDestinationFailureIsStrictAndLocalized();
         ReadinessReducerKeepsSignalsIndependent();
         ClientDeadlinesExceedServerBudgetsAndRemainDistinct();
         FocusReducerIsBoundedFailClosedAndGenerationSafe();
@@ -121,7 +122,11 @@ internal static class LifecycleTests
 
     private static void AgentErrorEnvelopeDecoderIsStrictAndRedacted()
     {
-        var allowed = new HashSet<string>(StringComparer.Ordinal) { "focus_rejected" };
+        var allowed = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "focus_rejected",
+            "receive_destination_unavailable",
+        };
         using JsonDocument valid = JsonDocument.Parse(
             """{"event":"error","code":"focus_rejected","message":"rejected"}""");
         Assert(
@@ -132,6 +137,16 @@ internal static class LifecycleTests
                 out string code) &&
             code == "focus_rejected",
             "the exact allowlisted focus rejection must decode deterministically");
+        using JsonDocument receiveUnavailable = JsonDocument.Parse(
+            """{"event":"error","code":"receive_destination_unavailable","message":"unavailable"}""");
+        Assert(
+            AgentErrorEnvelopeDecoder.TryDecode(
+                receiveUnavailable.RootElement,
+                allowed,
+                1_024,
+                out string receiveCode) &&
+            receiveCode == "receive_destination_unavailable",
+            "the content-free pre-persist receive rejection must decode exactly");
 
         string[] malformed =
         {
@@ -161,6 +176,60 @@ internal static class LifecycleTests
             }
             throw new InvalidOperationException(
                 "malformed error envelopes must remain ambiguous and fail closed");
+        }
+    }
+
+    private static void ReceiveDestinationFailureIsStrictAndLocalized()
+    {
+        string repository = FindRepositoryRoot();
+        string client = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Services/AgentClient.cs"));
+        string devices = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Views/DevicesView.xaml.cs"));
+        XDocument english = XDocument.Load(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Strings/en-US/Resources.resw"));
+        XDocument russian = XDocument.Load(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Strings/ru-RU/Resources.resw"));
+
+        Assert(
+            Regex.Matches(client, "\"receive_destination_unavailable\"").Count == 1,
+            "the client error allowlist must contain the exact receive rejection once");
+        Assert(
+            devices.Contains(
+                "exception.Code == ReceiveDestinationUnavailableCode",
+                StringComparison.Ordinal) &&
+            devices.Contains("TrustedReceiveDestinationUnavailable", StringComparison.Ordinal) &&
+            devices.Contains("PairingReceiveDestinationUnavailable", StringComparison.Ordinal),
+            "pairing and grant rejection must have exact deterministic presentation branches");
+
+        foreach (XDocument resources in new[] { english, russian })
+        {
+            var values = resources.Root!
+                .Elements("data")
+                .ToDictionary(
+                    node => node.Attribute("name")!.Value,
+                    node => node.Element("value")!.Value,
+                    StringComparer.Ordinal);
+            foreach (string key in new[]
+            {
+                "PairingReceiveDestinationUnavailable",
+                "TrustedReceiveDestinationUnavailableTitle",
+                "TrustedReceiveDestinationUnavailableMessage",
+            })
+            {
+                Assert(values.TryGetValue(key, out string? value) &&
+                    !string.IsNullOrWhiteSpace(value),
+                    $"{key} must be localized");
+            }
+            Assert(values["PairingReceiveDestinationUnavailable"]
+                    .Contains("Downloads/Nodavo", StringComparison.Ordinal) &&
+                values["TrustedReceiveDestinationUnavailableMessage"]
+                    .Contains("Downloads/Nodavo", StringComparison.Ordinal),
+                "localized failure messages must identify the fixed destination");
         }
     }
 

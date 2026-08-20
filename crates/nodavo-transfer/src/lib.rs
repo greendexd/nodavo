@@ -1,7 +1,8 @@
 //! Safe, streaming file-transfer primitives.
 //!
-//! Absolute destination paths and native filesystem handles deliberately never
-//! enter this crate. Platform adapters receive validated relative paths only.
+//! An absolute destination path or native handle may enter only once to create
+//! an opaque retained receive capability. Transfer operations use validated
+//! relative paths and retained handles; ambient paths are never reopened.
 
 use std::collections::HashSet;
 use std::future::Future;
@@ -17,7 +18,7 @@ mod outbound;
 mod queue;
 mod receiver;
 
-pub use fs_staging::FileSystemStagingArea;
+pub use fs_staging::{FileSystemStagingArea, ReceiveRoot};
 pub use outbound::{OutboundResumePoint, OutboundTransferSource};
 pub use queue::{
     MAX_ACTIVE_TRANSFERS, MAX_QUEUED_TRANSFERS, QueueEffect, QueuedTransfer, TransferQueue,
@@ -403,6 +404,104 @@ pub enum TransferError {
     InvalidQueueTransition,
     #[error("platform staging failed")]
     Platform,
+}
+
+/// Session receive staging that remains inert when the local peer has not
+/// granted inbound file transfer.
+///
+/// This lets input/clipboard-only sessions start without resolving or touching
+/// the visible receive directory. An authenticated inbound file operation is
+/// still rejected by the grant reducer before this unavailable backend can be
+/// reached.
+pub enum ReceiveStagingArea {
+    Available(FileSystemStagingArea),
+    Unavailable,
+}
+
+impl ReceiveStagingArea {
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self::Unavailable
+    }
+
+    /// Creates peer-private staging below a retained receive capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Platform`] when retained authority cannot be
+    /// cloned or private peer staging cannot be created safely.
+    pub fn new_scoped_in(
+        receive_root: &ReceiveRoot,
+        authenticated_owner: [u8; 32],
+    ) -> Result<Self, TransferError> {
+        FileSystemStagingArea::new_scoped_in(receive_root, authenticated_owner).map(Self::Available)
+    }
+}
+
+impl From<FileSystemStagingArea> for ReceiveStagingArea {
+    fn from(staging: FileSystemStagingArea) -> Self {
+        Self::Available(staging)
+    }
+}
+
+impl StagingArea for ReceiveStagingArea {
+    fn begin<'a>(
+        &'a mut self,
+        transfer: TransferId,
+        manifest: &'a TransferManifest,
+    ) -> TransferFuture<'a, Result<(), TransferError>> {
+        match self {
+            Self::Available(staging) => staging.begin(transfer, manifest),
+            Self::Unavailable => Box::pin(async { Err(TransferError::Platform) }),
+        }
+    }
+
+    fn write(&mut self, chunk: TransferChunk) -> TransferFuture<'_, Result<(), TransferError>> {
+        match self {
+            Self::Available(staging) => staging.write(chunk),
+            Self::Unavailable => Box::pin(async { Err(TransferError::Platform) }),
+        }
+    }
+
+    fn finalize(&mut self, transfer: TransferId) -> TransferFuture<'_, Result<(), TransferError>> {
+        match self {
+            Self::Available(staging) => staging.finalize(transfer),
+            Self::Unavailable => Box::pin(async { Err(TransferError::Platform) }),
+        }
+    }
+
+    fn abort(&mut self, transfer: TransferId) {
+        if let Self::Available(staging) = self {
+            staging.abort(transfer);
+        }
+    }
+
+    fn abort_confirmed(&mut self, transfer: TransferId) -> Result<(), TransferError> {
+        match self {
+            Self::Available(staging) => staging.abort_confirmed(transfer),
+            Self::Unavailable => Ok(()),
+        }
+    }
+}
+
+impl ResumableStagingArea for ReceiveStagingArea {
+    fn has_persisted(&self, transfer: TransferId) -> Result<bool, TransferError> {
+        match self {
+            Self::Available(staging) => staging.has_persisted(transfer),
+            Self::Unavailable => Ok(false),
+        }
+    }
+
+    fn resume(
+        &mut self,
+        transfer: TransferId,
+        manifest: &TransferManifest,
+    ) -> Result<ResumeState, TransferError> {
+        match self {
+            Self::Available(staging) => staging.resume(transfer, manifest),
+            Self::Unavailable => Err(TransferError::Platform),
+        }
+    }
 }
 
 #[cfg(test)]

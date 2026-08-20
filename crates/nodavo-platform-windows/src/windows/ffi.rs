@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{OsString, c_void};
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::mem::{size_of, size_of_val};
+use std::mem::{offset_of, size_of, size_of_val};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
@@ -53,17 +53,20 @@ use windows::Win32::Security::WinTrust::{
     WTHelperProvDataFromStateData, WinVerifyTrustEx,
 };
 use windows::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetTokenInformation, IsValidSid, OBJECT_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_STATISTICS, TOKEN_USER, TokenSessionId, TokenStatistics, TokenUser,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+    GetSecurityDescriptorControl, GetTokenInformation, IsValidSid, OBJECT_INHERIT_ACE,
+    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_STATISTICS, TOKEN_USER,
+    TokenSessionId, TokenStatistics, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW, GetFinalPathNameByHandleW,
-    MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
-    READ_CONTROL, ReOpenFile, VOLUME_NAME_GUID,
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDriveTypeW,
+    GetFinalPathNameByHandleW, MOVE_FILE_FLAGS, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    MoveFileExW, OPEN_EXISTING, READ_CONTROL, ReOpenFile, VOLUME_NAME_GUID, WRITE_DAC,
 };
 use windows::Win32::Storage::Packaging::Appx::{
     APPLICATION_USER_MODEL_ID_MAX_LENGTH, APPX_PACKAGE_ARCHITECTURE_ARM64,
@@ -100,6 +103,7 @@ use windows::Win32::System::StationsAndDesktops::{
     CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, GetUserObjectInformationW, HDESK,
     OpenInputDesktop, UOI_NAME,
 };
+use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetProcessId, GetProcessTimes,
     OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -125,6 +129,7 @@ use windows::Win32::UI::Input::{
     RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
     RegisterRawInputDevices,
 };
+use windows::Win32::UI::Shell::{FOLDERID_Downloads, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW,
     DestroyWindow, DispatchMessageW, GIDC_ARRIVAL, GIDC_REMOVAL, GetCursorPos, GetMessageTime,
@@ -168,6 +173,7 @@ const CF_DIBV5: u32 = 17;
 const MONITORINFOF_PRIMARY: u32 = 1;
 const NO_ACTIVE_SESSION: u32 = u32::MAX;
 const MAX_DESKTOP_NAME_UNITS: usize = 64;
+const MAX_KNOWN_FOLDER_PATH_UNITS: usize = 32_767;
 const MAX_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
@@ -2117,6 +2123,54 @@ pub(crate) fn create_private_update_directory(path: &Path) -> Result<(), Windows
     })
 }
 
+/// Creates the visible receive root with the transfer core's exact directory
+/// security policy present at namespace publication.
+pub(crate) fn create_private_receive_directory(path: &Path) -> Result<(), WindowsPlatformError> {
+    let path = nul_terminated_path(path)?;
+    with_receive_owner_only_security_attributes(|attributes| {
+        // SAFETY: the path and dynamic current-user security descriptor remain
+        // live for the synchronous call. OICI inheritance and the protected
+        // DACL are therefore present at the instant the leaf is published.
+        unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(attributes)) }
+            .map_err(|_| WindowsPlatformError::NativeApi)
+    })
+}
+
+/// Resolves the current interactive user's Downloads known folder.
+///
+/// The shell allocation is always released with `CoTaskMemFree`. Environment
+/// variables are intentionally not part of this boundary.
+pub(crate) fn current_user_downloads_directory() -> Result<PathBuf, WindowsPlatformError> {
+    let folder_id = FOLDERID_Downloads;
+    // SAFETY: the documented Downloads folder identifier is static, default
+    // flags request the current configured path, and a null token means the
+    // current interactive user. The returned COM allocation is guarded below.
+    let value = unsafe {
+        SHGetKnownFolderPath(&raw const folder_id, KF_FLAG_DEFAULT, None)
+            .map_err(|_| WindowsPlatformError::NativeApi)?
+    };
+    if value.is_null() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let owned = CoTaskWideString(value);
+    let mut length = None;
+    for index in 0..=MAX_KNOWN_FOLDER_PATH_UNITS {
+        // SAFETY: SHGetKnownFolderPath returns a valid NUL-terminated COM
+        // allocation. The local policy bounds the accepted path length.
+        if unsafe { *owned.0.0.add(index) } == 0 {
+            length = Some(index);
+            break;
+        }
+    }
+    let length = length.ok_or(WindowsPlatformError::NativeApi)?;
+    if length == 0 {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    // SAFETY: the bounded scan above found the terminator in this allocation.
+    let units = unsafe { std::slice::from_raw_parts(owned.0.0, length) };
+    Ok(PathBuf::from(OsString::from_wide(units)))
+}
+
 pub(crate) fn open_retained_update_directory(
     path: &Path,
 ) -> Result<std::fs::File, WindowsPlatformError> {
@@ -2130,6 +2184,36 @@ pub(crate) fn open_retained_update_directory(
         CreateFileW(
             PCWSTR(path.as_ptr()),
             FILE_LIST_DIRECTORY.0 | FILE_READ_ATTRIBUTES.0 | READ_CONTROL.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map_err(|_| WindowsPlatformError::NativeApi)?;
+    owned_handle(handle).map(std::fs::File::from)
+}
+
+/// Opens the final private receive root for handle-relative mutation.
+///
+/// Unlike namespace-observation handles, this final capability carries the
+/// current user's read/write directory rights and `WRITE_DAC`, which the
+/// transfer boundary needs to create and verify owner-only children. Delete
+/// sharing remains absent so the exact root cannot be renamed or replaced.
+pub(crate) fn open_retained_receive_directory(
+    path: &Path,
+) -> Result<std::fs::File, WindowsPlatformError> {
+    let path = nul_terminated_path(path)?;
+    let flags = FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT;
+    // SAFETY: the path is a live NUL-terminated string. The protected leaf is
+    // opened for handle-relative current-user transfer mutations. Read/write
+    // sharing permits bounded child work; absent delete sharing retains the
+    // exact directory object. OPEN_REPARSE_POINT suppresses final traversal.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | READ_CONTROL.0 | WRITE_DAC.0,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             None,
             OPEN_EXISTING,
@@ -2345,6 +2429,157 @@ pub(crate) fn validate_private_update_handle(
     Ok(())
 }
 
+/// Validates the transfer core's exact receive-directory security invariant.
+///
+/// The current user must own the object. Its DACL must be protected and contain
+/// exactly one allow ACE for that same SID, with only OI+CI inheritance flags
+/// and exactly `FILE_ALL_ACCESS`.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn validate_private_receive_handle(
+    file: &std::fs::File,
+) -> Result<(), WindowsPlatformError> {
+    // SAFETY: GetCurrentProcess returns a process pseudo-handle that remains
+    // valid for the process lifetime and must not be closed.
+    let current_token = open_query_token(unsafe { GetCurrentProcess() })?;
+    let current_user = read_token_user(as_windows_handle(&current_token))?;
+    let current_sid = current_user.sid;
+
+    let mut owner = PSID::default();
+    let mut dacl = ptr::null_mut::<ACL>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    let information =
+        OBJECT_SECURITY_INFORMATION(OWNER_SECURITY_INFORMATION.0 | DACL_SECURITY_INFORMATION.0);
+    // SAFETY: the retained file handle and all output pointers remain live;
+    // the returned descriptor is transferred immediately to its guard.
+    let status = unsafe {
+        GetSecurityInfo(
+            HANDLE(file.as_raw_handle()),
+            SE_FILE_OBJECT,
+            information,
+            Some(&raw mut owner),
+            None,
+            Some(&raw mut dacl),
+            None,
+            Some(&raw mut descriptor),
+        )
+    };
+    if status != ERROR_SUCCESS
+        || descriptor.0.is_null()
+        || owner.0.is_null()
+        || dacl.is_null()
+        || !unsafe { IsValidSid(owner) }.as_bool()
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    // SAFETY: owner, current_sid, and the descriptor backing owner remain live.
+    unsafe { EqualSid(owner, current_sid) }.map_err(|_| WindowsPlatformError::NativeApi)?;
+
+    let mut control = 0_u16;
+    let mut revision = 0_u32;
+    // SAFETY: the guarded descriptor and scalar outputs remain live.
+    unsafe {
+        GetSecurityDescriptorControl(descriptor.0, &raw mut control, &raw mut revision)
+            .map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    if control & SE_DACL_PROTECTED.0 == 0 {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+
+    let mut acl_information = ACL_SIZE_INFORMATION::default();
+    // SAFETY: the DACL belongs to the guarded descriptor and the output has
+    // exactly the documented size and alignment.
+    unsafe {
+        GetAclInformation(
+            dacl,
+            ptr::from_mut(&mut acl_information).cast::<c_void>(),
+            u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
+                .map_err(|_| WindowsPlatformError::NativeApi)?,
+            AclSizeInformation,
+        )
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    if acl_information.AceCount != 1 {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+
+    let mut raw_ace = ptr::null_mut::<c_void>();
+    // SAFETY: the validated ACL reports exactly one entry and the output is live.
+    unsafe { GetAce(dacl, 0, &raw mut raw_ace) }.map_err(|_| WindowsPlatformError::NativeApi)?;
+    if raw_ace.is_null() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let list_base = dacl.cast::<u8>() as usize;
+    let list_limit = list_base
+        .checked_add(
+            usize::try_from(acl_information.AclBytesInUse)
+                .map_err(|_| WindowsPlatformError::NativeApi)?,
+        )
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    let entry_base = raw_ace.cast::<u8>() as usize;
+    let minimum_entry_base = list_base
+        .checked_add(size_of::<ACL>())
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    if entry_base != minimum_entry_base || entry_base >= list_limit {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let header_limit = entry_base
+        .checked_add(size_of::<ACE_HEADER>())
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    if header_limit > list_limit {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    // SAFETY: the fixed ACE header is fully bounded by the live ACL.
+    let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+    let ace_size = usize::from(header.AceSize);
+    let entry_limit = entry_base
+        .checked_add(ace_size)
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    let sid_offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+    let minimum_ace_size = sid_offset
+        .checked_add(8)
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    if ace_size < minimum_ace_size || entry_limit > list_limit {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    // SAFETY: all fixed ACCESS_ALLOWED_ACE fields and the fixed SID header are
+    // bounded by AceSize and the containing live ACL.
+    let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+    let expected_flags = u8::try_from((OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE).0)
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+        || header.AceFlags != expected_flags
+        || ace.Mask != FILE_ALL_ACCESS.0
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+
+    let ace_sid_start = raw_ace.cast::<u8>().wrapping_add(sid_offset);
+    // SAFETY: the complete fixed SID header lies within the bounded ACE.
+    let sub_authority_count = usize::from(unsafe { *ace_sid_start.add(1) });
+    let sid_size = 8_usize
+        .checked_add(
+            sub_authority_count
+                .checked_mul(4)
+                .ok_or(WindowsPlatformError::NativeApi)?,
+        )
+        .ok_or(WindowsPlatformError::NativeApi)?;
+    if sid_offset
+        .checked_add(sid_size)
+        .is_none_or(|end| end != ace_size)
+        || entry_limit != list_limit
+    {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    let ace_sid = PSID(ace_sid_start.cast::<c_void>());
+    // SAFETY: the variable-length SID is bounded by the ACE and live ACL.
+    if ace_sid.0.is_null() || !unsafe { IsValidSid(ace_sid) }.as_bool() {
+        return Err(WindowsPlatformError::NativeApi);
+    }
+    // SAFETY: both SIDs are valid and backed by live storage.
+    unsafe { EqualSid(ace_sid, current_sid) }.map_err(|_| WindowsPlatformError::NativeApi)
+}
+
 fn with_owner_only_security_attributes<T>(
     operation: impl FnOnce(*const SECURITY_ATTRIBUTES) -> Result<T, WindowsPlatformError>,
 ) -> Result<T, WindowsPlatformError> {
@@ -2353,6 +2588,37 @@ fn with_owner_only_security_attributes<T>(
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(OWNER_ONLY_PIPE_SDDL.as_ptr()),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+        .map_err(|_| WindowsPlatformError::NativeApi)?;
+    }
+    let descriptor = LocalSecurityDescriptor(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>())
+            .map_err(|_| WindowsPlatformError::NativeApi)?,
+        lpSecurityDescriptor: descriptor.0.0,
+        bInheritHandle: false.into(),
+    };
+    operation(&raw const attributes)
+}
+
+fn with_receive_owner_only_security_attributes<T>(
+    operation: impl FnOnce(*const SECURITY_ATTRIBUTES) -> Result<T, WindowsPlatformError>,
+) -> Result<T, WindowsPlatformError> {
+    let sid = current_user_sid_string()?;
+    let sddl = format!("O:{sid}D:P(A;OICI;FA;;;{sid})");
+    let encoded = sddl
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the bounded dynamic SDDL and output pointer remain live. The SID
+    // was obtained from and validated against the current process token.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(encoded.as_ptr()),
             SDDL_REVISION_1,
             &raw mut descriptor,
             None,
@@ -2951,7 +3217,8 @@ struct CoTaskWideString(PWSTR);
 
 impl Drop for CoTaskWideString {
     fn drop(&mut self) {
-        // SAFETY: Appx returned this exact string with the COM task allocator.
+        // SAFETY: the originating COM or Shell API returned this exact string
+        // with the COM task allocator.
         unsafe { CoTaskMemFree(Some(self.0.0.cast::<c_void>())) };
     }
 }

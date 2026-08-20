@@ -5,6 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+use cap_fs_ext::DirExt as _;
+#[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+use cap_std::ambient_authority;
+#[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+use cap_std::fs::{Dir, DirBuilder, DirBuilderExt as _, MetadataExt as _};
 use nodavo_discovery::{DiscoveryLocation, DiscoveryRuntimeEvent, MdnsRuntime};
 use nodavo_identity::{
     Capability as TrustedCapability, CapabilityGrants, DeviceSigner as _, PairingAction,
@@ -16,7 +22,9 @@ use nodavo_local_ipc::{
     TrustedPeerState, TrustedPeerSummary,
 };
 use nodavo_protocol::{Capability as ProtocolCapability, GrantEpoch};
-use nodavo_transfer::{FileSystemStagingArea, TransferId};
+#[cfg(test)]
+use nodavo_transfer::FileSystemStagingArea;
+use nodavo_transfer::{ReceiveRoot, ReceiveStagingArea, TransferId};
 use nodavo_transport::quinn_backend::{
     EphemeralPairingConfiguration, EphemeralPairingIdentity, PinnedMutualConfiguration,
     QuinnBackendOptions, QuinnTransport,
@@ -86,6 +94,8 @@ pub(crate) enum AgentError {
     Storage,
     #[error("the local capability grant epoch is exhausted")]
     GrantEpochExhausted,
+    #[error("the fixed receive destination is unavailable")]
+    ReceiveDestinationUnavailable,
     #[error("the persisted peer placement could not be applied to the active session")]
     PlacementApplyFailed,
     #[error("no authenticated peer session is connected")]
@@ -130,7 +140,29 @@ pub(crate) struct PairingStarted {
 pub(crate) enum PairingOutcome {
     Pending,
     Finished(bool),
-    Failed,
+    Failed(PairingFailure),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PairingFailure {
+    Generic,
+    ReceiveDestinationUnavailable,
+}
+
+impl PairingFailure {
+    const fn from_agent_error(error: &AgentError) -> Self {
+        match error {
+            AgentError::ReceiveDestinationUnavailable => Self::ReceiveDestinationUnavailable,
+            _ => Self::Generic,
+        }
+    }
+
+    const fn into_agent_error(self) -> AgentError {
+        match self {
+            Self::Generic => AgentError::PairingFailed,
+            Self::ReceiveDestinationUnavailable => AgentError::ReceiveDestinationUnavailable,
+        }
+    }
 }
 
 struct PairingControl {
@@ -154,6 +186,94 @@ struct BoundSessionSender {
     sender: mpsc::Sender<LocalSessionCommand>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiveRootResolutionError;
+
+pub(crate) trait ReceiveRootResolver: Send + Sync {
+    fn resolve_receive_root(&self) -> Result<ReceiveRoot, ReceiveRootResolutionError>;
+}
+
+struct NativeReceiveRootResolver;
+
+impl ReceiveRootResolver for NativeReceiveRootResolver {
+    fn resolve_receive_root(&self) -> Result<ReceiveRoot, ReceiveRootResolutionError> {
+        #[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+        {
+            return development_receive_root();
+        }
+
+        #[cfg(all(
+            target_os = "macos",
+            not(test),
+            not(feature = "development-unverified-local-ipc")
+        ))]
+        {
+            let handle = crate::macos::resolve_downloads_nodavo_directory()
+                .map_err(|()| ReceiveRootResolutionError)?;
+            return ReceiveRoot::from_retained_directory_handle(handle)
+                .map_err(|_| ReceiveRootResolutionError);
+        }
+
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            return crate::windows::resolve_downloads_nodavo_directory()
+                .map_err(|()| ReceiveRootResolutionError);
+        }
+
+        #[allow(unreachable_code)]
+        Err(ReceiveRootResolutionError)
+    }
+}
+
+#[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+fn development_receive_root() -> Result<ReceiveRoot, ReceiveRootResolutionError> {
+    let state_root = crate::default_state_directory().map_err(|_| ReceiveRootResolutionError)?;
+    std::fs::create_dir_all(&state_root).map_err(|_| ReceiveRootResolutionError)?;
+    let state = Dir::open_ambient_dir(&state_root, ambient_authority())
+        .map_err(|_| ReceiveRootResolutionError)?;
+    let isolated = open_or_create_private_development_directory(&state, "development-receive")?;
+    let receive = open_or_create_private_development_directory(&isolated, "Nodavo")?;
+    ReceiveRoot::from_retained_directory_handle(receive.into_std_file())
+        .map_err(|_| ReceiveRootResolutionError)
+}
+
+#[cfg(all(not(windows), any(test, feature = "development-unverified-local-ipc")))]
+fn open_or_create_private_development_directory(
+    parent: &Dir,
+    name: &str,
+) -> Result<Dir, ReceiveRootResolutionError> {
+    match parent.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(ReceiveRootResolutionError);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            if let Err(error) = parent.create_dir_with(name, &builder)
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(ReceiveRootResolutionError);
+            }
+        }
+        Err(_) => return Err(ReceiveRootResolutionError),
+    }
+    let directory = parent
+        .open_dir_nofollow(name)
+        .map_err(|_| ReceiveRootResolutionError)?;
+    let metadata = directory
+        .dir_metadata()
+        .map_err(|_| ReceiveRootResolutionError)?;
+    if !metadata.is_dir() || metadata.mode() & 0o777 != 0o700 {
+        return Err(ReceiveRootResolutionError);
+    }
+    directory
+        .try_clone()
+        .and_then(|clone| clone.into_std_file().sync_all())
+        .map_err(|_| ReceiveRootResolutionError)?;
+    Ok(directory)
+}
+
 pub(crate) struct AgentRuntime {
     status: RwLock<AgentStatus>,
     readiness_probe_gate: Mutex<()>,
@@ -170,6 +290,8 @@ pub(crate) struct AgentRuntime {
     disconnect: watch::Sender<u64>,
     session_commands: Mutex<Option<BoundSessionSender>>,
     transfer_store: TransferStore,
+    receive_root_resolver: Arc<dyn ReceiveRootResolver>,
+    receive_root_resolution: std::sync::Mutex<()>,
     quic_bind_address: SocketAddr,
     device_name: String,
 }
@@ -181,6 +303,24 @@ impl AgentRuntime {
         peers: Vec<PeerRecord>,
         quic_bind_address: SocketAddr,
         device_name: String,
+    ) -> Arc<Self> {
+        Self::new_with_receive_root_resolver(
+            storage,
+            material,
+            peers,
+            quic_bind_address,
+            device_name,
+            Arc::new(NativeReceiveRootResolver),
+        )
+    }
+
+    pub(crate) fn new_with_receive_root_resolver(
+        storage: Arc<dyn DevelopmentStorage>,
+        material: DeviceMaterial,
+        peers: Vec<PeerRecord>,
+        quic_bind_address: SocketAddr,
+        device_name: String,
+        receive_root_resolver: Arc<dyn ReceiveRootResolver>,
     ) -> Arc<Self> {
         let (disconnect, _) = watch::channel(0_u64);
         Arc::new(Self {
@@ -205,9 +345,28 @@ impl AgentRuntime {
             disconnect,
             session_commands: Mutex::new(None),
             transfer_store: TransferStore::default(),
+            receive_root_resolver,
+            receive_root_resolution: std::sync::Mutex::new(()),
             quic_bind_address,
             device_name,
         })
+    }
+
+    fn ensure_receive_root(&self) -> Result<(), AgentError> {
+        let _resolution = self
+            .receive_root_resolution
+            .lock()
+            .map_err(|_| AgentError::ReceiveDestinationUnavailable)?;
+        if self.transfer_store.receive_root_ready() {
+            return Ok(());
+        }
+        let root = self
+            .receive_root_resolver
+            .resolve_receive_root()
+            .map_err(|_| AgentError::ReceiveDestinationUnavailable)?;
+        self.transfer_store
+            .install_receive_root(root)
+            .map_err(|_| AgentError::ReceiveDestinationUnavailable)
     }
 
     pub(crate) async fn status(&self) -> AgentStatus {
@@ -341,6 +500,13 @@ impl AgentRuntime {
             if record.grants.contains(capability) == enabled {
                 return Ok(());
             }
+            if capability == TrustedCapability::FileTransfer && enabled {
+                // The peer lock keeps concurrent grant disable/enable/revoke
+                // transitions on one side of this preflight. Filesystem
+                // authority is acquired before the epoch or trust record
+                // changes, so denial cannot leave a committed Files grant.
+                self.ensure_receive_root()?;
+            }
             let next = record
                 .grant_epoch
                 .get()
@@ -373,6 +539,15 @@ impl AgentRuntime {
             .as_ref()
             .filter(|bound| bound.peer == peer_device)
             .map(|bound| bound.sender.clone());
+        if capability == TrustedCapability::FileTransfer && enabled && sender.is_some() {
+            // A session created while inbound Files was disabled deliberately
+            // owns an inert receive backend. The persisted grant is now
+            // authoritative, but it cannot be applied to that old backend in
+            // place. Reconnect the exact peer so its worker is constructed
+            // from the retained root before any inbound manifest is accepted.
+            self.disconnect_all();
+            return Ok(());
+        }
         if let Some(sender) = sender {
             let (acknowledgement, received) = oneshot::channel();
             let command = LocalSessionCommand::UpdateLocalGrant {
@@ -564,6 +739,14 @@ impl AgentRuntime {
                 return Err(error);
             }
         };
+        if peer.grants.contains(TrustedCapability::FileTransfer)
+            && let Err(error) = self.ensure_receive_root()
+        {
+            // Persisted inbound Files authority is session-scoped fail closed;
+            // input-only peers never resolve or touch the receive root.
+            self.busy.store(false, Ordering::Release);
+            return Err(error);
+        }
 
         let role = match &mode {
             ReconnectMode::Listen { .. } => SessionRole::Acceptor,
@@ -778,7 +961,11 @@ impl AgentRuntime {
                 .map_err(|_| AgentError::PairingTimedOut)?
                 .map_err(|_| AgentError::PairingFailed)?;
         }
-        Ok(*outcome.borrow())
+        let final_outcome = *outcome.borrow();
+        match final_outcome {
+            PairingOutcome::Failed(failure) => Err(failure.into_agent_error()),
+            outcome => Ok(outcome),
+        }
     }
 
     pub(crate) async fn revoke_peer(&self, peer_id: &str) -> Result<(), AgentError> {
@@ -1356,8 +1543,10 @@ impl AgentRuntime {
         let result = self
             .complete_pairing(prepared, confirmation_rx, &mut disconnect, &outcome)
             .await;
-        if result.is_err() {
-            let _ = outcome.send(PairingOutcome::Failed);
+        if let Err(error) = &result {
+            let _ = outcome.send(PairingOutcome::Failed(PairingFailure::from_agent_error(
+                error,
+            )));
         }
         self.publish_session_finished_status(matches!(
             result,
@@ -1450,6 +1639,8 @@ impl AgentRuntime {
         prepared
             .transaction
             .reduce(PairingAction::SubmitAcceptance(peer_acceptance))?;
+
+        self.preflight_pairing_receive_root(&prepared.transaction, prepared.role)?;
 
         send_pairing_message(
             prepared.connection.as_mut(),
@@ -1549,6 +1740,12 @@ impl AgentRuntime {
     }
 
     async fn persist_peer(&self, record: PeerRecord) -> Result<(), AgentError> {
+        if record.grants.contains(TrustedCapability::FileTransfer) {
+            // Pairing is not externally committed until this record is stored
+            // and the Committed message is sent. Destination denial must win
+            // before either durable trust or that wire acknowledgement.
+            self.ensure_receive_root()?;
+        }
         let mut peers = self.peers.lock().await;
         let previous = peers.clone();
         if let Some(existing) = peers
@@ -1562,6 +1759,21 @@ impl AgentRuntime {
         if self.storage.store_peers(&peers).is_err() {
             *peers = previous;
             return Err(AgentError::Storage);
+        }
+        Ok(())
+    }
+
+    fn preflight_pairing_receive_root(
+        &self,
+        transaction: &PairingTxn,
+        local_role: PairingRole,
+    ) -> Result<(), AgentError> {
+        let local_grants = transaction
+            .transcript()
+            .participant(local_role)
+            .grants_to_peer();
+        if local_grants.contains(TrustedCapability::FileTransfer) {
+            self.ensure_receive_root()?;
         }
         Ok(())
     }
@@ -1634,7 +1846,13 @@ async fn run_platform_session(
     let (native_sender, native_receiver) = native_input_channel();
     let (safety_sender, safety_receiver) = platform_safety_channel();
     let clipboard = native_clipboard_port().map_err(|_| SessionRuntimeError::Platform)?;
-    let transfer = native_transfer_staging(&transfer_store, config.peer_device)?;
+    let transfer = native_transfer_staging(
+        &transfer_store,
+        config.peer_device,
+        config
+            .local_grants_to_peer
+            .contains(TrustedCapability::FileTransfer),
+    )?;
 
     #[cfg(target_os = "macos")]
     let mut platform = MacPlatformPort::new(native_sender, &safety_sender);
@@ -1669,25 +1887,10 @@ async fn run_platform_session(
 fn native_transfer_staging(
     transfer_store: &TransferStore,
     peer: nodavo_protocol::DeviceId,
-) -> Result<FileSystemStagingArea, SessionRuntimeError> {
-    #[cfg(unix)]
-    let state_root = crate::default_state_directory().map_err(|_| SessionRuntimeError::Platform)?;
-    #[cfg(target_os = "windows")]
-    let state_root =
-        crate::windows::default_state_directory().map_err(|_| SessionRuntimeError::Platform)?;
-    let inbox = state_root.join("Received Files");
-    std::fs::create_dir_all(&inbox).map_err(|_| SessionRuntimeError::Platform)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::set_permissions(&inbox, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| SessionRuntimeError::Platform)?;
-    }
+    inbound_files_granted: bool,
+) -> Result<ReceiveStagingArea, SessionRuntimeError> {
     transfer_store
-        .register_staging_root(peer, inbox.clone())
-        .map_err(|_| SessionRuntimeError::Platform)?;
-    FileSystemStagingArea::new_scoped(inbox, *peer.as_bytes())
+        .receive_staging(peer, inbound_files_granted)
         .map_err(|_| SessionRuntimeError::Platform)
 }
 
@@ -1933,7 +2136,9 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Mutex as StdMutex;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Barrier, Mutex as StdMutex};
 
     use bytes::Bytes;
     use nodavo_local_ipc::{AccessibilityReadiness, InputReadiness, LocalTopologyReadiness};
@@ -1941,6 +2146,7 @@ mod tests {
         ContentHash, EntryKind, ManifestEntry, RelativePath, ResumableStagingArea, StagingArea,
         TransferChunk, TransferManifest,
     };
+    use nodavo_transport::{BoxFuture, DatagramAvailability};
 
     use super::*;
     use crate::storage::{StorageError, create_identity};
@@ -1948,6 +2154,170 @@ mod tests {
     struct MemoryStorage {
         peers: StdMutex<Vec<PeerRecord>>,
         fail_store: AtomicBool,
+    }
+
+    struct TestReceiveRootResolver {
+        root: PathBuf,
+        fail: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    struct PairingMemoryConnection {
+        remote: Endpoint,
+        inbound: mpsc::UnboundedReceiver<TransportEvent>,
+        peer_events: mpsc::UnboundedSender<TransportEvent>,
+        closed: bool,
+    }
+
+    impl Drop for PairingMemoryConnection {
+        fn drop(&mut self) {
+            if !self.closed {
+                let _ = self
+                    .peer_events
+                    .send(TransportEvent::Closed(CloseReason::Requested));
+            }
+        }
+    }
+
+    impl PeerConnection for PairingMemoryConnection {
+        fn remote_endpoint(&self) -> Endpoint {
+            self.remote
+        }
+
+        fn datagram_availability(&self) -> DatagramAvailability {
+            DatagramAvailability::Unavailable
+        }
+
+        fn export_keying_material(
+            &self,
+            _label: &[u8],
+            _context: &[u8],
+            output_len: usize,
+        ) -> Result<Bytes, TransportError> {
+            Ok(Bytes::from(vec![7; output_len]))
+        }
+
+        fn execute(
+            &mut self,
+            command: TransportCommand,
+        ) -> BoxFuture<'_, Result<(), TransportError>> {
+            Box::pin(async move {
+                if self.closed {
+                    return Err(TransportError::Closed);
+                }
+                match command {
+                    TransportCommand::SendReliable {
+                        channel,
+                        payload,
+                        end_of_stream,
+                    } => self
+                        .peer_events
+                        .send(TransportEvent::ReliableData {
+                            channel,
+                            payload,
+                            end_of_stream,
+                        })
+                        .map_err(|_| TransportError::Closed),
+                    TransportCommand::Close(reason) => {
+                        self.closed = true;
+                        let _ = self.peer_events.send(TransportEvent::Closed(reason));
+                        Ok(())
+                    }
+                    _ => Err(TransportError::Backend),
+                }
+            })
+        }
+
+        fn next_event(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
+            Box::pin(async move { self.inbound.recv().await.ok_or(TransportError::Closed) })
+        }
+    }
+
+    fn pairing_memory_pair() -> (Box<dyn PeerConnection>, Box<dyn PeerConnection>) {
+        let (a_tx, a_rx) = mpsc::unbounded_channel();
+        let (b_tx, b_rx) = mpsc::unbounded_channel();
+        let a_endpoint = Endpoint::new("127.0.0.1:45101".parse().unwrap()).unwrap();
+        let b_endpoint = Endpoint::new("127.0.0.1:45102".parse().unwrap()).unwrap();
+        (
+            Box::new(PairingMemoryConnection {
+                remote: b_endpoint,
+                inbound: a_rx,
+                peer_events: b_tx,
+                closed: false,
+            }),
+            Box::new(PairingMemoryConnection {
+                remote: a_endpoint,
+                inbound: b_rx,
+                peer_events: a_tx,
+                closed: false,
+            }),
+        )
+    }
+
+    impl TestReceiveRootResolver {
+        fn available(root: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                root,
+                fail: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn unavailable(root: PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                root,
+                fail: AtomicBool::new(true),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl ReceiveRootResolver for TestReceiveRootResolver {
+        fn resolve_receive_root(&self) -> Result<ReceiveRoot, ReceiveRootResolutionError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if self.fail.load(Ordering::Acquire) {
+                return Err(ReceiveRootResolutionError);
+            }
+            let handle = fs::File::open(&self.root).map_err(|_| ReceiveRootResolutionError)?;
+            ReceiveRoot::from_retained_directory_handle(handle)
+                .map_err(|_| ReceiveRootResolutionError)
+        }
+    }
+
+    fn private_receive_test_root(label: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("nodavo-{label}-{}", TransferId::new().as_uuid()));
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        root
+    }
+
+    fn receive_runtime(
+        peers: Vec<PeerRecord>,
+        resolver: Arc<dyn ReceiveRootResolver>,
+    ) -> (Arc<AgentRuntime>, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(peers.clone()),
+            fail_store: AtomicBool::new(false),
+        });
+        let runtime = AgentRuntime::new_with_receive_root_resolver(
+            Arc::clone(&storage) as Arc<dyn DevelopmentStorage>,
+            create_identity().unwrap().0,
+            peers,
+            "127.0.0.1:0".parse().unwrap(),
+            "Receive test".to_owned(),
+            resolver,
+        );
+        (runtime, storage)
     }
 
     impl DevelopmentStorage for MemoryStorage {
@@ -2407,6 +2777,452 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_grant_preflight_fails_before_epoch_or_storage_commit() {
+        let peer = placement_peer(21, "Files peer");
+        let peer_id = device_id_text(peer.device_id());
+        let root = private_receive_test_root("denied-receive");
+        let resolver = TestReceiveRootResolver::unavailable(root.clone());
+        let (runtime, storage) = receive_runtime(
+            vec![peer.clone()],
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+
+        assert!(matches!(
+            runtime
+                .set_capability(&peer_id, TrustedCapability::FileTransfer, true)
+                .await,
+            Err(AgentError::ReceiveDestinationUnavailable)
+        ));
+        assert_eq!(resolver.calls(), 1);
+        let runtime_peer = runtime.active_peer(&peer_id).await.unwrap();
+        assert_eq!(runtime_peer.grant_epoch, GrantEpoch::new(1));
+        assert_eq!(runtime_peer.grants, CapabilityGrants::NONE);
+        {
+            let stored = storage.peers.lock().unwrap();
+            assert_eq!(stored[0].grant_epoch, GrantEpoch::new(1));
+            assert_eq!(stored[0].grants, CapabilityGrants::NONE);
+        }
+
+        // A receive-destination denial is scoped to inbound Files. The same
+        // peer can still gain and use input-only authority without retrying it.
+        runtime
+            .set_capability(&peer_id, TrustedCapability::RemoteInput, true)
+            .await
+            .unwrap();
+        assert_eq!(resolver.calls(), 1);
+        assert!(
+            runtime
+                .active_peer(&peer_id)
+                .await
+                .unwrap()
+                .grants
+                .contains(TrustedCapability::RemoteInput)
+        );
+        let staging = native_transfer_staging(
+            &runtime.transfer_store,
+            protocol_device_id(peer.device_id()),
+            false,
+        )
+        .unwrap();
+        assert!(!staging.has_persisted(TransferId::new()).unwrap());
+        assert!(!runtime.transfer_store.receive_root_ready());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn enabling_files_reconnects_session_before_new_receive_backend_can_be_used() {
+        let peer = placement_peer(26, "Live input-only peer");
+        let peer_id = device_id_text(peer.device_id());
+        let peer_device = protocol_device_id(peer.device_id());
+        let root = private_receive_test_root("enable-files-reconnect");
+        let resolver = TestReceiveRootResolver::available(root.clone());
+        let (runtime, storage) = receive_runtime(
+            vec![peer],
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+        let (sender, mut receiver) = command_channel();
+        runtime
+            .install_peer_bound_session_sender(peer_device, sender)
+            .await
+            .unwrap();
+        let disconnect = runtime.disconnect.subscribe();
+        let before = *disconnect.borrow();
+
+        runtime
+            .set_capability(&peer_id, TrustedCapability::FileTransfer, true)
+            .await
+            .unwrap();
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(runtime.transfer_store.receive_root_ready());
+        assert_ne!(*disconnect.borrow(), before);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let stored = storage.peers.lock().unwrap();
+        assert_eq!(stored[0].grant_epoch, GrantEpoch::new(2));
+        assert!(stored[0].grants.contains(TrustedCapability::FileTransfer));
+        drop(stored);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_persistence_preflights_files_before_trust_commit() {
+        let mut peer = placement_peer(22, "Pairing files peer");
+        peer.grants = CapabilityGrants::NONE.with(TrustedCapability::FileTransfer);
+        let root = private_receive_test_root("pairing-denied-receive");
+        let resolver = TestReceiveRootResolver::unavailable(root.clone());
+        let (runtime, storage) = receive_runtime(
+            Vec::new(),
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+
+        assert!(matches!(
+            runtime.persist_peer(peer).await,
+            Err(AgentError::ReceiveDestinationUnavailable)
+        ));
+        assert_eq!(resolver.calls(), 1);
+        assert!(runtime.peers.lock().await.is_empty());
+        assert!(storage.peers.lock().unwrap().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two-party ordering proof keeps the complete transcript visible"
+    )]
+    async fn failed_pairing_receive_preflight_precedes_ready_and_preserves_exact_outcome() {
+        let local_material = create_identity().unwrap().0;
+        let peer_material = create_identity().unwrap().0;
+        let local_certificate =
+            TransportCertificate::from_der(local_material.certificate_der.clone()).unwrap();
+        let peer_certificate =
+            TransportCertificate::from_der(peer_material.certificate_der.clone()).unwrap();
+        let local_nonce = PairingNonce::from_bytes([31; 32]);
+        let peer_nonce = PairingNonce::from_bytes([32; 32]);
+        let local_pending = PendingTrust::new(
+            local_material.signer.public_identity(),
+            CapabilityGrants::NONE.with(TrustedCapability::FileTransfer),
+            local_certificate,
+        );
+        let peer_pending = PendingTrust::new(
+            peer_material.signer.public_identity(),
+            CapabilityGrants::NONE,
+            peer_certificate.clone(),
+        );
+        let local_transaction = PairingTxn::new(
+            PAIRING_PROTOCOL_VERSION,
+            &[7; EXPORTER_BYTES],
+            local_pending.clone(),
+            local_nonce,
+            peer_pending.clone(),
+            peer_nonce,
+        )
+        .unwrap();
+        let peer_transaction = PairingTxn::new(
+            PAIRING_PROTOCOL_VERSION,
+            &[7; EXPORTER_BYTES],
+            local_pending,
+            local_nonce,
+            peer_pending,
+            peer_nonce,
+        )
+        .unwrap();
+        let peer_hello = PeerHello {
+            name: "Peer device".to_owned(),
+            identity: peer_material.signer.public_identity(),
+            certificate: peer_certificate,
+            grants: CapabilityGrants::NONE,
+            nonce: peer_nonce,
+            server_name: peer_material.server_name.clone(),
+        };
+        let root = private_receive_test_root("pairing-before-ready-denied");
+        let resolver = TestReceiveRootResolver::unavailable(root.clone());
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(Vec::new()),
+            fail_store: AtomicBool::new(false),
+        });
+        let runtime = AgentRuntime::new_with_receive_root_resolver(
+            Arc::clone(&storage) as Arc<dyn DevelopmentStorage>,
+            local_material,
+            Vec::new(),
+            "127.0.0.1:0".parse().unwrap(),
+            "Local device".to_owned(),
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+        let (local_connection, mut peer_connection) = pairing_memory_pair();
+        let remote_endpoint = local_connection.remote_endpoint().address();
+        let channel = nodavo_transport::ChannelId::from_backend(7);
+        let prepared = PreparedPairing {
+            role: PairingRole::Initiator,
+            transaction: local_transaction,
+            peer: peer_hello,
+            connection: local_connection,
+            channel,
+            remote_endpoint,
+        };
+        let peer_acceptance = peer_transaction
+            .create_acceptance(PairingRole::Responder, &peer_material.signer)
+            .unwrap();
+        let peer = tokio::spawn(async move {
+            assert!(matches!(
+                receive_pairing_message(peer_connection.as_mut(), channel).await,
+                Ok(PairingMessage::Confirmation(true))
+            ));
+            send_pairing_message(
+                peer_connection.as_mut(),
+                channel,
+                &PairingMessage::Confirmation(true),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                receive_pairing_message(peer_connection.as_mut(), channel).await,
+                Ok(PairingMessage::Acceptance(_))
+            ));
+            send_pairing_message(
+                peer_connection.as_mut(),
+                channel,
+                &PairingMessage::Acceptance(peer_acceptance),
+            )
+            .await
+            .unwrap();
+            // The healthy peer may advertise its own readiness immediately.
+            // It still cannot commit without observing the failing side's
+            // independently gated ReadyToCommit.
+            send_pairing_message(
+                peer_connection.as_mut(),
+                channel,
+                &PairingMessage::ReadyToCommit,
+            )
+            .await
+            .unwrap();
+            let observed = timeout(
+                Duration::from_secs(1),
+                receive_pairing_message(peer_connection.as_mut(), channel),
+            )
+            .await
+            .expect("failed local preflight did not terminate the pairing link");
+            match observed {
+                Ok(PairingMessage::ReadyToCommit | PairingMessage::Committed) => {
+                    panic!("peer observed commit traffic before local receive preflight")
+                }
+                Ok(_) => panic!("peer observed an unexpected pairing message"),
+                Err(
+                    WireError::InvalidMessage
+                    | WireError::MessageTooLarge
+                    | WireError::TimedOut
+                    | WireError::Closed
+                    | WireError::Transport
+                    | WireError::Io,
+                ) => {}
+            }
+        });
+
+        let pairing_id = "pairing-receive-preflight".to_owned();
+        let (confirmation, confirmation_rx) = oneshot::channel();
+        let (outcome_tx, outcome_rx) = watch::channel(PairingOutcome::Pending);
+        *runtime.pairing.lock().await = Some(PairingControl {
+            pairing_id: pairing_id.clone(),
+            confirmation: Some(confirmation),
+            outcome: outcome_rx,
+        });
+        runtime.busy.store(true, Ordering::Release);
+        let task_runtime = Arc::clone(&runtime);
+        let disconnect = runtime.disconnect.subscribe();
+        let pairing = tokio::spawn(async move {
+            task_runtime
+                .run_pairing(prepared, confirmation_rx, outcome_tx, disconnect)
+                .await;
+        });
+
+        assert!(matches!(
+            timeout(
+                Duration::from_secs(2),
+                runtime.confirm_pairing(&pairing_id, true)
+            )
+            .await
+            .expect("pairing result timed out"),
+            Err(AgentError::ReceiveDestinationUnavailable)
+        ));
+        pairing.await.unwrap();
+        peer.await.unwrap();
+        assert_eq!(resolver.calls(), 1);
+        assert!(runtime.peers.lock().await.is_empty());
+        assert!(storage.peers.lock().unwrap().is_empty());
+        assert!(!runtime.transfer_store.receive_root_ready());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_persistence_reuses_preflighted_receive_capability() {
+        let local_material = create_identity().unwrap().0;
+        let peer_material = create_identity().unwrap().0;
+        let local_pending = PendingTrust::new(
+            local_material.signer.public_identity(),
+            CapabilityGrants::NONE.with(TrustedCapability::FileTransfer),
+            TransportCertificate::from_der(local_material.certificate_der.clone()).unwrap(),
+        );
+        let peer_pending = PendingTrust::new(
+            peer_material.signer.public_identity(),
+            CapabilityGrants::NONE,
+            TransportCertificate::from_der(peer_material.certificate_der.clone()).unwrap(),
+        );
+        let transaction = PairingTxn::new(
+            PAIRING_PROTOCOL_VERSION,
+            &[8; EXPORTER_BYTES],
+            local_pending,
+            PairingNonce::from_bytes([41; 32]),
+            peer_pending,
+            PairingNonce::from_bytes([42; 32]),
+        )
+        .unwrap();
+        let root = private_receive_test_root("pairing-reused-receive");
+        let resolver = TestReceiveRootResolver::available(root.clone());
+        let (runtime, storage) = receive_runtime(
+            Vec::new(),
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+        runtime
+            .preflight_pairing_receive_root(&transaction, PairingRole::Initiator)
+            .unwrap();
+        let mut record = placement_peer(27, "Committed Files peer");
+        record.grants = CapabilityGrants::NONE.with(TrustedCapability::FileTransfer);
+        runtime.persist_peer(record).await.unwrap();
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(runtime.transfer_store.receive_root_ready());
+        assert_eq!(storage.peers.lock().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_files_peer_reconnect_fails_closed_without_blocking_input_only_peer() {
+        let mut files_peer = placement_peer(24, "Persisted Files peer");
+        files_peer.grants = CapabilityGrants::NONE.with(TrustedCapability::FileTransfer);
+        let input_peer = placement_peer(25, "Input-only peer");
+        let files_id = device_id_text(files_peer.device_id());
+        let input_id = device_id_text(input_peer.device_id());
+        let root = private_receive_test_root("reconnect-denied-receive");
+        let resolver = TestReceiveRootResolver::unavailable(root.clone());
+        let (runtime, _) = receive_runtime(
+            vec![files_peer, input_peer],
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+
+        assert!(matches!(
+            runtime.reconnect(&format!("reconnect:{files_id}")).await,
+            Err(AgentError::ReceiveDestinationUnavailable)
+        ));
+        assert!(!runtime.busy.load(Ordering::Acquire));
+        assert_eq!(resolver.calls(), 1);
+
+        // This reaches the input-only peer's normal endpoint validation; the
+        // unavailable receive destination is neither retried nor consulted.
+        assert!(matches!(
+            runtime.reconnect(&format!("reconnect:{input_id}")).await,
+            Err(AgentError::InvalidEndpoint)
+        ));
+        assert!(!runtime.busy.load(Ordering::Acquire));
+        assert_eq!(resolver.calls(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn concurrent_receive_preflight_resolves_one_global_capability() {
+        let root = private_receive_test_root("concurrent-receive");
+        let resolver = TestReceiveRootResolver::available(root.clone());
+        let (runtime, _) = receive_runtime(
+            Vec::new(),
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+        let barrier = Arc::new(Barrier::new(8));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let runtime = Arc::clone(&runtime);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    runtime.ensure_receive_root().unwrap();
+                });
+            }
+        });
+
+        assert_eq!(resolver.calls(), 1);
+        assert!(runtime.transfer_store.receive_root_ready());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_file_grant_uses_retained_root_and_leaves_legacy_hidden_state_untouched() {
+        let mut peer = placement_peer(23, "Persisted files peer");
+        peer.grants = CapabilityGrants::NONE.with(TrustedCapability::FileTransfer);
+        let peer_device = protocol_device_id(peer.device_id());
+        let original = private_receive_test_root("retained-visible-receive");
+        let legacy_parent = private_receive_test_root("legacy-hidden-state");
+        let legacy = legacy_parent.join("Received Files");
+        fs::create_dir(&legacy).unwrap();
+        let legacy_marker = legacy.join("legacy.marker");
+        fs::write(&legacy_marker, b"old state").unwrap();
+        let resolver = TestReceiveRootResolver::available(original.clone());
+        let (runtime, _) = receive_runtime(
+            vec![peer],
+            Arc::clone(&resolver) as Arc<dyn ReceiveRootResolver>,
+        );
+        runtime.ensure_receive_root().unwrap();
+
+        let retained = original.with_extension("retained");
+        fs::rename(&original, &retained).unwrap();
+        fs::create_dir(&original).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(original.join("replacement.marker"), b"replacement").unwrap();
+
+        let payload = b"retained visible destination";
+        let transfer = TransferId::new();
+        let manifest = TransferManifest::new(vec![ManifestEntry {
+            path: RelativePath::parse("received.bin").unwrap(),
+            kind: EntryKind::File,
+            size: payload.len() as u64,
+            hash: Some(ContentHash::digest(payload)),
+        }])
+        .unwrap();
+        let mut staging = native_transfer_staging(&runtime.transfer_store, peer_device, true)
+            .expect("persisted Files grant has a retained root");
+        staging.begin(transfer, &manifest).await.unwrap();
+        staging
+            .write(TransferChunk {
+                transfer,
+                entry_index: 0,
+                offset: 0,
+                bytes: Bytes::copy_from_slice(payload),
+            })
+            .await
+            .unwrap();
+        staging.finalize(transfer).await.unwrap();
+
+        assert_eq!(resolver.calls(), 1);
+        assert_eq!(fs::read(retained.join("received.bin")).unwrap(), payload);
+        assert!(!original.join("received.bin").exists());
+        assert_eq!(
+            fs::read(original.join("replacement.marker")).unwrap(),
+            b"replacement"
+        );
+        assert_eq!(fs::read(&legacy_marker).unwrap(), b"old state");
+        assert!(!legacy.join(".nodavo-staging").exists());
+        fs::remove_dir_all(original).unwrap();
+        fs::remove_dir_all(retained).unwrap();
+        fs::remove_dir_all(legacy_parent).unwrap();
+    }
+
+    #[tokio::test]
     async fn placement_mutation_cannot_miss_or_cross_the_peer_bound_session_cut() {
         let peer_a = placement_peer(10, "Peer A");
         let peer_b = placement_peer(11, "Peer B");
@@ -2551,8 +3367,10 @@ mod tests {
         }])
         .unwrap();
         {
-            let mut staging =
-                FileSystemStagingArea::new_scoped(&root, *protocol_peer.as_bytes()).unwrap();
+            let mut staging = runtime
+                .transfer_store
+                .receive_staging(protocol_peer, true)
+                .unwrap();
             staging.begin(transfer, &manifest).await.unwrap();
             staging
                 .write(TransferChunk {
@@ -2568,13 +3386,27 @@ mod tests {
             .transfer_store
             .remember_inbound(protocol_peer, transfer)
             .unwrap();
+        let retained = root.with_extension("retained");
+        fs::rename(&root, &retained).unwrap();
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let replacement_marker = root.join("replacement.marker");
+        fs::write(&replacement_marker, b"do not reopen").unwrap();
 
         runtime
             .set_capability(&peer_id, TrustedCapability::FileTransfer, false)
             .await
             .unwrap();
-        let staging = FileSystemStagingArea::new(&root).unwrap();
+        let staging =
+            FileSystemStagingArea::new_scoped(&retained, *protocol_peer.as_bytes()).unwrap();
         assert!(!staging.has_persisted(transfer).unwrap());
+        assert_eq!(fs::read(&replacement_marker).unwrap(), b"do not reopen");
+        assert!(!root.join(".nodavo-staging").exists());
         assert!(
             !storage.peers.lock().unwrap()[0]
                 .grants
@@ -2582,5 +3414,6 @@ mod tests {
         );
         assert!(!runtime.transfer_store.is_poisoned());
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(retained).unwrap();
     }
 }

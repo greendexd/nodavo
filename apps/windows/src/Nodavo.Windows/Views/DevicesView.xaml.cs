@@ -9,6 +9,7 @@ namespace Nodavo.Windows.Views;
 
 public sealed partial class DevicesView : UserControl
 {
+    private const string ReceiveDestinationUnavailableCode = "receive_destination_unavailable";
     private static readonly TimeSpan MutationCompletionWindow = TimeSpan.FromSeconds(2);
     private readonly AgentClient _client;
     private readonly ResourceLoader _resources;
@@ -182,12 +183,16 @@ public sealed partial class DevicesView : UserControl
             }
             ShowTrustedStatus("TrustedPermissionSaved", InfoBarSeverity.Success);
         }
-        catch (AgentProtocolException)
+        catch (AgentProtocolException exception)
         {
             if (mutation == _trustedMutationGeneration)
             {
                 SetToggleWithoutMutation(toggle, previous);
-                ShowTrustedStatus("TrustedPermissionRejected", InfoBarSeverity.Error);
+                ShowTrustedStatus(
+                    exception.Code == ReceiveDestinationUnavailableCode
+                        ? "TrustedReceiveDestinationUnavailable"
+                        : "TrustedPermissionRejected",
+                    InfoBarSeverity.Error);
             }
         }
         catch (Exception exception) when (
@@ -353,17 +358,16 @@ public sealed partial class DevicesView : UserControl
                 }
             }
         }
-        catch (AgentProtocolException)
+        catch (AgentProtocolException exception)
         {
             if (attempt == _attemptVersion)
             {
-                ShowFailure("PairingRejected");
+                ShowFailure(PairingProtocolFailureKey(exception, "PairingRejected"));
             }
         }
         catch (Exception exception) when (
             exception is IOException or JsonException or
-            InvalidDataException or InvalidOperationException or UnauthorizedAccessException or
-            AgentProtocolException)
+            InvalidDataException or InvalidOperationException or UnauthorizedAccessException)
         {
             if (attempt == _attemptVersion)
             {
@@ -438,10 +442,16 @@ public sealed partial class DevicesView : UserControl
                 }
             }
         }
+        catch (AgentProtocolException exception)
+        {
+            if (attempt == _attemptVersion)
+            {
+                ShowFailure(PairingProtocolFailureKey(exception, "PairingFailed"));
+            }
+        }
         catch (Exception exception) when (
             exception is IOException or JsonException or
-            InvalidDataException or InvalidOperationException or UnauthorizedAccessException or
-            AgentProtocolException)
+            InvalidDataException or InvalidOperationException or UnauthorizedAccessException)
         {
             if (attempt == _attemptVersion)
             {
@@ -567,6 +577,13 @@ public sealed partial class DevicesView : UserControl
         DeclineButton.IsEnabled = true;
         SetPermissionControlsEnabled(true);
     }
+
+    private static string PairingProtocolFailureKey(
+        AgentProtocolException exception,
+        string fallback) =>
+        exception.Code == ReceiveDestinationUnavailableCode
+            ? "PairingReceiveDestinationUnavailable"
+            : fallback;
 
     private string[] SelectedCapabilities()
     {

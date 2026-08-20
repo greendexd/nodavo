@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use nodavo_local_ipc::{TransferDirection, TransferFailureCode, TransferPhase};
 use nodavo_protocol::{DeviceId, TransferId as WireTransferId};
 use nodavo_transfer::{
-    EntryKind, FileSystemStagingArea, OutboundResumePoint, OutboundTransferSource, TransferError,
-    TransferId,
+    EntryKind, FileSystemStagingArea, OutboundResumePoint, OutboundTransferSource, ReceiveRoot,
+    ReceiveStagingArea, TransferError, TransferId,
 };
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
@@ -85,7 +85,7 @@ struct StoreInner {
     retained_wire: HashMap<RetainedWireKey, RetainedWireState>,
     inbound: HashMap<DeviceId, HashSet<TransferId>>,
     discard_required: HashMap<DeviceId, HashSet<TransferId>>,
-    staging_roots: HashMap<DeviceId, PathBuf>,
+    receive_root: Option<Arc<ReceiveRoot>>,
     active_workers: usize,
     active_worker_peers: HashSet<DeviceId>,
     worker_admission_closed: bool,
@@ -352,24 +352,59 @@ impl TransferStore {
         transition_retained_locked(&mut inner, retained_key(peer, direction, transfer), next)
     }
 
-    pub(crate) fn register_staging_root(
-        &self,
-        peer: DeviceId,
-        root: PathBuf,
-    ) -> Result<(), TransferError> {
+    pub(crate) fn install_receive_root(&self, root: ReceiveRoot) -> Result<(), TransferError> {
         let mut inner = self.inner.lock().map_err(|_| TransferError::Platform)?;
-        if inner
-            .staging_roots
-            .get(&peer)
-            .is_some_and(|known| known != &root)
-        {
-            self.poisoned.store(true, Ordering::Release);
-            return Err(TransferError::Platform);
+        if inner.receive_root.is_none() {
+            inner.receive_root = Some(Arc::new(root));
         }
-        inner.staging_roots.insert(peer, root);
         inner.directory_entry_crash_durable =
             FileSystemStagingArea::directory_entry_crash_durability_supported();
         Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn receive_root_ready(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("transfer store mutex poisoned")
+            .receive_root
+            .is_some()
+    }
+
+    pub(crate) fn receive_staging(
+        &self,
+        peer: DeviceId,
+        inbound_files_granted: bool,
+    ) -> Result<ReceiveStagingArea, TransferError> {
+        if !inbound_files_granted {
+            return Ok(ReceiveStagingArea::unavailable());
+        }
+        let root = self
+            .inner
+            .lock()
+            .map_err(|_| TransferError::Platform)?
+            .receive_root
+            .clone()
+            .ok_or(TransferError::Platform)?;
+        ReceiveStagingArea::new_scoped_in(root.as_ref(), *peer.as_bytes())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_staging_root(
+        &self,
+        _peer: DeviceId,
+        root: PathBuf,
+    ) -> Result<(), TransferError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| TransferError::Platform)?;
+        }
+        let handle = std::fs::File::open(root).map_err(|_| TransferError::Platform)?;
+        let root = ReceiveRoot::from_retained_directory_handle(handle)?;
+        self.install_receive_root(root)
     }
 
     fn resume_configuration(&self, peer: DeviceId) -> (Vec<TransferId>, bool) {
@@ -500,7 +535,7 @@ impl TransferStore {
                     .finish_system_abort(peer, TransferDirection::Inbound);
                 return Ok(TransferCleanupState::Complete);
             }
-            let Some(root) = inner.staging_roots.get(&peer).cloned() else {
+            let Some(root) = inner.receive_root.clone() else {
                 self.poisoned.store(true, Ordering::Release);
                 drop(inner);
                 self.registry
@@ -523,7 +558,8 @@ impl TransferStore {
         };
 
         let result = (|| {
-            let mut staging = FileSystemStagingArea::new_scoped(root, *peer.as_bytes())?;
+            let mut staging =
+                FileSystemStagingArea::new_scoped_in(root.as_ref(), *peer.as_bytes())?;
             for transfer in &transfers {
                 staging.discard_unopened_persisted(*transfer)?;
             }
@@ -721,7 +757,7 @@ pub(crate) struct TransferWorker {
 impl TransferWorker {
     pub(crate) fn start(
         peer: DeviceId,
-        mut runtime: PeerTransferRuntime<FileSystemStagingArea>,
+        mut runtime: PeerTransferRuntime<ReceiveStagingArea>,
         store: TransferStore,
     ) -> Result<Self, TransferWorkerAdmissionClosed> {
         if runtime
@@ -909,7 +945,7 @@ impl TransferWorker {
 
 struct WorkerState {
     peer: DeviceId,
-    runtime: PeerTransferRuntime<FileSystemStagingArea>,
+    runtime: PeerTransferRuntime<ReceiveStagingArea>,
     store: TransferStore,
     commands: mpsc::Receiver<WorkerCommand>,
     events: mpsc::Sender<TransferWorkerEvent>,
@@ -1882,7 +1918,7 @@ mod tests {
                     local_allows_peer_transfer: true,
                     peer_capabilities,
                 },
-                staging,
+                staging.into(),
             ),
             store,
         )

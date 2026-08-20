@@ -82,6 +82,18 @@ pub enum MacPlatformError {
     Unavailable,
 }
 
+/// Fail-closed errors from resolving or preparing the fixed user-visible
+/// receive destination. Error values deliberately carry no filesystem path.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum MacReceiveDestinationError {
+    #[error("macOS denied access to the Downloads directory")]
+    PermissionDenied,
+    #[error("the macOS Downloads directory is unavailable")]
+    Unavailable,
+    #[error("the fixed macOS receive destination is unsafe")]
+    UnsafeDestination,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DisplayGeometry {
     pub id: nodavo_input::DisplayId,
@@ -115,11 +127,11 @@ pub use macos::{
     ForceReleaseAcknowledgement, MAX_XPC_GLOBAL_OUTSTANDING, MAX_XPC_MESSAGE_BYTES,
     MAX_XPC_PEER_OUTSTANDING, MAX_XPC_PEERS, MacDisplayMonitor, MacDisplaySnapshot,
     MacInputCapture, MacInputCaptureEvent, MacInputInjector, MacInputLifecycleEvent,
-    MacIpcAuthError, MacIpcPeerGuard, MacLocalIpcAuthMode, MacXpcError, MacXpcEvent,
-    MacXpcListener, MacXpcPeerIdentity, MacXpcReply, MacXpcRequest, NODAVO_AGENT_MACH_SERVICE,
-    XPC_REPLY_DEADLINE_MILLISECONDS, accessibility_trusted, active_displays, local_ipc_auth_mode,
-    mac_xpc_peer_requirement, probe_readiness, refresh_display_snapshot, request_accessibility,
-    run_input_capture,
+    MacIpcAuthError, MacIpcPeerGuard, MacLocalIpcAuthMode, MacReceiveDestination, MacXpcError,
+    MacXpcEvent, MacXpcListener, MacXpcPeerIdentity, MacXpcReply, MacXpcRequest,
+    NODAVO_AGENT_MACH_SERVICE, XPC_REPLY_DEADLINE_MILLISECONDS, accessibility_trusted,
+    active_displays, local_ipc_auth_mode, mac_xpc_peer_requirement, prepare_receive_destination,
+    probe_readiness, refresh_display_snapshot, request_accessibility, run_input_capture,
 };
 
 #[cfg(not(target_os = "macos"))]

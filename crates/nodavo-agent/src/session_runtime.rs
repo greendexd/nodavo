@@ -24,7 +24,9 @@ use nodavo_session::{
     DisconnectReason, Effect, Event, FocusState as CoreFocusState, LeaseId, LinkState,
     MonotonicMillis, SessionCore,
 };
-use nodavo_transfer::{FileSystemStagingArea, TransferError, TransferId};
+#[cfg(test)]
+use nodavo_transfer::FileSystemStagingArea;
+use nodavo_transfer::{ReceiveStagingArea, TransferError, TransferId};
 use nodavo_transport::{
     ChannelDirection, ChannelId, ChannelKind, CloseReason, DatagramAvailability, PeerConnection,
     TransportCommand, TransportError, TransportEvent,
@@ -193,7 +195,7 @@ pub(crate) struct NativeSessionEvents {
     pub(crate) input: NativeInputReceiver,
     pub(crate) safety: PlatformSafetyReceiver,
     pub(crate) clipboard: Box<dyn ClipboardPort>,
-    pub(crate) transfer: FileSystemStagingArea,
+    pub(crate) transfer: ReceiveStagingArea,
     pub(crate) transfer_store: TransferStore,
     pub(crate) session_safety: Arc<SessionSafetyState>,
 }
@@ -472,7 +474,7 @@ fn start_transfer_worker(
     config: &SessionConfig,
     session_id: SessionId,
     peer_grant: PeerGrantState,
-    staging: FileSystemStagingArea,
+    staging: ReceiveStagingArea,
     transfer_store: TransferStore,
 ) -> Result<TransferWorker, SessionRuntimeError> {
     TransferWorker::start(
@@ -487,8 +489,8 @@ fn new_transfer_runtime(
     config: &SessionConfig,
     session_id: SessionId,
     peer_grant: PeerGrantState,
-    staging: FileSystemStagingArea,
-) -> PeerTransferRuntime<FileSystemStagingArea> {
+    staging: ReceiveStagingArea,
+) -> PeerTransferRuntime<ReceiveStagingArea> {
     PeerTransferRuntime::new(
         PeerTransferConfig {
             local_device: config.local_device,
@@ -2728,14 +2730,16 @@ mod tests {
         }
     }
 
-    fn test_transfer_staging(owner: DeviceId) -> (FileSystemStagingArea, PathBuf) {
+    fn test_transfer_staging(owner: DeviceId) -> (ReceiveStagingArea, PathBuf) {
         let root = std::env::temp_dir().join(format!(
             "nodavo-session-transfer-test-{}",
             nodavo_transfer::TransferId::new().as_uuid()
         ));
         fs::create_dir(&root).unwrap();
         (
-            FileSystemStagingArea::new_scoped(&root, *owner.as_bytes()).unwrap(),
+            FileSystemStagingArea::new_scoped(&root, *owner.as_bytes())
+                .unwrap()
+                .into(),
             root,
         )
     }

@@ -73,6 +73,8 @@
   <data name="TrustedPermissionFailedMessage" xml:space="preserve"><value>The change was not acknowledged and the switch was restored.</value></data>
   <data name="TrustedPermissionRejectedTitle" xml:space="preserve"><value>Permission rejected</value></data>
   <data name="TrustedPermissionRejectedMessage" xml:space="preserve"><value>The agent returned an explicit error, so the previous authoritative switch state is retained.</value></data>
+  <data name="TrustedReceiveDestinationUnavailableTitle" xml:space="preserve"><value>Inbound folder unavailable</value></data>
+  <data name="TrustedReceiveDestinationUnavailableMessage" xml:space="preserve"><value>The files permission was not changed because Nodavo could not securely prepare Downloads/Nodavo. Other permissions and input-only use are unaffected.</value></data>
   <data name="TrustedPermissionReconcilingTitle" xml:space="preserve"><value>Permission outcome unknown</value></data>
   <data name="TrustedPermissionReconcilingMessage" xml:space="preserve"><value>The acknowledgement was lost or invalid. Controls are disabled while Nodavo waits for the bounded agent window and reloads authoritative trust.</value></data>
   <data name="TrustedPermissionReconciledAppliedTitle" xml:space="preserve"><value>Permission confirmed after reload</value></data>
@@ -141,6 +143,7 @@
   <data name="PairingFailedTitle" xml:space="preserve"><value>Pairing did not finish</value></data>
   <data name="PairingFailed" xml:space="preserve"><value>Check that both agents are running on the same local network, then try again.</value></data>
   <data name="PairingRejected" xml:space="preserve"><value>The agent rejected the request or another pairing session is already active.</value></data>
+  <data name="PairingReceiveDestinationUnavailable" xml:space="preserve"><value>Nodavo could not securely prepare Downloads/Nodavo, so pairing was not saved. Fix access to Downloads and try again.</value></data>
   <data name="PairingDeclined" xml:space="preserve"><value>The other computer declined or did not confirm the code.</value></data>
   <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Enter an IP address with port or a valid mDNS instance.</value></data>
   <data name="PairingTimedOut" xml:space="preserve"><value>The other computer did not respond before the protected pairing deadline.</value></data>
@@ -191,6 +194,7 @@
   <data name="LayoutOutcomeUnknownMessage" xml:space="preserve"><value>This exact peer remains locked. Refreshing must successfully load the authoritative trusted-peer list before another placement can be sent.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Transfers</value></data>
   <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Queue only files and folders you explicitly select on this PC.</value></data>
+  <data name="TransferReceiveDestination.Text" xml:space="preserve"><value>Inbound destination: Downloads/Nodavo. If Nodavo cannot securely prepare this protected folder, inbound file transfers stay unavailable. Received files are never opened automatically.</value></data>
   <data name="TransferAddFiles.Content" xml:space="preserve"><value>Add files…</value></data>
   <data name="TransferAddFolder.Content" xml:space="preserve"><value>Add folder…</value></data>
   <data name="TransferRemoveSelection.Content" xml:space="preserve"><value>Remove selected</value></data>

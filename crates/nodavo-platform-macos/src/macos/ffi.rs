@@ -32,6 +32,7 @@ use core_graphics::display::{
     CGDisplayRemoveReconfigurationCallback, CGGetActiveDisplayList,
 };
 
+use crate::MacReceiveDestinationError;
 use crate::clipboard::{
     MacClipboardError, NativeClipboardRepresentation, NativeClipboardSnapshot, PasteboardTarget,
 };
@@ -76,6 +77,11 @@ const SIGNING_IDENTIFIER_CAPACITY: usize = 128;
 const TEAM_IDENTIFIER_CAPACITY: usize = 32;
 #[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
 const APPLICATION_IDENTIFIER_CAPACITY: usize = 192;
+
+pub(crate) const DOWNLOADS_PATH_CAPACITY: usize = 4_096;
+const RECEIVE_DESTINATION_OK: i32 = 0;
+const RECEIVE_DESTINATION_UNAVAILABLE: i32 = 1;
+const RECEIVE_DESTINATION_PERMISSION_DENIED: i32 = 2;
 
 #[cfg(any(not(feature = "development-unverified-local-ipc"), test))]
 pub(crate) const CODE_EVIDENCE_EXTERNAL_REQUIREMENT: u8 = 1 << 0;
@@ -271,6 +277,14 @@ pub(crate) enum NativeUpdateValidationError {
 }
 
 unsafe extern "C" {
+    fn ndv_resolve_user_downloads_directory(
+        output_utf8: *mut c_char,
+        output_capacity: usize,
+    ) -> i32;
+    fn ndv_prepare_receive_destination(
+        downloads_path_utf8: *const c_char,
+        out_descriptor: *mut i32,
+    ) -> i32;
     fn ndv_update_open_directory(
         path_utf8: *const c_char,
         require_private: bool,
@@ -349,6 +363,55 @@ unsafe extern "C" {
     -> i32;
     #[cfg(test)]
     fn ndv_pasteboard_release_named(name: *const c_void);
+}
+
+pub(crate) fn resolve_user_downloads_directory()
+-> Result<std::path::PathBuf, MacReceiveDestinationError> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut output = [0 as c_char; DOWNLOADS_PATH_CAPACITY];
+    // SAFETY: `output` is writable for its advertised capacity and the native
+    // function always NUL-terminates successful output within that bound.
+    let status = unsafe { ndv_resolve_user_downloads_directory(output.as_mut_ptr(), output.len()) };
+    match status {
+        RECEIVE_DESTINATION_OK => {
+            // SAFETY: success guarantees a NUL terminator inside `output`.
+            let bytes = unsafe { CStr::from_ptr(output.as_ptr()) }.to_bytes();
+            if bytes.is_empty() || bytes.len() >= DOWNLOADS_PATH_CAPACITY {
+                return Err(MacReceiveDestinationError::UnsafeDestination);
+            }
+            Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+        }
+        RECEIVE_DESTINATION_PERMISSION_DENIED => Err(MacReceiveDestinationError::PermissionDenied),
+        RECEIVE_DESTINATION_UNAVAILABLE => Err(MacReceiveDestinationError::Unavailable),
+        _ => Err(MacReceiveDestinationError::UnsafeDestination),
+    }
+}
+
+pub(crate) fn prepare_receive_destination(
+    downloads: &std::path::Path,
+) -> Result<File, MacReceiveDestinationError> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let downloads = CString::new(downloads.as_os_str().as_bytes())
+        .map_err(|_| MacReceiveDestinationError::UnsafeDestination)?;
+    let mut descriptor = -1_i32;
+    // SAFETY: `downloads` is a live NUL-terminated byte string, the output is
+    // exclusively borrowed, and native code transfers one owned no-follow
+    // directory descriptor only on success.
+    let status =
+        unsafe { ndv_prepare_receive_destination(downloads.as_ptr(), &raw mut descriptor) };
+    match status {
+        RECEIVE_DESTINATION_OK if descriptor >= 0 => {
+            // SAFETY: native success transfers unique ownership of the open
+            // directory descriptor to this `File`.
+            Ok(unsafe { File::from_raw_fd(descriptor) })
+        }
+        RECEIVE_DESTINATION_PERMISSION_DENIED => Err(MacReceiveDestinationError::PermissionDenied),
+        RECEIVE_DESTINATION_UNAVAILABLE => Err(MacReceiveDestinationError::Unavailable),
+        _ => Err(MacReceiveDestinationError::UnsafeDestination),
+    }
 }
 
 pub(crate) fn update_open_directory(path: &CString, require_private: bool) -> Result<File, ()> {

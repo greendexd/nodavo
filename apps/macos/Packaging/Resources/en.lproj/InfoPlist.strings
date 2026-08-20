@@ -1,2 +1,3 @@
 "CFBundleDisplayName" = "Nodavo";
+"NSDownloadsFolderUsageDescription" = "Nodavo saves files received from explicitly paired devices in Downloads/Nodavo.";
 "NSLocalNetworkUsageDescription" = "Nodavo discovers and connects to explicitly paired devices on your local network.";

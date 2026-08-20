@@ -380,6 +380,29 @@ and must not be distributed as a release.
 NOTICE
 fi
 
+python3 - "$APP_ENTITLEMENTS" "$AGENT_ENTITLEMENTS" "$MODE" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    ui = plistlib.load(source)
+with open(sys.argv[2], "rb") as source:
+    agent = plistlib.load(source)
+if sys.argv[3] == "release":
+    expected_ui = {
+        "com.apple.application-identifier",
+        "com.apple.developer.team-identifier",
+    }
+    expected_agent = expected_ui | {"keychain-access-groups"}
+else:
+    expected_ui = set()
+    expected_agent = set()
+if set(ui) != expected_ui:
+    raise SystemExit("UI entitlement template contains a broad or missing entitlement")
+if set(agent) != expected_agent:
+    raise SystemExit("agent entitlement template contains a broad or missing entitlement")
+PY
+
 if grep -E '@[A-Z_]+@' \
     "${APP_PATH}/Contents/Info.plist" \
     "${HELPER_APP}/Contents/Info.plist" \
@@ -392,6 +415,21 @@ find "$APP_PATH" -name '*.plist' -print0 | while IFS= read -r -d '' plist; do
 done
 plutil -lint "${APP_PATH}/Contents/Resources/en.lproj/InfoPlist.strings" >/dev/null
 plutil -lint "${APP_PATH}/Contents/Resources/ru.lproj/InfoPlist.strings" >/dev/null
+if plutil -extract NSDownloadsFolderUsageDescription raw \
+    "${APP_PATH}/Contents/Info.plist" >/dev/null 2>&1; then
+    fail "Downloads usage description belongs only to the receiving agent"
+fi
+[[ $(plutil -extract NSDownloadsFolderUsageDescription raw \
+    "${HELPER_APP}/Contents/Info.plist") \
+    == "Nodavo saves files received from explicitly paired devices in Downloads/Nodavo." ]] \
+    || fail "agent bundle has no exact Downloads usage description"
+for localization in en ru; do
+    LOCALIZED_DOWNLOADS_USAGE=$(plutil -extract NSDownloadsFolderUsageDescription raw \
+        "${HELPER_APP}/Contents/Resources/${localization}.lproj/InfoPlist.strings" 2>/dev/null) \
+        || fail "agent bundle has no ${localization} Downloads usage description"
+    [[ -n "$LOCALIZED_DOWNLOADS_USAGE" ]] \
+        || fail "agent bundle has an empty ${localization} Downloads usage description"
+done
 python3 - \
     "${APP_PATH}/Contents/Info.plist" \
     "${APP_PATH}/Contents/Library/LaunchAgents/dev.nodavo.agent.plist" \
@@ -430,6 +468,39 @@ codesign --verify --deep --strict --all-architectures --verbose=2 "$APP_PATH"
 [[ -f "${APP_PATH}/Contents/Resources/${SWIFT_RESOURCE_BUNDLE}/Contents/Resources/en.lproj/Localizable.strings" ]]
 [[ -f "${APP_PATH}/Contents/Resources/${SWIFT_RESOURCE_BUNDLE}/Contents/Resources/ru.lproj/Localizable.strings" ]]
 
+UI_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/ui-actual-entitlements.plist"
+AGENT_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/agent-actual-entitlements.plist"
+codesign -d --entitlements :- "$APP_PATH" >"$UI_ACTUAL_ENTITLEMENTS" 2>/dev/null
+codesign -d --entitlements :- "$HELPER_APP" >"$AGENT_ACTUAL_ENTITLEMENTS" 2>/dev/null
+plutil -lint "$UI_ACTUAL_ENTITLEMENTS" >/dev/null
+plutil -lint "$AGENT_ACTUAL_ENTITLEMENTS" >/dev/null
+python3 - "$UI_ACTUAL_ENTITLEMENTS" "$AGENT_ACTUAL_ENTITLEMENTS" \
+    "$MODE" "$KEYCHAIN_ACCESS_GROUP" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    ui = plistlib.load(source)
+with open(sys.argv[2], "rb") as source:
+    agent = plistlib.load(source)
+mode, keychain_group = sys.argv[3:]
+if mode == "release":
+    expected_ui = {
+        "com.apple.application-identifier",
+        "com.apple.developer.team-identifier",
+    }
+    expected_agent = expected_ui | {"keychain-access-groups"}
+    if agent.get("keychain-access-groups") != [keychain_group]:
+        raise SystemExit("signed agent does not contain exactly its Keychain access group")
+else:
+    expected_ui = set()
+    expected_agent = set()
+if set(ui) != expected_ui:
+    raise SystemExit("signed UI contains a broad or missing entitlement")
+if set(agent) != expected_agent:
+    raise SystemExit("signed agent contains a broad or missing entitlement")
+PY
+
 if [[ "$MODE" == "release" ]]; then
     UI_REQUIREMENT="anchor apple generic and identifier \"${APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"${TEAM_ID}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and entitlement[\"com.apple.application-identifier\"] = \"${TEAM_ID}.${APP_BUNDLE_ID}\" and entitlement[\"com.apple.developer.team-identifier\"] = \"${TEAM_ID}\" and entitlement[\"com.apple.security.get-task-allow\"] absent"
     AGENT_REQUIREMENT="anchor apple generic and identifier \"${AGENT_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"${TEAM_ID}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and entitlement[\"com.apple.application-identifier\"] = \"${TEAM_ID}.${AGENT_BUNDLE_ID}\" and entitlement[\"com.apple.developer.team-identifier\"] = \"${TEAM_ID}\" and entitlement[\"com.apple.security.get-task-allow\"] absent"
@@ -451,12 +522,6 @@ if [[ "$MODE" == "release" ]]; then
     grep -E -q '^CodeDirectory .*flags=.*\(runtime\)' <<<"$AGENT_SIGNING_DETAILS" \
         || fail "signed agent does not enable the hardened runtime"
 
-    UI_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/ui-actual-entitlements.plist"
-    AGENT_ACTUAL_ENTITLEMENTS="${BUILD_ROOT}/agent-actual-entitlements.plist"
-    codesign -d --entitlements :- "$APP_PATH" >"$UI_ACTUAL_ENTITLEMENTS" 2>/dev/null
-    codesign -d --entitlements :- "$HELPER_APP" >"$AGENT_ACTUAL_ENTITLEMENTS" 2>/dev/null
-    plutil -lint "$UI_ACTUAL_ENTITLEMENTS" >/dev/null
-    plutil -lint "$AGENT_ACTUAL_ENTITLEMENTS" >/dev/null
     [[ $(/usr/libexec/PlistBuddy -c "Print :com.apple.application-identifier" \
         "$UI_ACTUAL_ENTITLEMENTS") == "${TEAM_ID}.${APP_BUNDLE_ID}" ]] \
         || fail "signed UI application identifier is not secured to the expected Team ID"
@@ -481,16 +546,6 @@ if [[ "$MODE" == "release" ]]; then
         "$AGENT_ACTUAL_ENTITLEMENTS" >/dev/null 2>&1; then
         fail "signed agent contains the forbidden get-task-allow entitlement"
     fi
-    python3 - "$AGENT_ACTUAL_ENTITLEMENTS" "$KEYCHAIN_ACCESS_GROUP" <<'PY'
-import plistlib
-import sys
-
-with open(sys.argv[1], "rb") as source:
-    entitlements = plistlib.load(source)
-if entitlements.get("keychain-access-groups") != [sys.argv[2]]:
-    raise SystemExit("signed agent does not contain exactly its Keychain access group")
-PY
-
     APP_ARCHIVE="${BUILD_ROOT}/Nodavo-app.zip"
     ditto -c -k --keepParent "$APP_PATH" "$APP_ARCHIVE"
     notarize_archive "$APP_ARCHIVE" "app"

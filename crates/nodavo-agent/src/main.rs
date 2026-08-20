@@ -409,7 +409,7 @@ async fn dispatch_ui_command(command: UiCommand, runtime: Arc<AgentRuntime>) -> 
             Ok(PairingOutcome::Finished(paired)) => {
                 AgentEvent::PairingFinished { pairing_id, paired }
             }
-            Ok(PairingOutcome::Pending | PairingOutcome::Failed) => AgentEvent::Error {
+            Ok(PairingOutcome::Pending | PairingOutcome::Failed(_)) => AgentEvent::Error {
                 code: "pairing_failed".to_owned(),
                 message: "pairing did not complete".to_owned(),
             },
@@ -581,6 +581,7 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::PeerNotFound => "peer_not_found",
         AgentError::Storage => "storage_unavailable",
         AgentError::GrantEpochExhausted => "grant_epoch_exhausted",
+        AgentError::ReceiveDestinationUnavailable => "receive_destination_unavailable",
         AgentError::PlacementApplyFailed => "placement_apply_failed",
         AgentError::PairingFailed => "pairing_failed",
         AgentError::NotConnected => "not_connected",
@@ -928,6 +929,17 @@ mod local_ipc_authorization_tests {
         let mut frame = u32::try_from(payload.len()).unwrap().to_be_bytes().to_vec();
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    #[test]
+    fn receive_destination_pairing_failure_has_exact_content_free_ipc_error() {
+        let event = agent_error_event(&AgentError::ReceiveDestinationUnavailable);
+        let AgentEvent::Error { code, message } = event else {
+            panic!("receive destination failure must remain a public error")
+        };
+        assert_eq!(code, "receive_destination_unavailable");
+        assert_eq!(message, "the fixed receive destination is unavailable");
+        assert!(!message.contains('/') && !message.contains('\\'));
     }
 
     #[tokio::test]

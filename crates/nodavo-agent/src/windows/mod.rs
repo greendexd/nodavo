@@ -19,6 +19,8 @@ use self::storage::WindowsDpapiStorage;
 use crate::{FrameAuthorization, initialize_runtime, serve_connection_authorized};
 
 pub(crate) use self::platform::WindowsPlatformPort;
+#[cfg_attr(test, allow(unused_imports))]
+pub(crate) use self::platform::resolve_downloads_nodavo_directory;
 
 struct WindowsUiFrameAuthorization(AuthorizedWindowsUi);
 

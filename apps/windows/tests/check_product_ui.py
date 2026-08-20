@@ -66,6 +66,16 @@ error_decoder = (APP / "Services/AgentErrorEnvelopeDecoder.cs").read_text(
 )
 rust_runtime = (ROOT / "crates/nodavo-agent/src/runtime.rs").read_text(encoding="utf-8")
 agent_main = (ROOT / "crates/nodavo-agent/src/main.rs").read_text(encoding="utf-8")
+windows_agent_platform = (
+    ROOT / "crates/nodavo-agent/src/windows/platform.rs"
+).read_text(encoding="utf-8")
+windows_platform = (
+    ROOT / "crates/nodavo-platform-windows/src/windows/mod.rs"
+).read_text(encoding="utf-8")
+windows_ffi = (
+    ROOT / "crates/nodavo-platform-windows/src/windows/ffi.rs"
+).read_text(encoding="utf-8")
+windows_platform_production = windows_platform.rsplit("#[cfg(test)]", 1)[0]
 package_script = (ROOT / "scripts/package-windows.ps1").read_text(encoding="utf-8")
 project_file = ElementTree.parse(APP / "Nodavo.Windows.csproj").getroot()
 manifest_template_path = ROOT / "apps/windows/packaging/AppxManifest.xml.in"
@@ -187,6 +197,31 @@ placement_resources = {
     "LayoutOutcomeUnknownMessage",
 }
 assert placement_resources <= english, "missing peer-placement localization resources"
+
+receive_destination_resources = {
+    "PairingReceiveDestinationUnavailable",
+    "TrustedReceiveDestinationUnavailableTitle",
+    "TrustedReceiveDestinationUnavailableMessage",
+    "TransferReceiveDestination.Text",
+}
+assert receive_destination_resources <= english
+assert client.count('"receive_destination_unavailable"') == 1
+assert 'ReceiveDestinationUnavailableCode = "receive_destination_unavailable"' in devices
+assert "exception.Code == ReceiveDestinationUnavailableCode" in devices
+assert devices.count("PairingProtocolFailureKey(exception,") == 2
+assert "TrustedReceiveDestinationUnavailable" in devices
+assert "PairingReceiveDestinationUnavailable" in devices
+
+assert "TransferReceiveDestination.Text" in english
+assert "Downloads/Nodavo" in ElementTree.parse(
+    APP / "Strings/en-US/Resources.resw"
+).find(".//data[@name='TransferReceiveDestination.Text']/value").text
+assert "Downloads/Nodavo" in ElementTree.parse(
+    APP / "Strings/ru-RU/Resources.resw"
+).find(".//data[@name='TransferReceiveDestination.Text']/value").text
+assert "never opened automatically" in ElementTree.parse(
+    APP / "Strings/en-US/Resources.resw"
+).find(".//data[@name='TransferReceiveDestination.Text']/value").text
 
 mutation_seconds = float(
     re.search(
@@ -610,6 +645,56 @@ assert startup_tasks[0].attrib == {
 }
 assert "fullTrustProcess" not in manifest_source
 assert "ImmediateRegistration" not in manifest_source
+
+restricted = (
+    "http://schemas.microsoft.com/appx/manifest/"
+    "foundation/windows10/restrictedcapabilities"
+)
+capability_containers = manifest_template.findall(f"{{{foundation}}}Capabilities")
+assert len(capability_containers) == 1
+declared_capabilities = [
+    (node.tag, node.attrib)
+    for node in list(capability_containers[0])
+]
+assert declared_capabilities == [
+    (f"{{{foundation}}}Capability", {"Name": "privateNetworkClientServer"}),
+    (f"{{{restricted}}}Capability", {"Name": "runFullTrust"}),
+], "receive destination must not expand the package capability multiset"
+for forbidden_capability in ("broadFileSystemAccess", "downloadsFolder"):
+    assert forbidden_capability not in manifest_source
+assert "capability multiset must be exactly privateNetworkClientServer and runFullTrust" in package_script
+
+assert re.search(
+    r"pub fn resolve_downloads_nodavo_directory\(\)\s*"
+    r"-> Result<std::fs::File, WindowsPlatformError>",
+    windows_platform,
+), "Windows receive resolver must return only a retained owned handle"
+for required_receive_boundary in (
+    "SHGetKnownFolderPath",
+    "FOLDERID_Downloads",
+    "KF_FLAG_DEFAULT",
+    "CoTaskWideString(value)",
+    "create_private_receive_directory",
+    "open_retained_update_directory",
+    "open_retained_receive_directory",
+    "validate_private_receive_handle",
+    "FILE_ATTRIBUTE_REPARSE_POINT",
+    'const RECEIVED_FILES_DIRECTORY_NAME: &str = "Nodavo"',
+):
+    assert required_receive_boundary in windows_platform + windows_ffi, (
+        f"missing fixed Windows receive invariant: {required_receive_boundary}"
+    )
+assert "USERPROFILE" not in windows_platform_production + windows_ffi
+assert 'var_os("HOME")' not in windows_platform_production + windows_ffi
+assert "ReceiveRoot::from_retained_directory_handle(handle)" in windows_agent_platform
+assert 'format!("O:{sid}D:P(A;OICI;FA;;;{sid})")' in windows_ffi
+assert "create_private_update_directory(&lookup)" not in windows_platform
+assert "validate_private_update_handle(&leaf)" not in windows_platform
+assert "PathBuf" not in re.search(
+    r"pub\(crate\) fn resolve_downloads_nodavo_directory\(\).*?\n}",
+    windows_agent_platform,
+    re.DOTALL,
+).group(0), "agent bridge must not materialize or reopen the receive path"
 
 assert "Package.Current.InstalledLocation.Path" in lifecycle_platform
 assert 'AgentRelativePath = @"agent\\nodavo-agent.exe"' in lifecycle_platform

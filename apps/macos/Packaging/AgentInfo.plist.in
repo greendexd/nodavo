@@ -33,6 +33,8 @@
     </array>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Nodavo discovers and connects to explicitly paired devices on your local network.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Nodavo saves files received from explicitly paired devices in Downloads/Nodavo.</string>
     <key>NodavoKeychainAccessGroup</key>
     <string>@KEYCHAIN_ACCESS_GROUP@</string>
 </dict>

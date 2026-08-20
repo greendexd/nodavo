@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 13 -->
+<!-- doc-id: architecture; lang: en; revision: 14 -->
 
 # Architecture
 
@@ -107,6 +107,8 @@ Private keys are stored in macOS Keychain and Windows DPAPI/CNG-backed storage. 
 Clipboard synchronization is revisioned and content-addressed to prevent loops. Content is transferred only when its capability is enabled. Planned types are UTF-8 text, HTML, PNG/BMP, and file lists.
 
 Files are written to a private staging directory, bounded by quotas, validated against traversal and unsafe links, and hashed with BLAKE3. A bounded durable progress journal records only exact contiguous offsets; restart resume requires the same authenticated manifest and truncates any non-durable tail. Final publication refuses existing destinations. Received content is never auto-opened.
+
+Release builds publish into the fixed per-user `Downloads/Nodavo` destination. The platform adapter resolves Downloads through the OS known-folder API, walks or validates the namespace without following reparse points, creates the exact private leaf, and hands the agent only an already-open directory handle. The global transfer store retains that capability for sessions and offline cleanup; each authenticated peer still receives a separate private staging namespace below it, so staging and final publication stay on one filesystem. Initial pairing and a disabled-to-enabled Files grant preflight this root before persistent authority changes. An input-only session uses an inert receive backend and never resolves Downloads. Enabling Files during an active session persists the grant and then reconnects that exact peer so an already-created inert backend cannot be upgraded in place.
 
 Transfer execution and public presentation have separate owners. A short-held process registry admits at most 128 nonterminal rows and retains at most 32 terminal rows; it assigns a random local UUID that never appears on the peer protocol and never exposes the wire transfer UUID. The public snapshot contains only direction, phase, bounded byte counters, cancellability, and a fixed failure category. Outbound bytes advance after the reliable frame is accepted, inbound bytes after a durable staging write, and completion only after durable publication and the required authenticated acknowledgement. Targeted cancellation is linearized against finalization and reports `cancelled` only after local cleanup succeeds.
 

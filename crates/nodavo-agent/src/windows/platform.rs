@@ -9,7 +9,9 @@ use nodavo_input::InputEvent;
 use nodavo_platform_windows::{
     WindowsDisplayMonitor, WindowsInputCapture, WindowsInputCaptureEvent, WindowsInputInjector,
     WindowsInputLifecycleEvent, WindowsPlatformError, probe_environment,
+    resolve_downloads_nodavo_directory as resolve_native_downloads_nodavo_directory,
 };
+use nodavo_transfer::ReceiveRoot;
 
 use crate::native_bridge::{NativeInputSender, PlatformSafetyEvent, PlatformSafetySender};
 use crate::platform_port::{
@@ -21,6 +23,14 @@ use crate::topology_runtime::NativeDisplaySnapshot;
 
 const NATIVE_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 static WINDOWS_INJECTOR_POISONED: AtomicBool = AtomicBool::new(false);
+
+/// Converts the retained Windows known-folder handle directly into the generic
+/// receive-root capability without exposing or reopening a pathname.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn resolve_downloads_nodavo_directory() -> Result<ReceiveRoot, ()> {
+    let handle = resolve_native_downloads_nodavo_directory().map_err(|_| ())?;
+    ReceiveRoot::from_retained_directory_handle(handle).map_err(|_| ())
+}
 
 pub(crate) struct WindowsPlatformPort {
     // Capture drops first, so suppression is cleared before injector teardown.

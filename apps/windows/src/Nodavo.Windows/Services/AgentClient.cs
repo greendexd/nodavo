@@ -37,6 +37,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         "storage_unavailable",
         "grant_epoch_exhausted",
         "placement_apply_failed",
+        "receive_destination_unavailable",
         "pairing_failed",
         "not_connected",
         "focus_rejected",

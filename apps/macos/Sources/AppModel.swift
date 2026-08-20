@@ -1,5 +1,28 @@
 import SwiftUI
 
+enum ReceiveDestinationFailurePresentation {
+    static func matches(_ error: Error) -> Bool {
+        guard case let AgentClientError.agent(code, _) = error else { return false }
+        return code == "receive_destination_unavailable"
+    }
+
+    static var pairingLocalizationKey: String {
+        #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+        "pairing_receive_destination_unavailable_development"
+        #else
+        "pairing_receive_destination_unavailable"
+        #endif
+    }
+
+    static var grantLocalizationKey: String {
+        #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+        "trusted_devices_receive_destination_unavailable_development"
+        #else
+        "trusted_devices_receive_destination_unavailable"
+        #endif
+    }
+}
+
 struct UpdatePollingOwner {
     private(set) var generation: UInt64 = 0
     private(set) var isActive = false
@@ -92,6 +115,7 @@ final class AppModel: ObservableObject {
         case confirming
         case paired
         case declined
+        case receiveDestinationUnavailable
         case failed
     }
 
@@ -205,6 +229,8 @@ final class AppModel: ObservableObject {
         case .confirming: "pairing_confirming"
         case .paired: "pairing_succeeded"
         case .declined: "pairing_declined"
+        case .receiveDestinationUnavailable:
+            LocalizedStringKey(ReceiveDestinationFailurePresentation.pairingLocalizationKey)
         case .failed: "pairing_failed"
         }
     }
@@ -498,6 +524,9 @@ final class AppModel: ObservableObject {
                 if paired {
                     refreshTrustedPeers()
                 }
+            } catch let error where ReceiveDestinationFailurePresentation.matches(error) {
+                pairingPrompt = nil
+                pairingState = .receiveDestinationUnavailable
             } catch AgentClientError.agentUnavailable {
                 pairingPrompt = nil
                 pairingState = .failed
@@ -626,6 +655,8 @@ final class AppModel: ObservableObject {
                 } else {
                     trustedPeers[index].localGrants.remove(capability)
                 }
+            } catch let error where ReceiveDestinationFailurePresentation.matches(error) {
+                devicesErrorKey = ReceiveDestinationFailurePresentation.grantLocalizationKey
             } catch AgentClientError.agentUnavailable {
                 devicesErrorKey = "trusted_devices_agent_unavailable"
                 connectionState = .unavailable
@@ -1045,6 +1076,8 @@ final class AppModel: ObservableObject {
                     capabilities: capabilities
                 )
                 pairingState = .comparing
+            } catch let error where ReceiveDestinationFailurePresentation.matches(error) {
+                pairingState = .receiveDestinationUnavailable
             } catch AgentClientError.agentUnavailable {
                 pairingState = .failed
                 connectionState = .unavailable

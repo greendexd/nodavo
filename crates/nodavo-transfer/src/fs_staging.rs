@@ -46,6 +46,57 @@ pub struct FileSystemStagingArea {
     cleanup_failed: bool,
 }
 
+/// Retained authority for the fixed visible receive directory.
+///
+/// The original ambient path is deliberately forgotten after construction.
+/// Clones used by sessions and offline cleanup duplicate only this already
+/// validated directory handle, so later path substitution cannot redirect
+/// publication or cleanup.
+pub struct ReceiveRoot {
+    directory: Dir,
+}
+
+impl ReceiveRoot {
+    /// Opens one existing owner-only directory without following its final
+    /// component and retains the exact resulting directory handle.
+    ///
+    /// This ambient path constructor exists only for this crate's tests.
+    /// Production platform bridges must transfer an already retained handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Platform`] when the path cannot be opened
+    /// without following its leaf or is not an owner-private directory.
+    #[cfg(test)]
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, TransferError> {
+        let directory = open_ambient_directory_no_follow(path.as_ref())?;
+        Self::from_retained_directory_handle(directory.into_std_file())
+    }
+
+    /// Takes ownership of an already retained directory handle and
+    /// independently revalidates its object type, owner, and privacy policy.
+    ///
+    /// The platform caller is responsible for opening the handle without
+    /// following the fixed leaf. Windows callers must also deny delete sharing
+    /// before transferring ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Platform`] when the handle does not identify
+    /// the current user's owner-private directory.
+    pub fn from_retained_directory_handle(handle: std::fs::File) -> Result<Self, TransferError> {
+        let directory = Dir::from_std_file(handle);
+        require_private_receive_root(&directory)?;
+        Ok(Self { directory })
+    }
+
+    fn try_clone_directory(&self) -> Result<Dir, TransferError> {
+        self.directory
+            .try_clone()
+            .map_err(|_| TransferError::Platform)
+    }
+}
+
 struct ActiveTransfer {
     id: TransferId,
     _lease: TransferLease,
@@ -101,11 +152,35 @@ impl FileSystemStagingArea {
         Self::new_inner(destination_root.as_ref(), Some(authenticated_owner))
     }
 
+    /// Creates peer-private staging below a retained visible receive root.
+    /// Final publication and staging therefore stay on the same filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::Platform`] when retained authority cannot be
+    /// cloned or private peer staging cannot be created safely.
+    pub fn new_scoped_in(
+        receive_root: &ReceiveRoot,
+        authenticated_owner: [u8; 32],
+    ) -> Result<Self, TransferError> {
+        let destination = receive_root.try_clone_directory()?;
+        require_private_receive_root(&destination)?;
+        Self::new_in_directory(destination, Some(authenticated_owner))
+    }
+
     fn new_inner(
         destination_root: &Path,
         authenticated_owner: Option<[u8; 32]>,
     ) -> Result<Self, TransferError> {
         let destination = open_ambient_directory_no_follow(destination_root)?;
+        Self::new_in_directory(destination, authenticated_owner)
+    }
+
+    fn new_in_directory(
+        destination: Dir,
+        authenticated_owner: Option<[u8; 32]>,
+    ) -> Result<Self, TransferError> {
+        require_directory_handle(&destination)?;
         let (staging, created) = match destination.symlink_metadata(STAGING_DIRECTORY_NAME) {
             Ok(metadata) if metadata_is_reparse(&metadata) || !metadata.is_dir() => {
                 return Err(TransferError::Platform);
@@ -1213,6 +1288,48 @@ fn require_private_directory(directory: &Dir) -> Result<(), TransferError> {
     verify_private_directory(directory)
 }
 
+fn require_private_receive_root(directory: &Dir) -> Result<(), TransferError> {
+    require_private_directory(directory)?;
+    #[cfg(unix)]
+    verify_directory_owned_by_current_process(directory)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_directory_owned_by_current_process(directory: &Dir) -> Result<(), TransferError> {
+    use cap_std::fs::MetadataExt as _;
+
+    let directory_owner = directory
+        .dir_metadata()
+        .map_err(|_| TransferError::Platform)?
+        .uid();
+    for _ in 0..4 {
+        let name = format!(".nodavo-owner-probe-{}", TransferId::new().as_uuid());
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        configure_private_file_options(&mut options);
+        let file = match directory.open_with(Path::new(&name), &options) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err(TransferError::Platform),
+        };
+        let owner_matches = make_private_file(&file)
+            .and_then(|()| file.metadata().map_err(|_| TransferError::Platform))
+            .is_ok_and(|metadata| metadata.uid() == directory_owner);
+        drop(file);
+        directory
+            .remove_file(Path::new(&name))
+            .map_err(|_| TransferError::Platform)?;
+        sync_directory(directory)?;
+        return owner_matches.then_some(()).ok_or(TransferError::Platform);
+    }
+    Err(TransferError::Platform)
+}
+
 #[cfg(unix)]
 fn verify_private_directory(directory: &Dir) -> Result<(), TransferError> {
     use cap_std::fs::MetadataExt as _;
@@ -1821,6 +1938,108 @@ mod tests {
         ));
         fs::remove_file(alias).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receive_root_rejects_permissive_or_symlinked_authority() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let root = temporary_directory();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            ReceiveRoot::open_existing(&root),
+            Err(TransferError::Platform)
+        ));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let alias = root.with_extension("receive-alias");
+        symlink(&root, &alias).unwrap();
+        assert!(matches!(
+            ReceiveRoot::open_existing(&alias),
+            Err(TransferError::Platform)
+        ));
+        fs::remove_file(alias).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_receive_root_revalidates_privacy_before_each_session() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = temporary_directory();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = ReceiveRoot::open_existing(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            FileSystemStagingArea::new_scoped_in(&retained, [9; 32]),
+            Err(TransferError::Platform)
+        ));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_receive_root_ignores_ambient_substitution_and_never_overwrites() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let original = temporary_directory();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+        let retained = ReceiveRoot::open_existing(&original).unwrap();
+        let moved = original.with_extension("retained");
+        fs::rename(&original, &moved).unwrap();
+        fs::create_dir(&original).unwrap();
+        fs::set_permissions(&original, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(original.join("received.txt"), b"replacement root").unwrap();
+
+        let payload = b"retained capability";
+        let manifest = TransferManifest::new(vec![ManifestEntry {
+            path: RelativePath::parse("received.txt").unwrap(),
+            kind: EntryKind::File,
+            size: payload.len() as u64,
+            hash: Some(ContentHash::digest(payload)),
+        }])
+        .unwrap();
+        let transfer = TransferId::new();
+        let mut staging = FileSystemStagingArea::new_scoped_in(&retained, [7; 32]).unwrap();
+        staging.begin(transfer, &manifest).await.unwrap();
+        staging
+            .write(TransferChunk {
+                transfer,
+                entry_index: 0,
+                offset: 0,
+                bytes: Bytes::copy_from_slice(payload),
+            })
+            .await
+            .unwrap();
+        staging.finalize(transfer).await.unwrap();
+
+        assert_eq!(fs::read(moved.join("received.txt")).unwrap(), payload);
+        assert_eq!(
+            fs::read(original.join("received.txt")).unwrap(),
+            b"replacement root"
+        );
+        let second = TransferId::new();
+        let mut second_staging = FileSystemStagingArea::new_scoped_in(&retained, [7; 32]).unwrap();
+        second_staging.begin(second, &manifest).await.unwrap();
+        second_staging
+            .write(TransferChunk {
+                transfer: second,
+                entry_index: 0,
+                offset: 0,
+                bytes: Bytes::copy_from_slice(payload),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            second_staging.finalize(second).await,
+            Err(TransferError::DestinationExists)
+        );
+        assert_eq!(fs::read(moved.join("received.txt")).unwrap(), payload);
+        second_staging.abort(second);
+        fs::remove_dir_all(original).unwrap();
+        fs::remove_dir_all(moved).unwrap();
     }
 
     #[cfg(unix)]

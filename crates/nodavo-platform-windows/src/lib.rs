@@ -331,7 +331,8 @@ pub use self::windows::{
     WindowsInputInjector, active_displays, authorize_named_pipe_client,
     compiled_windows_ui_auth_mode, create_private_named_pipe, current_user_agent_pipe_name,
     probe_environment, probe_readiness, protect_current_user_secret, replace_file_atomic,
-    run_input_capture, unprotect_current_user_secret, validate_compiled_windows_ui_auth_policy,
+    resolve_downloads_nodavo_directory, run_input_capture, unprotect_current_user_secret,
+    validate_compiled_windows_ui_auth_policy,
 };
 
 /// Non-Windows probe stub used by workspace tooling and portable callers.

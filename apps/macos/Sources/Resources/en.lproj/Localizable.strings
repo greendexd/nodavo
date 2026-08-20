@@ -47,6 +47,8 @@
 "pairing_succeeded" = "Device paired and trust saved";
 "pairing_declined" = "Pairing was cancelled";
 "pairing_failed" = "Pairing failed or timed out";
+"pairing_receive_destination_unavailable" = "Pairing was not saved because Downloads/Nodavo is unavailable. Review the agent's Downloads access, then retry pairing.";
+"pairing_receive_destination_unavailable_development" = "Pairing was not saved because this build's isolated development receive folder is unavailable. Check the development agent state, then retry pairing.";
 "pairing_compare_instruction" = "Confirm only if this code is identical on the other device";
 "pairing_code" = "Pairing code";
 "pairing_codes_match" = "Codes match";
@@ -59,6 +61,8 @@
 "trusted_devices_agent_unavailable" = "The local agent is unavailable. No device changes were made.";
 "trusted_devices_load_failed" = "Trusted devices could not be loaded.";
 "trusted_devices_capability_failed" = "The permission was not changed. Refresh and try again.";
+"trusted_devices_receive_destination_unavailable" = "File receiving was not enabled because Downloads/Nodavo is unavailable. Review the agent's Downloads access, then retry.";
+"trusted_devices_receive_destination_unavailable_development" = "File receiving was not enabled because this build's isolated development receive folder is unavailable. Check the development agent state, then retry.";
 "trusted_devices_revoke_failed" = "Trust was not revoked. Refresh and try again.";
 "trusted_device_redacted_id" = "Redacted device identifier";
 "trusted_device_saving" = "Saving device change";
@@ -97,6 +101,9 @@
 "layout_placement_rejected" = "The agent rejected this position. The displayed authoritative value was not changed.";
 "layout_placement_outcome_unknown" = "The position may have been saved, but its result could not be reconciled. The command was not repeated; refresh before another change.";
 "layout_prealpha_notice" = "Per-device placement and edge routing have source and automated coverage. Physical switching with a signed Windows peer remains a release test.";
+"transfer_receive_destination" = "Received files";
+"transfer_receive_destination_help" = "Received files are saved in Downloads/Nodavo. Nodavo never opens them automatically.";
+"transfer_receive_destination_development_help" = "This development build keeps received files in an isolated app-state folder. Signed releases use Downloads/Nodavo. Nodavo never opens received files automatically.";
 "transfer_selection" = "Explicit local selection";
 "transfer_selection_help" = "Choose up to 32 local files or folders. Nodavo sends only the absolute paths returned by this picker to the local agent.";
 "transfer_choose" = "Choose files or folders…";
