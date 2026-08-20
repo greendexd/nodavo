@@ -5,6 +5,70 @@ import Testing
 @testable import NodavoMac
 
 #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+private actor RecordingPassiveSmokeClient: PassiveSmokeClient {
+    enum Failure: Error {
+        case requested
+    }
+
+    private var calls: [String] = []
+    private let failingCall: String?
+
+    init(failingCall: String? = nil) {
+        self.failingCall = failingCall
+    }
+
+    func status() throws -> AgentStatusResponse {
+        try record("status")
+        return Self.sampleStatus()
+    }
+
+    func focusStatus() throws -> AgentStatusResponse {
+        try record("focusStatus")
+        return Self.sampleStatus()
+    }
+
+    func listTrustedPeers() throws -> [TrustedPeerSummary] {
+        try record("listTrustedPeers")
+        return []
+    }
+
+    func listTransfers() throws -> TransferSnapshot {
+        try record("listTransfers")
+        return try TransferSnapshot(
+            instanceID: "123e4567-e89b-12d3-a456-426614174000",
+            revision: 1,
+            truncated: false,
+            transfers: []
+        )
+    }
+
+    func recordedCalls() -> [String] {
+        calls
+    }
+
+    private func record(_ call: String) throws {
+        calls.append(call)
+        if failingCall == call {
+            throw Failure.requested
+        }
+    }
+
+    private nonisolated static func sampleStatus() -> AgentStatusResponse {
+        AgentStatusResponse(
+            phase: "ready",
+            connectedPeer: nil,
+            inputOwner: "local",
+            focusState: "local",
+            readiness: AgentReadiness(
+                accessibility: .actionRequired,
+                input: .blockedByPermission,
+                localTopology: .available,
+                sessionTopology: .notConnected
+            )
+        )
+    }
+}
+
 @Test func localSocketDescriptorIsClosedAcrossExec() throws {
     let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
     #expect(descriptor >= 0)
@@ -16,7 +80,45 @@ import Testing
     #expect(flags >= 0)
     #expect(flags & FD_CLOEXEC == FD_CLOEXEC)
 }
+
+@Test func developmentPassiveSmokeOwnsExactlyFourReadOnlyCalls() async {
+    let client = RecordingPassiveSmokeClient()
+
+    #expect(await PassiveSmokeCommand.run(client: client))
+    #expect(
+        await client.recordedCalls()
+            == ["status", "focusStatus", "listTrustedPeers", "listTransfers"]
+    )
+}
+
+@Test func developmentPassiveSmokeStillMakesEachReadOnlyCallAfterFailure() async {
+    let client = RecordingPassiveSmokeClient(failingCall: "focusStatus")
+
+    #expect(!(await PassiveSmokeCommand.run(client: client)))
+    #expect(
+        await client.recordedCalls()
+            == ["status", "focusStatus", "listTrustedPeers", "listTransfers"]
+    )
+}
+
+@Test func developmentPassiveSmokeRequiresTheExactSoleArgument() {
+    #expect(PassiveSmokeCommand.isRequested(arguments: ["Nodavo", "--passive-smoke"]))
+    #expect(!PassiveSmokeCommand.isRequested(arguments: ["Nodavo"]))
+    #expect(!PassiveSmokeCommand.isRequested(
+        arguments: ["Nodavo", "--passive-smoke", "--extra"]
+    ))
+    #expect(PassiveSmokeCommand.successLine.utf8.count <= 64)
+    #expect(PassiveSmokeCommand.failureLine.utf8.count <= 64)
+}
 #endif
+
+@Test func passiveSmokeCompileContractIsDevelopmentOnly() {
+    #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+    #expect(PassiveSmokeBuildContract.isCompiledIn)
+    #else
+    #expect(!PassiveSmokeBuildContract.isCompiledIn)
+    #endif
+}
 
 @Test func releaseXpcConfigurationBindsExactAgentIdentity() throws {
     #if !NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC

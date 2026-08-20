@@ -113,6 +113,12 @@ jobs:
                   raise SystemExit(f"update archive contains a writable node: {candidate}")
           PY
           helper="$verify_root/Nodavo.app/Contents/Library/Helpers/NodavoAgent.app"
+          ui="$verify_root/Nodavo.app/Contents/MacOS/Nodavo"
+          for marker in \
+            'nodavo-ui: development-passive-read-only-smoke-ok' \
+            'nodavo-ui: development-passive-read-only-smoke-failed'; do
+            grep -F -x -q -- "$marker" < <(/usr/bin/strings -a "$ui")
+          done
           usage=$(plutil -extract NSDownloadsFolderUsageDescription raw \
             "$helper/Contents/Info.plist")
           [[ "$usage" == \

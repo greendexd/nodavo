@@ -310,6 +310,24 @@ verify_universal "${UNIVERSAL_DIRECTORY}/nodavo-agent"
 verify_system_dependencies "${UNIVERSAL_DIRECTORY}/Nodavo"
 verify_system_dependencies "${UNIVERSAL_DIRECTORY}/nodavo-agent"
 
+PASSIVE_SMOKE_ARGUMENT="--passive-smoke"
+PASSIVE_SMOKE_SUCCESS="nodavo-ui: development-passive-read-only-smoke-ok"
+PASSIVE_SMOKE_FAILURE="nodavo-ui: development-passive-read-only-smoke-failed"
+if [[ "$MODE" == "release" ]]; then
+    for marker in "$PASSIVE_SMOKE_SUCCESS" "$PASSIVE_SMOKE_FAILURE"; do
+        if grep -F -x -q -- "$marker" \
+            < <(/usr/bin/strings -a "${UNIVERSAL_DIRECTORY}/Nodavo"); then
+            fail "release UI contains a development passive-smoke marker"
+        fi
+    done
+else
+    for marker in "$PASSIVE_SMOKE_SUCCESS" "$PASSIVE_SMOKE_FAILURE"; do
+        grep -F -x -q -- "$marker" \
+            < <(/usr/bin/strings -a "${UNIVERSAL_DIRECTORY}/Nodavo") \
+            || fail "development UI is missing an exact passive-smoke marker"
+    done
+fi
+
 AGENT_SELF_CHECK=$(python3 - "${UNIVERSAL_DIRECTORY}/nodavo-agent" <<'PY'
 import subprocess
 import sys
@@ -460,6 +478,88 @@ sign_path "$HELPER_APP" "$AGENT_ENTITLEMENTS" "$AGENT_BUNDLE_ID"
 sign_path "$APP_PATH" "$APP_ENTITLEMENTS" "$APP_BUNDLE_ID"
 codesign --verify --strict --all-architectures --verbose=2 "$HELPER_APP"
 codesign --verify --deep --strict --all-architectures --verbose=2 "$APP_PATH"
+
+if [[ "$MODE" == "development" ]]; then
+    python3 - \
+        "${HELPER_APP}/Contents/MacOS/nodavo-agent" \
+        "${APP_PATH}/Contents/MacOS/Nodavo" \
+        "$PASSIVE_SMOKE_ARGUMENT" "$PASSIVE_SMOKE_SUCCESS" <<'PY'
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+helper, ui, argument, expected = sys.argv[1:]
+# Darwin's AF_UNIX address is short. Keep the random private root under /tmp
+# so a long repository checkout cannot make an otherwise valid smoke fail.
+smoke_root = pathlib.Path(tempfile.mkdtemp(prefix="nodavo-pkg-smoke-", dir="/tmp"))
+socket_path = smoke_root / "agent.sock"
+state_path = smoke_root / "state"
+environment = os.environ.copy()
+environment.update({
+    "NODAVO_ALLOW_INSECURE_DEVELOPMENT_STORAGE": "1",
+    "NODAVO_DEVICE_NAME": "Nodavo-Package-Smoke",
+    "NODAVO_DISABLE_MDNS": "1",
+    "NODAVO_IPC_PATH": str(socket_path),
+    "NODAVO_PAIRING_ADDR": "127.0.0.1:0",
+    "NODAVO_STATE_DIR": str(state_path),
+    "RUST_LOG": "off",
+})
+agent = None
+passed = False
+try:
+    agent = subprocess.Popen(
+        [helper],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if agent.poll() is not None:
+            raise RuntimeError
+        if socket_path.is_socket():
+            break
+        time.sleep(0.05)
+    else:
+        raise TimeoutError
+
+    result = subprocess.run(
+        [ui, argument],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=50,
+        check=False,
+    )
+    passed = (
+        result.returncode == 0
+        and result.stdout == expected + "\n"
+        and result.stderr == ""
+    )
+except (OSError, RuntimeError, subprocess.SubprocessError):
+    passed = False
+finally:
+    if agent is not None and agent.poll() is None:
+        agent.terminate()
+        try:
+            agent.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            agent.kill()
+            agent.wait(timeout=5)
+    shutil.rmtree(smoke_root, ignore_errors=True)
+
+if not passed:
+    raise SystemExit("packaged development passive smoke failed")
+print(expected)
+PY
+fi
 
 [[ $(plutil -extract CFBundleIdentifier raw "${APP_PATH}/Contents/Info.plist") == "$APP_BUNDLE_ID" ]]
 [[ $(plutil -extract CFBundleIdentifier raw "${HELPER_APP}/Contents/Info.plist") == "$AGENT_BUNDLE_ID" ]]

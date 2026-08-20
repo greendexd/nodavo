@@ -59,6 +59,210 @@ jobs:
             -Version 0.1.0 `
             -BuildNumber $buildNumber
 
+      - name: Install and inspect the exact development package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactRoots = @(Get-ChildItem -LiteralPath target/windows-packages `
+              -Directory | Where-Object Name -Like '*-development')
+          if ($artifactRoots.Count -ne 1) {
+              throw "Expected exactly one development artifact root."
+          }
+          $artifactRoot = $artifactRoots[0].FullName
+          $bundles = @(Get-ChildItem -LiteralPath $artifactRoot `
+              -Filter '*-DEVELOPMENT-NOT-FOR-DISTRIBUTION.msixbundle' -File)
+          $certificates = @(Get-ChildItem -LiteralPath $artifactRoot `
+              -Filter 'Nodavo-DEVELOPMENT-NOT-FOR-DISTRIBUTION.cer' -File)
+          $metadataFiles = @(Get-ChildItem -LiteralPath $artifactRoot `
+              -Filter 'package-metadata.json' -File)
+          if ($bundles.Count -ne 1 -or $certificates.Count -ne 1 -or
+              $metadataFiles.Count -ne 1) {
+              throw "Development package evidence is incomplete or ambiguous."
+          }
+          $metadata = Get-Content -LiteralPath $metadataFiles[0].FullName -Raw |
+              ConvertFrom-Json
+          if ($metadata.mode -cne 'development' -or
+              $metadata.packageIdentityName -cne 'dev.nodavo.Nodavo.Development' -or
+              $metadata.publisher -cne 'CN=Nodavo Development Only') {
+              throw "Development package metadata has an unexpected identity."
+          }
+          $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $certificates[0].FullName)
+          $primaryError = $null
+          try {
+              $thumbprint = $certificate.Thumbprint
+          }
+          finally {
+              $certificate.Dispose()
+          }
+          if ([string]::IsNullOrWhiteSpace($thumbprint) -or
+              $thumbprint -cne $metadata.signerThumbprint) {
+              throw "Development certificate does not match package metadata."
+          }
+          $trustedCertificatePath =
+              "Cert:\LocalMachine\TrustedPeople\$thumbprint"
+          if (Test-Path -LiteralPath $trustedCertificatePath) {
+              throw "Exact development certificate was already trusted before the smoke."
+          }
+          $preinstalled = @(Get-AppxPackage -Name $metadata.packageIdentityName)
+          if ($preinstalled.Count -ne 0) {
+              throw "Exact development package was already installed before the smoke."
+          }
+
+          try {
+              $imported = Import-Certificate `
+                  -FilePath $certificates[0].FullName `
+                  -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople'
+              if ($imported.Thumbprint -cne $thumbprint -or
+                  -not (Test-Path -LiteralPath $trustedCertificatePath)) {
+                  throw "Exact public development certificate was not trusted."
+              }
+              Add-AppxPackage -Path $bundles[0].FullName
+              $packages = @(Get-AppxPackage -Name $metadata.packageIdentityName)
+              if ($packages.Count -ne 1) {
+                  throw "Expected exactly one installed development package."
+              }
+              $package = $packages[0]
+              if ($package.Publisher -cne $metadata.publisher -or
+                  $package.PackageFamilyName -cne $metadata.packageFamilyName -or
+                  ([string]$package.Version) -cne $metadata.packageVersion -or
+                  ([string]$package.Architecture) -cne 'X64') {
+                  throw "Installed package identity/version/architecture mismatch."
+              }
+              $manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+              $namespaces = [Xml.XmlNamespaceManager]::new($manifest.NameTable)
+              $namespaces.AddNamespace(
+                  'foundation',
+                  'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+              $namespaces.AddNamespace(
+                  'desktop',
+                  'http://schemas.microsoft.com/appx/manifest/desktop/windows10')
+              $applications = @($manifest.SelectNodes(
+                  '/foundation:Package/foundation:Applications/foundation:Application',
+                  $namespaces))
+              if ($applications.Count -ne 1 -or
+                  $applications[0].GetAttribute('Id') -cne 'App' -or
+                  $applications[0].GetAttribute('Executable') -cne
+                      $metadata.executable) {
+                  throw "Installed application manifest entry mismatch."
+              }
+              $extensions = @($applications[0].SelectNodes(
+                  'foundation:Extensions/desktop:Extension', $namespaces))
+              if ($extensions.Count -ne 1 -or
+                  $extensions[0].GetAttribute('Category') -cne
+                      'windows.startupTask' -or
+                  $extensions[0].GetAttribute('Executable') -cne
+                      $metadata.agentExecutable -or
+                  $extensions[0].GetAttribute('EntryPoint') -cne
+                      'Windows.FullTrustApplication') {
+                  throw "Installed StartupTask declaration mismatch."
+              }
+              $startupTasks = @($extensions[0].SelectNodes(
+                  'desktop:StartupTask', $namespaces))
+              if ($startupTasks.Count -ne 1 -or
+                  $startupTasks[0].GetAttribute('TaskId') -cne
+                      $metadata.startupTaskId -or
+                  $startupTasks[0].GetAttribute('Enabled') -cne 'false') {
+                  throw "Installed StartupTask policy mismatch."
+              }
+              $agent = Join-Path $package.InstallLocation $metadata.agentExecutable
+              if (-not (Test-Path -LiteralPath $agent -PathType Leaf)) {
+                  throw "Installed package does not contain the exact agent executable."
+              }
+              $processInfo = [Diagnostics.ProcessStartInfo]::new()
+              $processInfo.FileName = $agent
+              $processInfo.ArgumentList.Add('--self-check')
+              $processInfo.UseShellExecute = $false
+              $processInfo.CreateNoWindow = $true
+              $processInfo.RedirectStandardOutput = $true
+              $processInfo.RedirectStandardError = $true
+              $selfCheckProcess = [Diagnostics.Process]::new()
+              $selfCheckProcess.StartInfo = $processInfo
+              $selfCheckStarted = $false
+              try {
+                  if (-not $selfCheckProcess.Start()) {
+                      throw "Installed agent self-check did not start."
+                  }
+                  $selfCheckStarted = $true
+                  if (-not $selfCheckProcess.WaitForExit(10000)) {
+                      throw "Installed agent self-check timed out."
+                  }
+                  $selfCheckOutput = $selfCheckProcess.StandardOutput.ReadToEnd().Trim()
+                  $selfCheckError = $selfCheckProcess.StandardError.ReadToEnd().Trim()
+                  if ($selfCheckProcess.ExitCode -ne 0 -or
+                      $selfCheckError.Length -ne 0 -or
+                      $selfCheckOutput -cne
+                          'nodavo-agent: core runtime available; windows-ui-auth=development') {
+                      throw "Installed agent self-check failed."
+                  }
+              }
+              finally {
+                  try {
+                      if ($selfCheckStarted -and -not $selfCheckProcess.HasExited) {
+                          $selfCheckProcess.Kill($true)
+                          if (-not $selfCheckProcess.WaitForExit(5000)) {
+                              throw "Installed agent self-check could not be stopped."
+                          }
+                      }
+                  }
+                  finally {
+                      $selfCheckProcess.Dispose()
+                  }
+              }
+          }
+          catch {
+              $primaryError = $_
+          }
+          finally {
+              $cleanupErrors = [Collections.Generic.List[string]]::new()
+              try {
+                  $installedPackages = @(
+                      Get-AppxPackage -Name $metadata.packageIdentityName
+                  )
+                  foreach ($installedPackage in $installedPackages) {
+                      Remove-AppxPackage `
+                          -Package $installedPackage.PackageFullName `
+                          -ErrorAction Stop
+                  }
+              }
+              catch {
+                  $cleanupErrors.Add('installed package removal failed')
+              }
+              try {
+                  if (@(Get-AppxPackage -Name $metadata.packageIdentityName).Count -ne 0) {
+                      $cleanupErrors.Add('exact development package remains installed')
+                  }
+              }
+              catch {
+                  $cleanupErrors.Add('installed package cleanup could not be verified')
+              }
+              try {
+                  if (Test-Path -LiteralPath $trustedCertificatePath) {
+                      Remove-Item -LiteralPath $trustedCertificatePath -Force -ErrorAction Stop
+                  }
+              }
+              catch {
+                  $cleanupErrors.Add('trusted certificate removal failed')
+              }
+              try {
+                  if (Test-Path -LiteralPath $trustedCertificatePath) {
+                      $cleanupErrors.Add('exact development certificate remains trusted')
+                  }
+              }
+              catch {
+                  $cleanupErrors.Add('trusted certificate cleanup could not be verified')
+              }
+              if ($cleanupErrors.Count -ne 0) {
+                  if ($null -ne $primaryError) {
+                      throw "Installed-package smoke failed: $($primaryError.Exception.Message) Cleanup failed: $($cleanupErrors -join '; ')."
+                  }
+                  throw "Installed-package smoke cleanup failed: $($cleanupErrors -join '; ')."
+              }
+          }
+          if ($null -ne $primaryError) {
+              throw $primaryError
+          }
+
       - name: Upload development-only package evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

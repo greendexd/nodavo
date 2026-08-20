@@ -2,7 +2,16 @@ import SwiftUI
 
 @main
 struct NodavoApp: App {
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
+
+    init() {
+        #if NODAVO_DEVELOPMENT_UNVERIFIED_LOCAL_IPC
+        if PassiveSmokeCommand.isRequested(arguments: CommandLine.arguments) {
+            PassiveSmokeCommand.runAndExit()
+        }
+        #endif
+        _model = StateObject(wrappedValue: AppModel())
+    }
 
     var body: some Scene {
         MenuBarExtra("Nodavo", systemImage: model.menuBarSymbol) {

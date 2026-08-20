@@ -77,6 +77,9 @@ windows_ffi = (
 ).read_text(encoding="utf-8")
 windows_platform_production = windows_platform.rsplit("#[cfg(test)]", 1)[0]
 package_script = (ROOT / "scripts/package-windows.ps1").read_text(encoding="utf-8")
+packaging_workflow = (
+    ROOT / ".github/workflows/windows-packaging.yml"
+).read_text(encoding="utf-8")
 project_file = ElementTree.parse(APP / "Nodavo.Windows.csproj").getroot()
 manifest_template_path = ROOT / "apps/windows/packaging/AppxManifest.xml.in"
 manifest_template = ElementTree.parse(manifest_template_path).getroot()
@@ -722,6 +725,57 @@ assert "FullTrustProcessLauncher" not in package_script
 assert "windows.startupTask" in package_script
 assert "ImmediateRegistration" in package_script
 assert "Enabled') -cne 'false'" in package_script
+
+package_build = packaging_workflow.index(
+    "- name: Build and verify the development MSIX bundle"
+)
+installed_smoke = packaging_workflow.index(
+    "- name: Install and inspect the exact development package"
+)
+package_upload = packaging_workflow.index(
+    "- name: Upload development-only package evidence"
+)
+certificate_import = packaging_workflow.index("Import-Certificate", installed_smoke)
+package_install = packaging_workflow.index("Add-AppxPackage", certificate_import)
+manifest_inspection = packaging_workflow.index(
+    "Get-AppxPackageManifest", package_install
+)
+agent_self_check = packaging_workflow.index("--self-check", manifest_inspection)
+package_cleanup = packaging_workflow.index("Remove-AppxPackage", agent_self_check)
+certificate_cleanup = packaging_workflow.index(
+    "Remove-Item -LiteralPath $trustedCertificatePath", package_cleanup
+)
+assert (
+    package_build
+    < installed_smoke
+    < certificate_import
+    < package_install
+    < manifest_inspection
+    < agent_self_check
+    < package_cleanup
+    < certificate_cleanup
+    < package_upload
+), "installed-package smoke must run after build and clean up before upload"
+assert "Cert:\\LocalMachine\\TrustedPeople" in packaging_workflow
+assert "-allowunsigned" not in packaging_workflow.lower()
+assert "windows-ui-auth=development" in packaging_workflow
+assert "$applications[0].GetAttribute('Id') -cne 'App'" in packaging_workflow
+assert "foundation:Extensions/desktop:Extension" in packaging_workflow
+assert "$extensions[0].GetAttribute('Category')" in packaging_workflow
+assert "'windows.startupTask'" in packaging_workflow
+assert "$extensions[0].GetAttribute('EntryPoint')" in packaging_workflow
+assert "'Windows.FullTrustApplication'" in packaging_workflow
+assert "$startupTasks[0].GetAttribute('TaskId')" in packaging_workflow
+assert "$startupTasks[0].GetAttribute('Enabled') -cne 'false'" in packaging_workflow
+assert "$selfCheckProcess.WaitForExit(10000)" in packaging_workflow
+assert "$selfCheckProcess.Kill($true)" in packaging_workflow
+assert "$selfCheckProcess.WaitForExit(5000)" in packaging_workflow
+assert "& $agent --self-check" not in packaging_workflow
+assert "$primaryError = $_" in packaging_workflow
+assert "$primaryError.Exception.Message" in packaging_workflow
+assert "throw $primaryError" in packaging_workflow
+assert "exact development package remains installed" in packaging_workflow
+assert "exact development certificate remains trusted" in packaging_workflow
 
 application_manifest = (APP / "app.manifest").read_text(encoding="utf-8")
 assert 'requestedExecutionLevel level="asInvoker" uiAccess="false"' in application_manifest
