@@ -68,6 +68,13 @@ struct AuthoritativeAgentStatus: Equatable {
     }
 }
 
+private enum FocusStatusApplication {
+    case ordinary
+    case mutation
+    case reconciliation
+    case emergency
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     enum ConnectionState {
@@ -100,6 +107,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var connectedPeer: String?
     @Published private(set) var inputOwner = "local"
     @Published private(set) var focusState = "local"
+    @Published private var focusControlState = FocusControlState.initial
     @Published private(set) var readiness = AgentReadiness.unavailable
     @Published private(set) var readinessRequestInProgress = false
     @Published private(set) var pairingState: PairingState = .idle
@@ -108,6 +116,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var trustedPeers = [TrustedPeerSummary]()
     @Published private(set) var deviceOperationPeerIDs = Set<String>()
     @Published private(set) var devicesErrorKey: String?
+    @Published private(set) var selectedLayoutPeerID: String?
+    @Published private(set) var layoutErrorKey: String?
+    @Published private(set) var placementOutcomeUnknownPeerIDs = Set<String>()
     @Published private(set) var transferIsBusy = false
     @Published private(set) var queuedTransferReference: QueuedTransferReference?
     @Published private(set) var transferErrorKey: String?
@@ -124,13 +135,21 @@ final class AppModel: ObservableObject {
     private let safetyClient = AgentClient()
     private let pairingClient = AgentClient()
     private let focusClient = AgentClient()
+    private let focusReconciliationClient = AgentClient()
     private let trustedDevicesClient = AgentClient()
+    private let placementClient = AgentClient()
+    private let placementReconciliationClient = AgentClient()
     private let transferAdmissionClient = AgentClient()
     private let transferPollingClient = AgentClient()
     private let transferMutationClient = AgentClient()
     private let updateClient = AgentClient()
     private let updatePollingClient = AgentClient()
     private var readinessRequestOwner = ReadinessRequestOwner()
+    private var focusRequestGeneration: UInt64 = 0
+    private var focusOperationTask: Task<Void, Never>?
+    private var focusOperationDeadlineTask: Task<Void, Never>?
+    private var trustedPeersRequestGeneration: UInt64 = 0
+    private var placementMutationOwner = PeerPlacementMutationOwner()
     private var updateRequestGeneration: UInt64 = 0
     private var updatePollingOwner = UpdatePollingOwner()
     private var updatePollingTask: Task<Void, Never>?
@@ -198,6 +217,30 @@ final class AppModel: ObservableObject {
         trustedPeersState == .loading
     }
 
+    var selectedLayoutPeer: TrustedPeerSummary? {
+        guard let selectedLayoutPeerID else { return nil }
+        return trustedPeers.first(where: { $0.peerID == selectedLayoutPeerID })
+    }
+
+    var placementMutationInProgress: Bool {
+        placementMutationOwner.isActive
+    }
+
+    var selectedLayoutPlacementOutcomeUnknown: Bool {
+        selectedLayoutPeerID.map(placementOutcomeUnknownPeerIDs.contains) == true
+    }
+
+    var layoutCanChangePlacement: Bool {
+        guard trustedPeersState == .ready,
+              let peer = selectedLayoutPeer,
+              peer.state == .active,
+              !placementMutationOwner.isActive,
+              deviceOperationPeerIDs.isEmpty,
+              !placementOutcomeUnknownPeerIDs.contains(peer.peerID)
+        else { return false }
+        return true
+    }
+
     var agentRegistrationStatusText: LocalizedStringKey {
         switch agentRegistrationStatus {
         case .notApplicable: "agent_registration_development"
@@ -217,11 +260,28 @@ final class AppModel: ObservableObject {
     }
 
     var focusStatusText: LocalizedStringKey {
-        switch focusState {
-        case "controlling_peer": "focus_controlling_peer"
-        case "controlled_by_peer": "focus_controlled_by_peer"
-        default: "focus_local"
+        switch focusControlState.authority {
+        case .local: "focus_local"
+        case .controllingPeer: "focus_controlling_peer"
+        case .controlledByPeer: "focus_controlled_by_peer"
+        case .unknown: "focus_unavailable"
         }
+    }
+
+    var focusCanRequestRemote: Bool {
+        FocusControlReducer.canAcquire(focusControlState)
+    }
+
+    var focusCanRelease: Bool {
+        FocusControlReducer.canRelease(focusControlState)
+    }
+
+    var focusOperationInProgress: Bool {
+        FocusControlReducer.isProgressVisible(focusControlState)
+    }
+
+    var focusOutcomeUnknown: Bool {
+        focusControlState.phase == .outcomeUnknown
     }
 
     var readinessCanRequestAccessibilityPermission: Bool {
@@ -318,79 +378,97 @@ final class AppModel: ObservableObject {
     }
 
     func refreshReadiness() {
+        guard let focusGeneration = beginFocusStatusRefresh() else { return }
         let generation = beginReadinessRequest()
         connectionState = .checking
         Task {
             do {
                 let response = try await readinessClient.status()
-                finishReadinessRequest(response, generation: generation)
+                finishReadinessRequest(
+                    response,
+                    generation: generation,
+                    focusGeneration: focusGeneration
+                )
             } catch {
-                failReadinessRequest(generation: generation)
+                failReadinessRequest(
+                    error,
+                    generation: generation,
+                    focusGeneration: focusGeneration
+                )
             }
         }
     }
 
     func requestAccessibilityPermission() {
         guard readinessCanRequestAccessibilityPermission else { return }
+        guard let focusGeneration = beginFocusStatusRefresh() else { return }
         let generation = beginReadinessRequest()
         Task {
             do {
                 // The agent returns a fresh status after requesting the system prompt.
                 // We apply that status verbatim; requesting the prompt is not a grant.
                 let response = try await readinessClient.requestAccessibilityPermission()
-                finishReadinessRequest(response, generation: generation)
+                finishReadinessRequest(
+                    response,
+                    generation: generation,
+                    focusGeneration: focusGeneration
+                )
             } catch {
-                failReadinessRequest(generation: generation)
+                failReadinessRequest(
+                    error,
+                    generation: generation,
+                    focusGeneration: focusGeneration
+                )
             }
         }
     }
 
     func emergencyStop() {
+        focusOperationTask?.cancel()
+        focusOperationTask = nil
+        focusOperationDeadlineTask?.cancel()
+        focusOperationDeadlineTask = nil
+        focusRequestGeneration &+= 1
+        let generation = focusRequestGeneration
+        focusControlState = FocusControlReducer.beginEmergency(
+            focusControlState,
+            generation: generation
+        )
         Task {
             do {
                 let response = try await safetyClient.emergencyStop()
-                applyStatus(response)
-            } catch AgentClientError.agentUnavailable {
-                connectionState = .unavailable
-                focusState = "local"
+                applyFocusStatus(response, generation: generation, application: .mutation)
             } catch {
-                connectionState = .failed
-                focusState = "local"
+                failFocusStatus(error, generation: generation, application: .emergency)
             }
         }
     }
 
     func requestRemoteFocus() {
-        Task {
-            do {
-                let response = try await focusClient.requestRemoteFocus()
-                connectedPeer = response.connectedPeer
-                inputOwner = response.inputOwner
-                focusState = response.focusState
-                connectionState = .connected
-            } catch AgentClientError.agentUnavailable {
-                connectionState = .unavailable
-                focusState = "local"
-            } catch {
-                connectionState = .failed
-            }
+        guard FocusControlReducer.canAcquire(focusControlState) else { return }
+        focusRequestGeneration &+= 1
+        let generation = focusRequestGeneration
+        focusControlState = FocusControlReducer.beginAcquire(
+            focusControlState,
+            generation: generation
+        )
+        startFocusOperationDeadline(generation)
+        focusOperationTask = Task { [weak self] in
+            await self?.runFocusAcquisition(generation: generation)
         }
     }
 
     func releaseFocus() {
-        Task {
-            do {
-                let response = try await focusClient.releaseFocus()
-                connectedPeer = response.connectedPeer
-                inputOwner = response.inputOwner
-                focusState = response.focusState
-                connectionState = response.connectedPeer == nil ? .ready : .connected
-            } catch AgentClientError.agentUnavailable {
-                connectionState = .unavailable
-                focusState = "local"
-            } catch {
-                connectionState = .failed
-            }
+        guard FocusControlReducer.canRelease(focusControlState) else { return }
+        focusRequestGeneration &+= 1
+        let generation = focusRequestGeneration
+        focusControlState = FocusControlReducer.beginRelease(
+            focusControlState,
+            generation: generation
+        )
+        startFocusOperationDeadline(generation)
+        focusOperationTask = Task { [weak self] in
+            await self?.runFocusRelease(generation: generation)
         }
     }
 
@@ -438,20 +516,81 @@ final class AppModel: ObservableObject {
     }
 
     func refreshTrustedPeers() {
-        guard trustedPeersState != .loading else { return }
+        guard trustedPeersState != .loading,
+              !placementMutationOwner.isActive,
+              deviceOperationPeerIDs.isEmpty
+        else { return }
+        trustedPeersRequestGeneration &+= 1
+        let generation = trustedPeersRequestGeneration
         trustedPeersState = .loading
         devicesErrorKey = nil
+        layoutErrorKey = nil
         Task {
             do {
-                trustedPeers = try await trustedDevicesClient.listTrustedPeers()
-                trustedPeersState = .ready
+                let peers = try await trustedDevicesClient.listTrustedPeers()
+                guard generation == trustedPeersRequestGeneration else { return }
+                applyAuthoritativeTrustedPeers(peers)
             } catch AgentClientError.agentUnavailable {
+                guard generation == trustedPeersRequestGeneration else { return }
                 trustedPeersState = .unavailable
                 devicesErrorKey = "trusted_devices_agent_unavailable"
+                layoutErrorKey = "layout_agent_unavailable"
                 connectionState = .unavailable
             } catch {
+                guard generation == trustedPeersRequestGeneration else { return }
                 trustedPeersState = .failed
                 devicesErrorKey = "trusted_devices_load_failed"
+                layoutErrorKey = "layout_load_failed"
+            }
+        }
+    }
+
+    func selectLayoutPeer(_ peerID: String?) {
+        guard !placementMutationOwner.isActive else { return }
+        guard let peerID else {
+            selectedLayoutPeerID = nil
+            return
+        }
+        guard trustedPeers.contains(where: { $0.peerID == peerID }) else { return }
+        selectedLayoutPeerID = peerID
+        layoutErrorKey = nil
+    }
+
+    func setSelectedPeerPlacement(_ placement: PeerPlacement) {
+        guard let peer = selectedLayoutPeer,
+              let generation = placementMutationOwner.begin(
+                  peerID: peer.peerID,
+                  currentPlacement: peer.placement,
+                  requestedPlacement: placement,
+                  eligible: layoutCanChangePlacement
+              )
+        else { return }
+
+        // Any older list reply was requested before this mutation and cannot
+        // replace its exact acknowledgement or reconciliation snapshot.
+        trustedPeersRequestGeneration &+= 1
+        deviceOperationPeerIDs.insert(peer.peerID)
+        layoutErrorKey = nil
+        let peerID = peer.peerID
+        Task {
+            do {
+                try await placementClient.setPeerPlacement(peerID: peerID, placement: placement)
+                guard placementMutationOwner.acceptAcknowledgement(
+                    generation: generation,
+                    peerID: peerID,
+                    placement: placement
+                ) else { return }
+                deviceOperationPeerIDs.remove(peerID)
+                if let index = trustedPeers.firstIndex(where: { $0.peerID == peerID }),
+                   trustedPeers[index].state == .active {
+                    trustedPeers[index].placement = placement
+                }
+            } catch {
+                finishPeerPlacementFailure(
+                    error,
+                    generation: generation,
+                    peerID: peerID
+                )
             }
         }
     }
@@ -464,7 +603,9 @@ final class AppModel: ObservableObject {
         guard let peer = trustedPeers.first(where: { $0.peerID == peerID }),
               peer.state == .active,
               peer.localGrants.contains(capability) != enabled,
-              !deviceOperationPeerIDs.contains(peerID)
+              !deviceOperationPeerIDs.contains(peerID),
+              !placementMutationOwner.isActive,
+              !placementOutcomeUnknownPeerIDs.contains(peerID)
         else { return }
 
         deviceOperationPeerIDs.insert(peerID)
@@ -497,7 +638,9 @@ final class AppModel: ObservableObject {
     func revokePeer(peerID: String) {
         guard let peer = trustedPeers.first(where: { $0.peerID == peerID }),
               peer.state == .active,
-              !deviceOperationPeerIDs.contains(peerID)
+              !deviceOperationPeerIDs.contains(peerID),
+              !placementMutationOwner.isActive,
+              !placementOutcomeUnknownPeerIDs.contains(peerID)
         else { return }
 
         deviceOperationPeerIDs.insert(peerID)
@@ -505,11 +648,11 @@ final class AppModel: ObservableObject {
         Task {
             defer { deviceOperationPeerIDs.remove(peerID) }
             do {
-                let response = try await trustedDevicesClient.revokePeer(peerID: peerID)
+                _ = try await trustedDevicesClient.revokePeer(peerID: peerID)
                 if let index = trustedPeers.firstIndex(where: { $0.peerID == peerID }) {
                     trustedPeers[index].state = .revoked
                 }
-                applyStatus(response)
+                refreshReadiness()
             } catch AgentClientError.agentUnavailable {
                 devicesErrorKey = "trusted_devices_agent_unavailable"
                 connectionState = .unavailable
@@ -517,6 +660,70 @@ final class AppModel: ObservableObject {
                 devicesErrorKey = "trusted_devices_revoke_failed"
             }
         }
+    }
+
+    private func finishPeerPlacementFailure(
+        _ error: Error,
+        generation: UInt64,
+        peerID: String
+    ) {
+        switch PeerPlacementMutationFailureDisposition.classify(error) {
+        case .rejected:
+            guard placementMutationOwner.reject(
+                generation: generation,
+                peerID: peerID
+            ) else { return }
+            deviceOperationPeerIDs.remove(peerID)
+            layoutErrorKey = "layout_placement_rejected"
+        case .outcomeUnknown:
+            guard placementMutationOwner.markAmbiguous(
+                generation: generation,
+                peerID: peerID
+            ) else { return }
+            reconcilePeerPlacement(generation: generation, peerID: peerID)
+        }
+    }
+
+    private func reconcilePeerPlacement(generation: UInt64, peerID: String) {
+        Task {
+            do {
+                let peers = try await placementReconciliationClient.listTrustedPeers()
+                guard placementMutationOwner.finishReconciliation(
+                    generation: generation,
+                    peerID: peerID
+                ) else { return }
+                deviceOperationPeerIDs.remove(peerID)
+                applyAuthoritativeTrustedPeers(peers)
+            } catch {
+                guard placementMutationOwner.finishReconciliation(
+                    generation: generation,
+                    peerID: peerID
+                ) else { return }
+                deviceOperationPeerIDs.remove(peerID)
+                placementOutcomeUnknownPeerIDs.insert(peerID)
+                layoutErrorKey = "layout_placement_outcome_unknown"
+                if case AgentClientError.agentUnavailable = error {
+                    trustedPeersState = .unavailable
+                    connectionState = .unavailable
+                } else {
+                    trustedPeersState = .failed
+                }
+            }
+        }
+    }
+
+    private func applyAuthoritativeTrustedPeers(_ peers: [TrustedPeerSummary]) {
+        trustedPeers = peers
+        trustedPeersState = .ready
+        devicesErrorKey = nil
+        layoutErrorKey = nil
+        placementOutcomeUnknownPeerIDs.removeAll()
+        if let selectedLayoutPeerID,
+           peers.contains(where: { $0.peerID == selectedLayoutPeerID }) {
+            return
+        }
+        self.selectedLayoutPeerID = peers.first(where: { $0.state == .active })?.peerID
+            ?? peers.first?.peerID
     }
 
     func sendFiles(paths: [String]) {
@@ -847,13 +1054,259 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func applyStatus(_ response: AgentStatusResponse) {
+    private func runFocusAcquisition(generation: UInt64) async {
+        do {
+            let response = try await focusClient.requestRemoteFocus()
+            applyFocusStatus(response, generation: generation, application: .mutation)
+        } catch {
+            guard generation == focusControlState.generation else { return }
+            switch FocusMutationFailureDisposition.classify(error) {
+            case .rejected:
+                focusControlState = FocusControlReducer.rejectMutation(
+                    focusControlState,
+                    generation: generation
+                )
+            case .outcomeUnknown:
+                focusControlState = FocusControlReducer.markAmbiguousMutation(
+                    focusControlState,
+                    generation: generation
+                )
+            }
+        }
+
+        guard generation == focusControlState.generation else { return }
+        if focusControlState.phase == .acquireLeaseWindow {
+            do {
+                try await Task.sleep(
+                    for: .milliseconds(Int(FocusCommandContract.acquireLeaseMilliseconds))
+                )
+            } catch {
+                guard generation == focusControlState.generation else { return }
+                focusControlState = FocusControlReducer.failReconciliation(
+                    focusControlState,
+                    generation: generation
+                )
+                publishUnknownFocusStatus(error)
+                finishFocusOperation(generation)
+                return
+            }
+            guard generation == focusControlState.generation else { return }
+            focusControlState = FocusControlReducer.markAcquireLeaseWindowElapsed(
+                focusControlState,
+                generation: generation
+            )
+            if focusControlState.phase == .acquireReconciliation {
+                await reconcileFocusStatus(generation: generation)
+            }
+        }
+        finishFocusOperation(generation)
+    }
+
+    private func runFocusRelease(generation: UInt64) async {
+        do {
+            let response = try await focusClient.releaseFocus()
+            applyFocusStatus(response, generation: generation, application: .mutation)
+        } catch {
+            guard generation == focusControlState.generation else { return }
+            switch FocusMutationFailureDisposition.classify(error) {
+            case .rejected:
+                focusControlState = FocusControlReducer.rejectMutation(
+                    focusControlState,
+                    generation: generation
+                )
+            case .outcomeUnknown:
+                focusControlState = FocusControlReducer.markAmbiguousMutation(
+                    focusControlState,
+                    generation: generation
+                )
+            }
+        }
+
+        guard generation == focusControlState.generation else { return }
+        if focusControlState.phase == .releaseReconciliation {
+            await reconcileFocusStatus(generation: generation)
+        }
+        finishFocusOperation(generation)
+    }
+
+    private func reconcileFocusStatus(generation: UInt64) async {
+        do {
+            let response = try await focusReconciliationClient.focusStatus()
+            applyFocusStatus(response, generation: generation, application: .reconciliation)
+        } catch {
+            guard generation == focusControlState.generation else { return }
+            focusControlState = FocusControlReducer.failReconciliation(
+                focusControlState,
+                generation: generation
+            )
+            publishUnknownFocusStatus(error)
+        }
+    }
+
+    private func finishFocusOperation(_ generation: UInt64) {
+        guard generation == focusControlState.generation else { return }
+        focusOperationDeadlineTask?.cancel()
+        focusOperationDeadlineTask = nil
+        focusOperationTask = nil
+    }
+
+    private func startFocusOperationDeadline(_ generation: UInt64) {
+        focusOperationDeadlineTask?.cancel()
+        focusOperationDeadlineTask = Task { [weak self] in
+            do {
+                try await Task.sleep(
+                    for: .seconds(FocusCommandContract.overallOperationDeadlineSeconds)
+                )
+            } catch {
+                return
+            }
+            guard let self, generation == focusControlState.generation else { return }
+            let expired = FocusControlReducer.expireOperation(
+                focusControlState,
+                generation: generation
+            )
+            guard expired != focusControlState else { return }
+            focusControlState = expired
+            publishUnknownFocusStatus(AgentClientError.invalidResponse)
+            focusOperationTask?.cancel()
+            focusOperationTask = nil
+            focusOperationDeadlineTask = nil
+        }
+    }
+
+    private func beginFocusStatusRefresh() -> UInt64? {
+        guard FocusControlReducer.canBeginStatusRefresh(focusControlState) else { return nil }
+        focusRequestGeneration &+= 1
+        let generation = focusRequestGeneration
+        focusControlState = FocusControlReducer.beginStatusRefresh(
+            focusControlState,
+            generation: generation
+        )
+        return generation
+    }
+
+    private func applyFocusStatus(
+        _ response: AgentStatusResponse,
+        generation: UInt64,
+        application: FocusStatusApplication
+    ) {
+        guard generation == focusControlState.generation else { return }
+        let acceptsStatus = switch application {
+        case .mutation, .emergency:
+            focusControlState.phase == .acquireInFlight
+                || focusControlState.phase == .releaseInFlight
+                || focusControlState.phase == .emergencyInFlight
+        case .reconciliation:
+            focusControlState.phase == .acquireReconciliation
+                || focusControlState.phase == .releaseReconciliation
+                || focusControlState.phase == .statusReconciliation
+        case .ordinary:
+            focusControlState.phase == .idle
+                || focusControlState.phase == .statusReconciliation
+        }
+        guard acceptsStatus else { return }
         let status = AuthoritativeAgentStatus(response)
+        let authority = focusAuthority(status.focusState)
+        let context = focusActionContext(response)
+        focusControlState = switch application {
+        case .mutation, .emergency:
+            FocusControlReducer.applyMutationStatus(
+                focusControlState,
+                generation: generation,
+                authority: authority,
+                context: context
+            )
+        case .reconciliation:
+            FocusControlReducer.applyReconciledStatus(
+                focusControlState,
+                generation: generation,
+                authority: authority,
+                context: context
+            )
+        case .ordinary:
+            if focusControlState.phase == .statusReconciliation {
+                FocusControlReducer.applyReconciledStatus(
+                    focusControlState,
+                    generation: generation,
+                    authority: authority,
+                    context: context
+                )
+            } else {
+                FocusControlReducer.applyOrdinaryStatus(
+                    focusControlState,
+                    generation: generation,
+                    authority: authority,
+                    context: context
+                )
+            }
+        }
         connectedPeer = status.connectedPeer
         inputOwner = status.inputOwner
         focusState = status.focusState
         readiness = status.readiness
         connectionState = status.connectedPeer == nil ? .ready : .connected
+    }
+
+    private func failFocusStatus(
+        _ error: Error,
+        generation: UInt64,
+        application: FocusStatusApplication
+    ) {
+        guard generation == focusControlState.generation else { return }
+        switch application {
+        case .emergency:
+            focusControlState = FocusControlReducer.markAmbiguousMutation(
+                focusControlState,
+                generation: generation
+            )
+        case .reconciliation:
+            focusControlState = FocusControlReducer.failReconciliation(
+                focusControlState,
+                generation: generation
+            )
+        case .ordinary:
+            focusControlState = FocusControlReducer.failStatus(
+                focusControlState,
+                generation: generation
+            )
+        case .mutation:
+            focusControlState = FocusControlReducer.markAmbiguousMutation(
+                focusControlState,
+                generation: generation
+            )
+        }
+        publishUnknownFocusStatus(error)
+    }
+
+    private func publishUnknownFocusStatus(_ error: Error) {
+        connectedPeer = nil
+        inputOwner = "local"
+        focusState = "unknown"
+        readiness = .unavailable
+        if case AgentClientError.agentUnavailable = error {
+            connectionState = .unavailable
+        } else {
+            connectionState = .failed
+        }
+    }
+
+    private func focusAuthority(_ value: String) -> FocusAuthority {
+        switch value {
+        case "local": .local
+        case "controlling_peer": .controllingPeer
+        case "controlled_by_peer": .controlledByPeer
+        default: .unknown
+        }
+    }
+
+    private func focusActionContext(_ status: AgentStatusResponse) -> FocusActionContext {
+        FocusActionContext(
+            hasConnectedPeer: status.connectedPeer != nil,
+            isConnectedPhase: status.phase == "connected",
+            isInputReady: status.readiness.input == .ready,
+            isLocalTopologyAvailable: status.readiness.localTopology == .available,
+            isSessionTopologyReady: status.readiness.sessionTopology == .ready
+        )
     }
 
     private func beginReadinessRequest() -> UInt64 {
@@ -862,20 +1315,24 @@ final class AppModel: ObservableObject {
         return generation
     }
 
-    private func finishReadinessRequest(_ response: AgentStatusResponse, generation: UInt64) {
+    private func finishReadinessRequest(
+        _ response: AgentStatusResponse,
+        generation: UInt64,
+        focusGeneration: UInt64
+    ) {
         guard readinessRequestOwner.finish(generation) else { return }
         readinessRequestInProgress = false
-        applyStatus(response)
+        applyFocusStatus(response, generation: focusGeneration, application: .ordinary)
     }
 
-    private func failReadinessRequest(generation: UInt64) {
+    private func failReadinessRequest(
+        _ error: Error,
+        generation: UInt64,
+        focusGeneration: UInt64
+    ) {
         guard readinessRequestOwner.finish(generation) else { return }
         readinessRequestInProgress = false
-        connectedPeer = nil
-        inputOwner = "local"
-        focusState = "local"
-        readiness = .unavailable
-        connectionState = .unavailable
+        failFocusStatus(error, generation: focusGeneration, application: .ordinary)
     }
 
     private func beginUpdateRequest() -> UInt64? {

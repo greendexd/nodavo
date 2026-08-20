@@ -430,6 +430,12 @@ async fn dispatch_ui_command(command: UiCommand, runtime: Arc<AgentRuntime>) -> 
             },
             Err(error) => agent_error_event(&error),
         },
+        UiCommand::SetPeerPlacement { peer_id, placement } => {
+            match runtime.set_peer_placement(&peer_id, placement).await {
+                Ok(()) => AgentEvent::PeerPlacementChanged { peer_id, placement },
+                Err(error) => agent_error_event(&error),
+            }
+        }
         UiCommand::RevokePeer { peer_id } => match runtime.revoke_peer(&peer_id).await {
             Ok(()) => AgentEvent::Status(runtime.status().await),
             Err(error) => agent_error_event(&error),
@@ -575,6 +581,7 @@ fn agent_error_event(error: &AgentError) -> AgentEvent {
         AgentError::PeerNotFound => "peer_not_found",
         AgentError::Storage => "storage_unavailable",
         AgentError::GrantEpochExhausted => "grant_epoch_exhausted",
+        AgentError::PlacementApplyFailed => "placement_apply_failed",
         AgentError::PairingFailed => "pairing_failed",
         AgentError::NotConnected => "not_connected",
         AgentError::FocusRejected => "focus_rejected",

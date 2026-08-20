@@ -26,12 +26,35 @@
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
                         <TextBlock x:Uid="PeerLabel" FontWeight="SemiBold" />
                         <TextBlock Grid.Column="1" Text="{Binding PeerText}" TextWrapping="Wrap" />
                         <TextBlock x:Uid="InputOwnerLabel" Grid.Row="1" FontWeight="SemiBold" />
                         <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding InputOwnerText}" />
+                        <TextBlock x:Uid="FocusLabel" Grid.Row="2" FontWeight="SemiBold" />
+                        <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding FocusStateText}" TextWrapping="Wrap" />
                     </Grid>
+                    <StackPanel Spacing="8">
+                        <StackPanel Orientation="Horizontal" Spacing="10">
+                            <Button
+                                x:Uid="FocusAcquireButton"
+                                IsEnabled="{Binding CanRequestRemoteFocus}"
+                                Click="FocusAcquireButton_Click" />
+                            <Button
+                                x:Uid="FocusReleaseButton"
+                                IsEnabled="{Binding CanReleaseFocus}"
+                                Click="FocusReleaseButton_Click" />
+                            <ProgressRing
+                                Width="20"
+                                Height="20"
+                                IsActive="{Binding IsFocusOperationInProgress}" />
+                        </StackPanel>
+                        <TextBlock
+                            Text="{Binding FocusGuidanceText}"
+                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                            TextWrapping="Wrap" />
+                    </StackPanel>
                 </StackPanel>
             </Border>
 

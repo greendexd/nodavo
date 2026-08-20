@@ -90,6 +90,7 @@ struct AgentCommand: Encodable {
     let peerID: String?
     let capability: String?
     let enabled: Bool?
+    let placement: PeerPlacement?
     let capabilities: [String]?
     let paths: [String]?
     let ttlMs: UInt32?
@@ -104,6 +105,7 @@ struct AgentCommand: Encodable {
         case peerID = "peer_id"
         case capability
         case enabled
+        case placement
         case capabilities
         case paths
         case ttlMs = "ttl_ms"
@@ -119,6 +121,7 @@ struct AgentCommand: Encodable {
         peerID: String? = nil,
         capability: String? = nil,
         enabled: Bool? = nil,
+        placement: PeerPlacement? = nil,
         capabilities: [String]? = nil,
         paths: [String]? = nil,
         ttlMs: UInt32? = nil,
@@ -132,6 +135,7 @@ struct AgentCommand: Encodable {
         self.peerID = peerID
         self.capability = capability
         self.enabled = enabled
+        self.placement = placement
         self.capabilities = capabilities
         self.paths = paths
         self.ttlMs = ttlMs
@@ -153,12 +157,31 @@ struct AgentPeerResponse: Decodable {
     let displayName: String
     let state: TrustedPeerState
     let localGrants: [PairingCapability]
+    let placement: PeerPlacement
 
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey, CaseIterable {
         case peerID = "peer_id"
         case displayName = "display_name"
         case state
         case localGrants = "local_grants"
+        case placement
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue))
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        peerID = try container.decode(String.self, forKey: AnyCodingKey("peer_id"))
+        displayName = try container.decode(String.self, forKey: AnyCodingKey("display_name"))
+        state = try container.decode(TrustedPeerState.self, forKey: AnyCodingKey("state"))
+        localGrants = try container.decode(
+            [PairingCapability].self,
+            forKey: AnyCodingKey("local_grants")
+        )
+        placement = try container.decode(PeerPlacement.self, forKey: AnyCodingKey("placement"))
     }
 }
 
@@ -175,6 +198,7 @@ struct AgentResponse: Decodable {
     let peerID: String?
     let capability: PairingCapability?
     let enabled: Bool?
+    let placement: PeerPlacement?
     let peers: [AgentPeerResponse]?
     let message: String?
     let offerID: String?
@@ -197,6 +221,7 @@ struct AgentResponse: Decodable {
         case peerID = "peer_id"
         case capability
         case enabled
+        case placement
         case peers
         case message
         case offerID = "offer_id"
@@ -214,6 +239,66 @@ struct AgentStatusResponse {
     let inputOwner: String
     let focusState: String
     let readiness: AgentReadiness
+}
+
+private struct AgentStatusEnvelope: Decodable {
+    let event: String
+    let phase: String
+    let connectedPeer: String?
+    let inputOwner: String
+    let focusState: String
+    let readiness: AgentReadiness
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case event
+        case phase
+        case connectedPeer = "connected_peer"
+        case inputOwner = "input_owner"
+        case focusState = "focus_state"
+        case readiness
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue))
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        event = try container.decode(String.self, forKey: AnyCodingKey("event"))
+        phase = try container.decode(String.self, forKey: AnyCodingKey("phase"))
+        connectedPeer = try container.decodeIfPresent(
+            String.self,
+            forKey: AnyCodingKey("connected_peer")
+        )
+        inputOwner = try container.decode(String.self, forKey: AnyCodingKey("input_owner"))
+        focusState = try container.decode(String.self, forKey: AnyCodingKey("focus_state"))
+        readiness = try container.decode(AgentReadiness.self, forKey: AnyCodingKey("readiness"))
+    }
+}
+
+private struct AgentErrorEnvelope: Decodable {
+    let event: String
+    let code: String
+    let message: String
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case event
+        case code
+        case message
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue))
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        event = try container.decode(String.self, forKey: AnyCodingKey("event"))
+        code = try container.decode(String.self, forKey: AnyCodingKey("code"))
+        message = try container.decode(String.self, forKey: AnyCodingKey("message"))
+    }
 }
 
 enum AccessibilityReadiness: String, CaseIterable, Decodable {
@@ -325,16 +410,71 @@ enum TrustedPeerState: String, Decodable {
     case revoked
 }
 
+enum PeerPlacement: String, CaseIterable, Hashable, Identifiable, Codable {
+    case disabled
+    case left
+    case right
+    case above
+    case below
+
+    var id: String { rawValue }
+}
+
 struct TrustedPeerSummary: Identifiable, Equatable {
     let peerID: String
     let displayName: String
     var state: TrustedPeerState
     var localGrants: Set<PairingCapability>
+    var placement: PeerPlacement
 
     var id: String { peerID }
 
     var redactedID: String {
         String(peerID.prefix(8)) + "…"
+    }
+}
+
+private struct TrustedPeersResponse: Decodable {
+    let peers: [AgentPeerResponse]
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case event
+        case peers
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue)),
+              try container.decode(String.self, forKey: AnyCodingKey("event")) == "trusted_peers"
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        peers = try container.decode([AgentPeerResponse].self, forKey: AnyCodingKey("peers"))
+    }
+}
+
+private struct PeerPlacementChangedResponse: Decodable {
+    let peerID: String
+    let placement: PeerPlacement
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case event
+        case peerID = "peer_id"
+        case placement
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: AnyCodingKey.self)
+        guard Set(container.allKeys.map(\.stringValue))
+                == Set(CodingKeys.allCases.map(\.rawValue)),
+              try container.decode(String.self, forKey: AnyCodingKey("event"))
+                == "peer_placement_changed"
+        else {
+            throw AgentClientError.invalidResponse
+        }
+        peerID = try container.decode(String.self, forKey: AnyCodingKey("peer_id"))
+        placement = try container.decode(PeerPlacement.self, forKey: AnyCodingKey("placement"))
     }
 }
 
@@ -430,8 +570,35 @@ enum AgentResponseDecoder {
     static let maximumDisplayNameBytes = 256
     static let maximumUpdateVersionBytes = 128
     static let maximumUpdateArtifactBytes: UInt64 = 16 * 1024 * 1024 * 1024
+    private static let allowedAgentErrorCodes: Set<String> = [
+        "busy",
+        "invalid_endpoint",
+        "discovery_unavailable",
+        "pairing_timed_out",
+        "reconnect_failed",
+        "pairing_not_found",
+        "already_confirmed",
+        "peer_not_found",
+        "storage_unavailable",
+        "grant_epoch_exhausted",
+        "placement_apply_failed",
+        "pairing_failed",
+        "not_connected",
+        "focus_rejected",
+        "safety_recovery_failed",
+        "transfer_failed",
+        "transfer_not_found",
+        "transfer_not_cancellable",
+        "unsupported_platform",
+        "readiness_unavailable",
+        "update_not_configured",
+        "update_busy",
+        "update_offer_mismatch",
+        "update_invalid_transition",
+        "update_internal",
+    ]
 
-    static func validateTransferJSON(_ payload: Data) throws {
+    static func validateStrictJSON(_ payload: Data) throws {
         do {
             try StrictJSONDuplicateKeyValidator.validate(payload)
         } catch {
@@ -441,7 +608,7 @@ enum AgentResponseDecoder {
 
     static func transferAdmission(_ payload: Data) throws -> QueuedTransferReference {
         do {
-            try validateTransferJSON(payload)
+            try validateStrictJSON(payload)
             let response = try JSONDecoder().decode(TransferAdmissionResponse.self, from: payload)
             return QueuedTransferReference(transferID: response.transferID)
         } catch let error as AgentClientError {
@@ -453,7 +620,7 @@ enum AgentResponseDecoder {
 
     static func transferSnapshot(_ payload: Data) throws -> TransferSnapshot {
         do {
-            try validateTransferJSON(payload)
+            try validateStrictJSON(payload)
             return try JSONDecoder().decode(TransferSnapshot.self, from: payload)
         } catch let error as AgentClientError {
             throw error
@@ -462,9 +629,38 @@ enum AgentResponseDecoder {
         }
     }
 
-    static func trustedPeers(_ response: AgentResponse) throws -> [TrustedPeerSummary] {
-        guard response.event == "trusted_peers", let peers = response.peers,
-              peers.count <= maximumTrustedPeers,
+    static func trustedPeers(_ payload: Data) throws -> [TrustedPeerSummary] {
+        do {
+            try StrictJSONDuplicateKeyValidator.validate(payload)
+            let response = try JSONDecoder().decode(TrustedPeersResponse.self, from: payload)
+            return try trustedPeers(response.peers)
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
+    }
+
+    static func peerPlacementAcknowledgement(
+        _ payload: Data,
+        peerID: String,
+        placement: PeerPlacement
+    ) throws {
+        do {
+            try StrictJSONDuplicateKeyValidator.validate(payload)
+            let response = try JSONDecoder().decode(PeerPlacementChangedResponse.self, from: payload)
+            guard response.peerID == peerID, response.placement == placement else {
+                throw AgentClientError.invalidResponse
+            }
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
+    }
+
+    private static func trustedPeers(_ peers: [AgentPeerResponse]) throws -> [TrustedPeerSummary] {
+        guard peers.count <= maximumTrustedPeers,
               Set(peers.map(\.peerID)).count == peers.count
         else {
             throw AgentClientError.invalidResponse
@@ -485,34 +681,68 @@ enum AgentResponseDecoder {
                 peerID: peer.peerID,
                 displayName: peer.displayName,
                 state: peer.state,
-                localGrants: Set(peer.localGrants)
+                localGrants: Set(peer.localGrants),
+                placement: peer.placement
             )
         }
     }
 
-    static func status(_ response: AgentResponse) throws -> AgentStatusResponse {
+    static func status(_ payload: Data) throws -> AgentStatusResponse {
+        let response: AgentStatusEnvelope
+        do {
+            try validateStrictJSON(payload)
+            response = try JSONDecoder().decode(AgentStatusEnvelope.self, from: payload)
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
         let validPhases = ["starting", "ready", "pairing", "connected", "stopping"]
         let validFocusStates = ["local", "controlling_peer", "controlled_by_peer"]
-        let focusState = response.focusState ?? "local"
         guard response.event == "status",
-              let phase = response.phase,
-              validPhases.contains(phase),
-              let inputOwner = response.inputOwner,
-              inputOwner == "local" || inputOwner == "remote",
-              validFocusStates.contains(focusState),
+              validPhases.contains(response.phase),
+              response.inputOwner == "local" || response.inputOwner == "remote",
+              validFocusStates.contains(response.focusState),
+              response.connectedPeer?.isEmpty != true,
               response.connectedPeer?.utf8.count ?? 0 <= 256,
-              response.connectedPeer.map(containsControlCharacter) != true,
-              let readiness = response.readiness
+              response.connectedPeer.map(containsControlCharacter) != true
         else {
             throw AgentClientError.invalidResponse
         }
         return AgentStatusResponse(
-            phase: phase,
+            phase: response.phase,
             connectedPeer: response.connectedPeer,
-            inputOwner: inputOwner,
-            focusState: focusState,
-            readiness: readiness
+            inputOwner: response.inputOwner,
+            focusState: response.focusState,
+            readiness: response.readiness
         )
+    }
+
+    static func agentError(_ payload: Data) throws -> AgentClientError? {
+        do {
+            try validateStrictJSON(payload)
+            let discriminator = try JSONDecoder().decode(AgentResponse.self, from: payload)
+            guard discriminator.event == "error" else { return nil }
+            let response = try JSONDecoder().decode(AgentErrorEnvelope.self, from: payload)
+            guard response.event == "error",
+                  allowedAgentErrorCodes.contains(response.code),
+                  !response.code.isEmpty,
+                  response.code.utf8.count <= 128,
+                  response.code == response.code.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !containsControlCharacter(response.code),
+                  !response.message.isEmpty,
+                  response.message.utf8.count <= 1_024,
+                  response.message == response.message.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !containsControlCharacter(response.message)
+            else {
+                throw AgentClientError.invalidResponse
+            }
+            return AgentClientError.agent(code: response.code, message: response.message)
+        } catch let error as AgentClientError {
+            throw error
+        } catch {
+            throw AgentClientError.invalidResponse
+        }
     }
 
     static func updateStatus(_ response: AgentResponse) throws -> UpdateStatusSnapshot {
@@ -687,34 +917,57 @@ actor AgentClient {
     // Existing non-transfer commands retain their current bounded ceiling.
     // Admission, transfer polling, and cancellation override it below.
     private static let defaultReplyDeadlineSeconds = 360
+    private static let statusReplyDeadlineSeconds = 8
+    private static let emergencyReplyDeadlineSeconds = 25
+    private static let trustedPeersReplyDeadlineSeconds = 15
+    private static let placementReplyDeadlineSeconds = 15
     private let maximumEndpointBytes = 512
     static let maximumSelectedPaths = 32
     static let maximumSelectedPathBytes = 4 * 1024
 
     func status() throws -> AgentStatusResponse {
-        try decodeStatus(request(AgentCommand.simple("get_status")))
+        try requestStatus(
+            AgentCommand.simple("get_status"),
+            deadlineSeconds: Self.statusReplyDeadlineSeconds
+        )
     }
 
     func requestAccessibilityPermission() throws -> AgentStatusResponse {
-        try decodeStatus(request(AgentCommand.simple("request_accessibility_permission")))
+        try requestStatus(
+            AgentCommand.simple("request_accessibility_permission"),
+            deadlineSeconds: Self.statusReplyDeadlineSeconds
+        )
     }
 
     func emergencyStop() throws -> AgentStatusResponse {
-        try decodeStatus(request(AgentCommand.simple("emergency_stop")))
+        try requestStatus(
+            AgentCommand.simple("emergency_stop"),
+            deadlineSeconds: Self.emergencyReplyDeadlineSeconds
+        )
     }
 
-    func requestRemoteFocus(ttlMs: UInt32 = 5_000) throws -> AgentStatusResponse {
-        guard (1_000 ... 30_000).contains(ttlMs) else {
-            throw AgentClientError.unsafeValue
-        }
-        return try decodeStatus(request(AgentCommand(
-            command: "request_remote_focus",
-            ttlMs: ttlMs
-        )))
+    func requestRemoteFocus() throws -> AgentStatusResponse {
+        try requestStatus(
+            AgentCommand(
+                command: "request_remote_focus",
+                ttlMs: FocusCommandContract.acquireLeaseMilliseconds
+            ),
+            deadlineSeconds: FocusCommandContract.mutationDeadlineSeconds
+        )
     }
 
     func releaseFocus() throws -> AgentStatusResponse {
-        try decodeStatus(request(AgentCommand.simple("release_focus")))
+        try requestStatus(
+            AgentCommand.simple("release_focus"),
+            deadlineSeconds: FocusCommandContract.mutationDeadlineSeconds
+        )
+    }
+
+    func focusStatus() throws -> AgentStatusResponse {
+        try requestStatus(
+            AgentCommand.simple("get_status"),
+            deadlineSeconds: FocusCommandContract.reconciliationDeadlineSeconds
+        )
     }
 
     func beginPairing(
@@ -769,7 +1022,13 @@ actor AgentClient {
     }
 
     func listTrustedPeers() throws -> [TrustedPeerSummary] {
-        try AgentResponseDecoder.trustedPeers(request(AgentCommand.simple("list_trusted_peers")))
+        let payload = try requestData(
+            AgentCommand.simple("list_trusted_peers"),
+            deadlineSeconds: Self.trustedPeersReplyDeadlineSeconds
+        )
+        try AgentResponseDecoder.validateStrictJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        return try AgentResponseDecoder.trustedPeers(payload)
     }
 
     func setCapability(
@@ -793,9 +1052,31 @@ actor AgentClient {
         }
     }
 
+    func setPeerPlacement(peerID: String, placement: PeerPlacement) throws {
+        try validatePeerID(peerID)
+        let payload = try requestData(
+            AgentCommand(
+                command: "set_peer_placement",
+                peerID: peerID,
+                placement: placement
+            ),
+            deadlineSeconds: Self.placementReplyDeadlineSeconds
+        )
+        try AgentResponseDecoder.validateStrictJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        try AgentResponseDecoder.peerPlacementAcknowledgement(
+            payload,
+            peerID: peerID,
+            placement: placement
+        )
+    }
+
     func revokePeer(peerID: String) throws -> AgentStatusResponse {
         try validatePeerID(peerID)
-        return try decodeStatus(request(AgentCommand(command: "revoke_peer", peerID: peerID)))
+        return try requestStatus(
+            AgentCommand(command: "revoke_peer", peerID: peerID),
+            deadlineSeconds: Self.defaultReplyDeadlineSeconds
+        )
     }
 
     func sendFiles(paths: [String]) throws -> QueuedTransferReference {
@@ -804,7 +1085,7 @@ actor AgentClient {
             AgentCommand(command: "send_files", paths: paths),
             deadlineSeconds: TransferCommandDeadline.admissionSeconds
         )
-        try AgentResponseDecoder.validateTransferJSON(payload)
+        try AgentResponseDecoder.validateStrictJSON(payload)
         try throwAgentErrorIfPresent(payload)
         return try AgentResponseDecoder.transferAdmission(payload)
     }
@@ -814,7 +1095,7 @@ actor AgentClient {
             AgentCommand.simple("list_transfers"),
             deadlineSeconds: TransferCommandDeadline.statusSeconds
         )
-        try AgentResponseDecoder.validateTransferJSON(payload)
+        try AgentResponseDecoder.validateStrictJSON(payload)
         try throwAgentErrorIfPresent(payload)
         return try AgentResponseDecoder.transferSnapshot(payload)
     }
@@ -827,7 +1108,7 @@ actor AgentClient {
             AgentCommand(command: "cancel_transfer", transferID: transferID),
             deadlineSeconds: TransferCommandDeadline.statusSeconds
         )
-        try AgentResponseDecoder.validateTransferJSON(payload)
+        try AgentResponseDecoder.validateStrictJSON(payload)
         try throwAgentErrorIfPresent(payload)
         return try AgentResponseDecoder.transferSnapshot(payload)
     }
@@ -873,8 +1154,14 @@ actor AgentClient {
         }
     }
 
-    private func decodeStatus(_ response: AgentResponse) throws -> AgentStatusResponse {
-        try AgentResponseDecoder.status(response)
+    private func requestStatus(
+        _ command: AgentCommand,
+        deadlineSeconds: Int
+    ) throws -> AgentStatusResponse {
+        let payload = try requestData(command, deadlineSeconds: deadlineSeconds)
+        try AgentResponseDecoder.validateStrictJSON(payload)
+        try throwAgentErrorIfPresent(payload)
+        return try AgentResponseDecoder.status(payload)
     }
 
     private func validatePeerID(_ peerID: String) throws {
@@ -888,8 +1175,9 @@ actor AgentClient {
 
     private func request(_ command: AgentCommand) throws -> AgentResponse {
         let response = try requestData(command, deadlineSeconds: Self.defaultReplyDeadlineSeconds)
+        try AgentResponseDecoder.validateStrictJSON(response)
+        try throwAgentErrorIfPresent(response)
         let decoded = try JSONDecoder().decode(AgentResponse.self, from: response)
-        try throwAgentError(decoded)
         return decoded
     }
 
@@ -907,20 +1195,8 @@ actor AgentClient {
     }
 
     private func throwAgentErrorIfPresent(_ payload: Data) throws {
-        let decoded = try JSONDecoder().decode(AgentResponse.self, from: payload)
-        try throwAgentError(decoded)
-    }
-
-    private func throwAgentError(_ decoded: AgentResponse) throws {
-        if decoded.event == "error" {
-            guard let code = decoded.code,
-                  let message = decoded.message,
-                  code.utf8.count <= 64,
-                  message.utf8.count <= 512
-            else {
-                throw AgentClientError.invalidResponse
-            }
-            throw AgentClientError.agent(code: code, message: message)
+        if let error = try AgentResponseDecoder.agentError(payload) {
+            throw error
         }
     }
 

@@ -65,18 +65,19 @@ import Testing
             "peer_id":"0123456789abcdef",
             "display_name":"Office Mac",
             "state":"active",
-            "local_grants":["input","files"]
+            "local_grants":["input","files"],
+            "placement":"right"
         }]
     }
     """#.utf8)
 
-    let response = try JSONDecoder().decode(AgentResponse.self, from: data)
-    let peers = try AgentResponseDecoder.trustedPeers(response)
+    let peers = try AgentResponseDecoder.trustedPeers(data)
 
     #expect(peers.count == 1)
     #expect(peers[0].displayName == "Office Mac")
     #expect(peers[0].state == .active)
     #expect(peers[0].localGrants == [.input, .files])
+    #expect(peers[0].placement == .right)
     #expect(peers[0].redactedID == "01234567…")
 }
 
@@ -86,18 +87,16 @@ import Testing
         "display_name": "Peer",
         "state": "active",
         "local_grants": [],
+        "placement": "disabled",
     ] as [String: Any]
     let payload: [String: Any] = [
         "event": "trusted_peers",
         "peers": Array(repeating: peer, count: 33),
     ]
-    let response = try JSONDecoder().decode(
-        AgentResponse.self,
-        from: JSONSerialization.data(withJSONObject: payload)
-    )
+    let data = try JSONSerialization.data(withJSONObject: payload)
 
     #expect(throws: AgentClientError.self) {
-        try AgentResponseDecoder.trustedPeers(response)
+        try AgentResponseDecoder.trustedPeers(data)
     }
 }
 
@@ -109,14 +108,13 @@ import Testing
             "peer_id":"0123456789abcdef",
             "display_name":"Peer",
             "state":"active",
-            "local_grants":["files","files"]
+            "local_grants":["files","files"],
+            "placement":"disabled"
         }]
     }
     """#.utf8)
-    let response = try JSONDecoder().decode(AgentResponse.self, from: data)
-
     #expect(throws: AgentClientError.self) {
-        try AgentResponseDecoder.trustedPeers(response)
+        try AgentResponseDecoder.trustedPeers(data)
     }
 }
 
@@ -126,17 +124,443 @@ import Testing
         "display_name": "Peer",
         "state": "active",
         "local_grants": [],
+        "placement": "left",
     ]
-    let response = try JSONDecoder().decode(
-        AgentResponse.self,
-        from: JSONSerialization.data(withJSONObject: [
+    let data = try JSONSerialization.data(withJSONObject: [
             "event": "trusted_peers",
             "peers": [peer, peer],
         ])
-    )
 
     #expect(throws: AgentClientError.self) {
-        try AgentResponseDecoder.trustedPeers(response)
+        try AgentResponseDecoder.trustedPeers(data)
+    }
+}
+
+@Test func trustedPeerDecoderRequiresExactPlacementAndObjectShapes() throws {
+    for placement in PeerPlacement.allCases {
+        let data = Data(#"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[],"placement":"\#(placement.rawValue)"}]}"#.utf8)
+        #expect(try AgentResponseDecoder.trustedPeers(data).first?.placement == placement)
+    }
+
+    for invalid in [
+        #"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[]}]}"#,
+        #"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[],"placement":"diagonal"}]}"#,
+        #"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[],"placement":"left","display_id":7}]}"#,
+        #"{"event":"trusted_peers","peers":[],"revision":1}"#,
+        #"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[],"placement":"left","placement":"right"}]}"#,
+        #"{"event":"trusted_peers","peers":[{"peer_id":"peer","display_name":"Peer","state":"active","local_grants":[],"placement":"left","place\u006dent":"right"}]}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.trustedPeers(Data(invalid.utf8))
+        }
+    }
+}
+
+@Test func peerPlacementCommandAndAcknowledgementAreExact() throws {
+    let command = AgentCommand(
+        command: "set_peer_placement",
+        peerID: "peer-1",
+        placement: .above
+    )
+    let object = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(command)) as? [String: Any]
+    )
+    #expect(object.count == 3)
+    #expect(object["command"] as? String == "set_peer_placement")
+    #expect(object["peer_id"] as? String == "peer-1")
+    #expect(object["placement"] as? String == "above")
+
+    let valid = Data(
+        #"{"event":"peer_placement_changed","peer_id":"peer-1","placement":"above"}"#.utf8
+    )
+    try AgentResponseDecoder.peerPlacementAcknowledgement(
+        valid,
+        peerID: "peer-1",
+        placement: .above
+    )
+
+    for invalid in [
+        #"{"event":"peer_placement_changed","peer_id":"peer-2","placement":"above"}"#,
+        #"{"event":"peer_placement_changed","peer_id":"peer-1","placement":"below"}"#,
+        #"{"event":"peer_placement_changed","peer_id":"peer-1"}"#,
+        #"{"event":"peer_placement_changed","peer_id":"peer-1","placement":"diagonal"}"#,
+        #"{"event":"peer_placement_changed","peer_id":"peer-1","placement":"above","session_id":"private"}"#,
+        #"{"event":"peer_placement_changed","peer_id":"peer-1","placement":"above","placement":"below"}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.peerPlacementAcknowledgement(
+                Data(invalid.utf8),
+                peerID: "peer-1",
+                placement: .above
+            )
+        }
+    }
+}
+
+@Test func placementMutationWaitsForExactAckOrAuthoritativeReconciliation() throws {
+    var owner = PeerPlacementMutationOwner()
+    let revokedCandidate = owner.begin(
+        peerID: "revoked-peer",
+        currentPlacement: .disabled,
+        requestedPlacement: .left,
+        eligible: false
+    )
+    #expect(revokedCandidate == nil)
+    let unchangedCandidate = owner.begin(
+        peerID: "peer-1",
+        currentPlacement: .right,
+        requestedPlacement: .right,
+        eligible: true
+    )
+    #expect(unchangedCandidate == nil)
+    let firstCandidate = owner.begin(
+        peerID: "peer-1",
+        currentPlacement: .disabled,
+        requestedPlacement: .right,
+        eligible: true
+    )
+    let first = try #require(firstCandidate)
+    let busyCandidate = owner.begin(
+        peerID: "peer-2",
+        currentPlacement: .disabled,
+        requestedPlacement: .above,
+        eligible: true
+    )
+    #expect(busyCandidate == nil)
+    let wrongPeerAccepted = owner.acceptAcknowledgement(
+        generation: first,
+        peerID: "peer-2",
+        placement: .right
+    )
+    #expect(!wrongPeerAccepted)
+    let wrongPlacementAccepted = owner.acceptAcknowledgement(
+        generation: first,
+        peerID: "peer-1",
+        placement: .left
+    )
+    #expect(!wrongPlacementAccepted)
+    #expect(owner.isActive)
+    let markedAmbiguous = owner.markAmbiguous(generation: first, peerID: "peer-1")
+    #expect(markedAmbiguous)
+    let duplicateAmbiguity = owner.markAmbiguous(generation: first, peerID: "peer-1")
+    #expect(!duplicateAmbiguity)
+    let lateAcknowledgementAccepted = owner.acceptAcknowledgement(
+        generation: first,
+        peerID: "peer-1",
+        placement: .right
+    )
+    #expect(!lateAcknowledgementAccepted)
+    let reconciled = owner.finishReconciliation(generation: first, peerID: "peer-1")
+    #expect(reconciled)
+    #expect(!owner.isActive)
+
+    let secondCandidate = owner.begin(
+        peerID: "peer-1",
+        currentPlacement: .left,
+        requestedPlacement: .below,
+        eligible: true
+    )
+    let second = try #require(secondCandidate)
+    #expect(second != first)
+    let staleReconciliation = owner.finishReconciliation(generation: first, peerID: "peer-1")
+    #expect(!staleReconciliation)
+    let exactAcknowledgement = owner.acceptAcknowledgement(
+        generation: second,
+        peerID: "peer-1",
+        placement: .below
+    )
+    #expect(exactAcknowledgement)
+}
+
+@Test func placementMutationClassifiesOnlyDefiniteRejectionAsRetryableByUser() {
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(
+            AgentClientError.agent(code: "peer_not_found", message: "missing")
+        ) == .rejected
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(
+            AgentClientError.agent(code: "storage_unavailable", message: "not persisted")
+        ) == .rejected
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(
+            AgentClientError.agent(code: "placement_apply_failed", message: "persisted")
+        ) == .outcomeUnknown
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(
+            AgentClientError.agent(code: "unexpected", message: "unknown")
+        ) == .outcomeUnknown
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(AgentClientError.unsafeValue)
+            == .rejected
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(AgentClientError.invalidResponse)
+            == .outcomeUnknown
+    )
+    #expect(
+        PeerPlacementMutationFailureDisposition.classify(AgentClientError.agentUnavailable)
+            == .outcomeUnknown
+    )
+}
+
+@Test func focusReducerOwnsOneBoundedGenerationAndNeverAdmitsRepeatClicks() {
+    let ready = FocusActionContext(
+        hasConnectedPeer: true,
+        isConnectedPhase: true,
+        isInputReady: true,
+        isLocalTopologyAvailable: true,
+        isSessionTopologyReady: true
+    )
+    var state = FocusControlState(
+        authority: .local,
+        phase: .idle,
+        notice: .none,
+        generation: 7,
+        context: ready
+    )
+    #expect(FocusControlReducer.canAcquire(state))
+
+    for blocked in [
+        FocusActionContext(
+            hasConnectedPeer: false,
+            isConnectedPhase: true,
+            isInputReady: true,
+            isLocalTopologyAvailable: true,
+            isSessionTopologyReady: true
+        ),
+        FocusActionContext(
+            hasConnectedPeer: true,
+            isConnectedPhase: false,
+            isInputReady: true,
+            isLocalTopologyAvailable: true,
+            isSessionTopologyReady: true
+        ),
+        FocusActionContext(
+            hasConnectedPeer: true,
+            isConnectedPhase: true,
+            isInputReady: false,
+            isLocalTopologyAvailable: true,
+            isSessionTopologyReady: true
+        ),
+        FocusActionContext(
+            hasConnectedPeer: true,
+            isConnectedPhase: true,
+            isInputReady: true,
+            isLocalTopologyAvailable: false,
+            isSessionTopologyReady: true
+        ),
+        FocusActionContext(
+            hasConnectedPeer: true,
+            isConnectedPhase: true,
+            isInputReady: true,
+            isLocalTopologyAvailable: true,
+            isSessionTopologyReady: false
+        ),
+    ] {
+        var candidate = state
+        candidate.context = blocked
+        #expect(!FocusControlReducer.canAcquire(candidate))
+    }
+
+    state = FocusControlReducer.beginAcquire(state, generation: 8)
+    #expect(state.phase == .acquireInFlight)
+    #expect(state.authority == .local)
+    #expect(!FocusControlReducer.canAcquire(state))
+    let repeated = FocusControlReducer.beginAcquire(state, generation: 9)
+    #expect(repeated == state)
+    #expect(repeated.generation == 8)
+    #expect(FocusControlReducer.expireOperation(state, generation: 7) == state)
+    let expired = FocusControlReducer.expireOperation(state, generation: 8)
+    #expect(expired.phase == .outcomeUnknown)
+    #expect(expired.authority == .unknown)
+
+    state = FocusControlReducer.applyMutationStatus(
+        state,
+        generation: 8,
+        authority: .local,
+        context: ready
+    )
+    #expect(state.phase == .acquireLeaseWindow)
+    #expect(FocusControlReducer.isProgressVisible(state))
+    #expect(
+        FocusControlReducer.markAcquireLeaseWindowElapsed(state, generation: 7) == state
+    )
+    state = FocusControlReducer.markAcquireLeaseWindowElapsed(state, generation: 8)
+    #expect(state.phase == .acquireReconciliation)
+    state = FocusControlReducer.applyReconciledStatus(
+        state,
+        generation: 8,
+        authority: .controllingPeer,
+        context: ready
+    )
+    #expect(state.phase == .idle)
+    #expect(state.authority == .controllingPeer)
+    #expect(FocusControlReducer.canRelease(state))
+}
+
+@Test func focusReducerLocksAmbiguityUntilExplicitStatusAndEmergencySupersedesLateReplies() {
+    let ready = FocusActionContext(
+        hasConnectedPeer: true,
+        isConnectedPhase: true,
+        isInputReady: true,
+        isLocalTopologyAvailable: true,
+        isSessionTopologyReady: true
+    )
+    var state = FocusControlState(
+        authority: .local,
+        phase: .idle,
+        notice: .none,
+        generation: 10,
+        context: ready
+    )
+    state = FocusControlReducer.beginAcquire(state, generation: 11)
+    state = FocusControlReducer.markAmbiguousMutation(state, generation: 11)
+    #expect(state.phase == .acquireLeaseWindow)
+    state = FocusControlReducer.failReconciliation(state, generation: 11)
+    #expect(state.phase == .outcomeUnknown)
+    #expect(state.authority == .unknown)
+    #expect(!FocusControlReducer.canAcquire(state))
+    #expect(!FocusControlReducer.canRelease(state))
+
+    let repeatedAcquire = FocusControlReducer.beginAcquire(state, generation: 12)
+    let repeatedRelease = FocusControlReducer.beginRelease(state, generation: 12)
+    #expect(repeatedAcquire == state)
+    #expect(repeatedRelease == state)
+
+    state = FocusControlReducer.beginStatusRefresh(state, generation: 12)
+    #expect(state.phase == .statusReconciliation)
+    state = FocusControlReducer.applyReconciledStatus(
+        state,
+        generation: 12,
+        authority: .local,
+        context: ready
+    )
+    #expect(state.phase == .idle)
+    #expect(FocusControlReducer.canAcquire(state))
+
+    state = FocusControlReducer.beginAcquire(state, generation: 13)
+    state = FocusControlReducer.beginEmergency(state, generation: 14)
+    let stale = FocusControlReducer.applyMutationStatus(
+        state,
+        generation: 13,
+        authority: .controllingPeer,
+        context: ready
+    )
+    #expect(stale == state)
+    #expect(stale.phase == .emergencyInFlight)
+    state = FocusControlReducer.applyMutationStatus(
+        state,
+        generation: 14,
+        authority: .local,
+        context: ready
+    )
+    #expect(state.phase == .idle)
+    #expect(state.authority == .local)
+
+    state.authority = .controlledByPeer
+    state.context = .unavailable
+    #expect(FocusControlReducer.canRelease(state))
+    state = FocusControlReducer.beginRelease(state, generation: 15)
+    state = FocusControlReducer.applyMutationStatus(
+        state,
+        generation: 15,
+        authority: .local,
+        context: ready
+    )
+    #expect(state.phase == .idle)
+    #expect(state.authority == .local)
+}
+
+@Test func focusContractUsesFixedLeaseSeparateDeadlinesAndOnlyExactRejection() throws {
+    #expect(FocusCommandContract.acquireLeaseMilliseconds == 5_000)
+    #expect(FocusCommandContract.mutationDeadlineSeconds == 15)
+    #expect(FocusCommandContract.reconciliationDeadlineSeconds == 8)
+    #expect(FocusCommandContract.maximumSequentialOperationSeconds == 28)
+    #expect(
+        FocusCommandContract.maximumSequentialOperationSeconds
+            <= FocusCommandContract.overallOperationDeadlineSeconds
+    )
+
+    let acquire = AgentCommand(
+        command: "request_remote_focus",
+        ttlMs: FocusCommandContract.acquireLeaseMilliseconds
+    )
+    let acquireObject = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(acquire)) as? [String: Any]
+    )
+    #expect(acquireObject.count == 2)
+    #expect(acquireObject["command"] as? String == "request_remote_focus")
+    #expect(acquireObject["ttl_ms"] as? Int == 5_000)
+
+    let releaseObject = try #require(
+        JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(AgentCommand.simple("release_focus"))
+        ) as? [String: Any]
+    )
+    #expect(releaseObject.count == 1)
+    #expect(releaseObject["command"] as? String == "release_focus")
+
+    #expect(
+        FocusMutationFailureDisposition.classify(
+            AgentClientError.agent(code: "focus_rejected", message: "rejected")
+        ) == .rejected
+    )
+    for ambiguous: AgentClientError in [
+        .agent(code: "not_connected", message: "not connected"),
+        .agent(code: "unexpected", message: "unexpected"),
+        .agentUnavailable,
+        .invalidResponse,
+        .system(1),
+        .unsafeValue,
+    ] {
+        #expect(FocusMutationFailureDisposition.classify(ambiguous) == .outcomeUnknown)
+    }
+}
+
+@Test func focusStatusAndAgentErrorDecodersRequireExactDuplicateFreeEnvelopes() throws {
+    let validStatus = Data(#"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","focus_state":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}"#.utf8)
+    let status = try AgentResponseDecoder.status(validStatus)
+    #expect(status.phase == "connected")
+    #expect(status.connectedPeer == "peer")
+    #expect(status.focusState == "local")
+
+    for invalid in [
+        #"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}"#,
+        #"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","focus_state":"future","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}"#,
+        #"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","focus_state":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"},"private":"secret"}"#,
+        #"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","focus_state":"local","focus_state":"controlled_by_peer","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}"#,
+        #"{"event":"status","phase":"connected","connected_peer":"peer","input_owner":"local","focus_state":"local","focus_\u0073tate":"controlled_by_peer","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.status(Data(invalid.utf8))
+        }
+    }
+
+    let exactError = Data(
+        #"{"event":"error","code":"focus_rejected","message":"focus lease rejected"}"#.utf8
+    )
+    let candidate = try AgentResponseDecoder.agentError(exactError)
+    let decoded = try #require(candidate)
+    guard case let AgentClientError.agent(code, _) = decoded else {
+        Issue.record("exact error did not decode as an agent error")
+        return
+    }
+    #expect(code == "focus_rejected")
+
+    for malformed in [
+        #"{"event":"error","code":"focus_rejected"}"#,
+        #"{"event":"error","code":"focus_rejected","message":"rejected","detail":"private"}"#,
+        #"{"event":"error","code":"focus_rejected","code":"not_connected","message":"rejected"}"#,
+        #"{"event":"error","code":"focus_rejected","c\u006fde":"not_connected","message":"rejected"}"#,
+        #"{"event":"error","code":"unknown_error","message":"rejected"}"#,
+    ] {
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.agentError(Data(malformed.utf8))
+        }
     }
 }
 
@@ -444,16 +868,8 @@ import Testing
     ]
 
     for payload in invalidPayloads {
-        let response: AgentResponse?
-        do {
-            response = try decodeAgentResponse(payload)
-        } catch {
-            continue
-        }
-        if let response {
-            #expect(throws: AgentClientError.self) {
-                try AgentResponseDecoder.status(response)
-            }
+        #expect(throws: AgentClientError.self) {
+            try AgentResponseDecoder.status(Data(payload.utf8))
         }
     }
 }
@@ -536,10 +952,10 @@ private func readinessStatusResponse(
     input: String,
     localTopology: String,
     sessionTopology: String
-) throws -> AgentResponse {
-    try decodeAgentResponse("""
-    {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"\(accessibility)","input":"\(input)","local_topology":"\(localTopology)","session_topology":"\(sessionTopology)"}}
-    """)
+) throws -> Data {
+    Data("""
+    {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"\(accessibility)","input":"\(input)","local_topology":"\(localTopology)","session_topology":"\(sessionTopology)"}}
+    """.utf8)
 }
 
 private func decodeAgentResponse(_ json: String) throws -> AgentResponse {

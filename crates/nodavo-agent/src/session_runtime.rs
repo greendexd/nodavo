@@ -12,7 +12,7 @@ use nodavo_input::{InputEvent, NormalizedPosition};
 #[cfg(test)]
 use nodavo_local_ipc::ReadinessSnapshot;
 use nodavo_local_ipc::{
-    AgentStatus, FocusState as AgentFocusState, InputOwner, SessionTopologyReadiness,
+    AgentStatus, FocusState as AgentFocusState, InputOwner, PeerPlacement, SessionTopologyReadiness,
 };
 use nodavo_protocol::{
     Capability, ClipboardMessage, ControlMessage, DeviceId, EventMeta, GrantEpoch, ProtocolVersion,
@@ -75,6 +75,7 @@ pub(crate) struct SessionConfig {
     pub(crate) local_grant_epoch: GrantEpoch,
     pub(crate) peer_grants_to_local: Option<CapabilityGrants>,
     pub(crate) peer_grant_epoch: Option<GrantEpoch>,
+    pub(crate) peer_placement: PeerPlacement,
     pub(crate) existing_control: Option<ChannelId>,
 }
 
@@ -161,11 +162,24 @@ pub(crate) enum LocalSessionCommand {
         enabled: bool,
         acknowledgement: oneshot::Sender<Result<(), SessionRuntimeError>>,
     },
+    UpdatePeerPlacement {
+        placement: PeerPlacement,
+        acknowledgement: oneshot::Sender<Result<(), SessionRuntimeError>>,
+    },
     SendFiles {
         paths: Vec<PathBuf>,
         acknowledgement: oneshot::Sender<Result<TransferId, TransferError>>,
     },
     WakeTransferCancellation,
+}
+
+const fn placement_update_recovery_event(focus: CoreFocusState) -> Option<Event> {
+    match focus {
+        CoreFocusState::Local => None,
+        CoreFocusState::RequestingRemote { .. }
+        | CoreFocusState::ControllingRemote { .. }
+        | CoreFocusState::ControlledByRemote { .. } => Some(Event::ReconnectRequested),
+    }
 }
 
 pub(crate) fn command_channel() -> (
@@ -391,8 +405,11 @@ pub(crate) async fn run_peer_session(
         replaceable_sequence: 0,
         renewal_pending: false,
         routing_to_peer: false,
-        topology: PeerTopologyState::from_environment()
-            .map_err(|_| SessionRuntimeError::Platform)?,
+        topology: PeerTopologyState::from_environment(
+            config.peer_placement,
+            peer_grant.capabilities.contains(Capability::REMOTE_INPUT),
+        )
+        .map_err(|_| SessionRuntimeError::Platform)?,
         topology_refresh: LocalTopologyRefresh::default(),
         topology_initialized: false,
         clipboard,
@@ -545,6 +562,7 @@ impl PeerSession<'_> {
                             | LocalSessionCommand::LocalLocked { .. }
                             | LocalSessionCommand::LocalSleeping { .. }
                             | LocalSessionCommand::UpdateLocalGrant { .. }
+                            | LocalSessionCommand::UpdatePeerPlacement { .. }
                     );
                     if !priority {
                         self.preflight_local_topology_refresh(
@@ -620,6 +638,10 @@ impl PeerSession<'_> {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive command match keeps acknowledgement and safety ordering auditable"
+    )]
     async fn handle_local_command(
         &mut self,
         command: LocalSessionCommand,
@@ -708,6 +730,40 @@ impl PeerSession<'_> {
                 }
                 self.update_status().await;
                 return Ok(true);
+            }
+            LocalSessionCommand::UpdatePeerPlacement {
+                placement,
+                acknowledgement,
+            } => {
+                let recovery = placement_update_recovery_event(self.core.focus_state());
+                let result = if let Some(event) = recovery {
+                    match self.force_recovery(event).await {
+                        Ok(()) => Err(SessionRuntimeError::FocusRejected),
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    self.topology
+                        .set_peer_placement(placement)
+                        .map_err(|_| SessionRuntimeError::Platform)
+                };
+                if result.is_ok() {
+                    self.config.peer_placement = placement;
+                }
+                let failed = result.is_err();
+                let safety_failed =
+                    matches!(result, Err(SessionRuntimeError::SafetyRecoveryFailed));
+                let link_down = self.core.link_state() == LinkState::Down;
+                let _ = acknowledgement.send(result);
+                if link_down {
+                    return if safety_failed {
+                        Err(SessionRuntimeError::SafetyRecoveryFailed)
+                    } else {
+                        Ok(true)
+                    };
+                }
+                if failed {
+                    return Ok(false);
+                }
             }
             LocalSessionCommand::SendFiles {
                 paths,
@@ -1370,15 +1426,22 @@ impl PeerSession<'_> {
         let candidate = tokio::time::timeout(INITIAL_TOPOLOGY_TIMEOUT, acquisition)
             .await
             .map_err(|_| SessionRuntimeError::Platform)??;
-        if self.core.local_grant_allows_peer_input() {
+        let unpublished_local = if self.core.local_grant_allows_peer_input() {
             self.publish_local_candidate(candidate).await?;
+            false
         } else {
             self.topology
                 .commit_local_candidate(candidate)
                 .map_err(|_| SessionRuntimeError::Platform)?;
-        }
+            true
+        };
         let effects = self.core.handle(Event::LocalTopologyRefreshStarted);
         self.apply_local_effects(effects).await?;
+        if unpublished_local {
+            self.topology
+                .mark_unpublished_local_ready()
+                .map_err(|_| SessionRuntimeError::Platform)?;
+        }
 
         let needs_remote = self.core.peer_grant_allows_local_input();
         let needs_ack = self.core.local_grant_allows_peer_input();
@@ -1523,6 +1586,9 @@ impl PeerSession<'_> {
             self.platform.set_routing_to_peer(false)?;
             self.routing_to_peer = false;
             self.platform.pause_input_admission()?;
+            self.topology
+                .begin_local_transition()
+                .map_err(|_| SessionRuntimeError::Platform)?;
             if let Some(native_input) = native_input {
                 let mut admitted = admitted_input.into_iter().collect::<Vec<_>>();
                 admitted.extend(
@@ -1560,6 +1626,9 @@ impl PeerSession<'_> {
         if !changed {
             let effects = self.core.handle(Event::LocalTopologyRefreshUnchanged);
             self.apply_local_effects(effects).await?;
+            self.topology
+                .finish_unchanged_local_transition()
+                .map_err(|_| SessionRuntimeError::Platform)?;
             self.platform.resume_input_admission();
         } else if !self.core.local_grant_allows_peer_input() {
             let candidate = self
@@ -1571,6 +1640,9 @@ impl PeerSession<'_> {
                 .map_err(|_| SessionRuntimeError::Platform)?;
             let effects = self.core.handle(Event::LocalTopologyRefreshUnchanged);
             self.apply_local_effects(effects).await?;
+            self.topology
+                .mark_unpublished_local_ready()
+                .map_err(|_| SessionRuntimeError::Platform)?;
             self.platform.resume_input_admission();
             self.set_session_topology_readiness(SessionTopologyReadiness::Ready)
                 .await?;
@@ -2455,6 +2527,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn placement_during_requesting_remote_requires_exact_reconnect_recovery() {
+        let focus = CoreFocusState::RequestingRemote {
+            lease_id: LeaseId::new(7),
+            expires_at: MonotonicMillis::new(5_000),
+        };
+        assert_eq!(
+            placement_update_recovery_event(focus),
+            Some(Event::ReconnectRequested)
+        );
+    }
+
+    #[test]
+    fn placement_during_controlling_remote_requires_exact_reconnect_recovery() {
+        let focus = CoreFocusState::ControllingRemote {
+            lease_id: LeaseId::new(8),
+            expires_at: MonotonicMillis::new(5_000),
+        };
+        assert_eq!(
+            placement_update_recovery_event(focus),
+            Some(Event::ReconnectRequested)
+        );
+        assert_eq!(placement_update_recovery_event(CoreFocusState::Local), None);
+    }
+
     fn display_snapshot(native_id: u64, pixel_width: u32) -> NativeDisplaySnapshot {
         NativeDisplaySnapshot {
             native_id: nodavo_input::DisplayId::new(native_id),
@@ -2470,7 +2567,7 @@ mod tests {
 
     #[test]
     fn missing_refresh_ack_deadline_survives_a_dirty_storm_and_latest_wins() {
-        let mut topology = PeerTopologyState::from_environment().unwrap();
+        let mut topology = PeerTopologyState::from_environment(PeerPlacement::Right, true).unwrap();
         let mut refresh = LocalTopologyRefresh::default();
         refresh.arm_ack_deadline(MonotonicMillis::new(10));
 
@@ -2768,6 +2865,7 @@ mod tests {
                     local_grant_epoch: GrantEpoch::new(3),
                     peer_grants_to_local: Some(grants),
                     peer_grant_epoch: Some(GrantEpoch::new(7)),
+                    peer_placement: PeerPlacement::Right,
                     existing_control: None,
                 },
                 a_receiver,
@@ -2799,6 +2897,7 @@ mod tests {
                     local_grant_epoch: GrantEpoch::new(7),
                     peer_grants_to_local: Some(grants),
                     peer_grant_epoch: Some(GrantEpoch::new(3)),
+                    peer_placement: PeerPlacement::Right,
                     existing_control: None,
                 },
                 b_receiver,

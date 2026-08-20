@@ -27,6 +27,16 @@ public sealed partial class OverviewView : UserControl
         await _agent.EmergencyStopAsync();
     }
 
+    private async void FocusAcquireButton_Click(object sender, RoutedEventArgs args)
+    {
+        await _agent.RequestRemoteFocusAsync();
+    }
+
+    private async void FocusReleaseButton_Click(object sender, RoutedEventArgs args)
+    {
+        await _agent.ReleaseFocusAsync();
+    }
+
     private async void StartAgentButton_Click(object sender, RoutedEventArgs args)
     {
         await Lifecycle.StartAgentAsync();

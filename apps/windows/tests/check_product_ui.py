@@ -42,6 +42,11 @@ server_authenticator = (
     APP / "Services/AgentServerAuthenticator.cs"
 ).read_text(encoding="utf-8")
 devices = (APP / "Views/DevicesView.xaml.cs").read_text(encoding="utf-8")
+layout = (APP / "Views/LayoutView.xaml.cs").read_text(encoding="utf-8")
+layout_xaml = (APP / "Views/LayoutView.xaml").read_text(encoding="utf-8")
+placement_reducer = (
+    APP / "Models/PeerPlacementState.cs"
+).read_text(encoding="utf-8")
 transfers = (APP / "Views/TransfersView.xaml.cs").read_text(encoding="utf-8")
 transfers_xaml = (APP / "Views/TransfersView.xaml").read_text(encoding="utf-8")
 transfer_model = (APP / "Models/TransferSnapshot.cs").read_text(encoding="utf-8")
@@ -52,6 +57,13 @@ transfer_reducer = (
     APP / "ViewModels/TransfersViewModel.cs"
 ).read_text(encoding="utf-8")
 overview_xaml = (APP / "Views/OverviewView.xaml").read_text(encoding="utf-8")
+settings_xaml = (APP / "Views/SettingsView.xaml").read_text(encoding="utf-8")
+agent_view_model = (APP / "ViewModels/AgentViewModel.cs").read_text(encoding="utf-8")
+focus_reducer = (APP / "Models/FocusControlState.cs").read_text(encoding="utf-8")
+status_decoder = (APP / "Services/AgentStatusDecoder.cs").read_text(encoding="utf-8")
+error_decoder = (APP / "Services/AgentErrorEnvelopeDecoder.cs").read_text(
+    encoding="utf-8"
+)
 rust_runtime = (ROOT / "crates/nodavo-agent/src/runtime.rs").read_text(encoding="utf-8")
 agent_main = (ROOT / "crates/nodavo-agent/src/main.rs").read_text(encoding="utf-8")
 package_script = (ROOT / "scripts/package-windows.ps1").read_text(encoding="utf-8")
@@ -70,7 +82,10 @@ identity = json.loads(
 )
 
 dynamic_resource_prefixes = set(
-    re.findall(r'(?:ShowStatus|ShowTrustedStatus)\("([^"]+)"', devices + transfers)
+    re.findall(
+        r'(?:ShowStatus|ShowTrustedStatus)\("([^"]+)"',
+        devices + transfers + layout,
+    )
 )
 dynamic_resource_prefixes.update(("TrustedRevokeReconciling", "TrustedRevokeVerifying"))
 for prefix in dynamic_resource_prefixes:
@@ -111,6 +126,68 @@ lifecycle_resources = {
 }
 assert lifecycle_resources <= english, "missing lifecycle localization resources"
 
+focus_resources = {
+    "FocusLabel.Text",
+    "FocusAcquireButton.Content",
+    "FocusReleaseButton.Content",
+    "FocusStateLocal",
+    "FocusStateControllingPeer",
+    "FocusStateControlledByPeer",
+    "FocusStateUnavailable",
+    "FocusGuidanceReady",
+    "FocusGuidanceConnectPeer",
+    "FocusGuidanceWaitForReadiness",
+    "FocusGuidanceControllingPeer",
+    "FocusGuidanceControlledByPeer",
+    "FocusGuidanceAcquiring",
+    "FocusGuidanceAcquireLeaseWindow",
+    "FocusGuidanceReleasing",
+    "FocusGuidanceReconciling",
+    "FocusGuidanceEmergency",
+    "FocusGuidanceOutcomeUnknown",
+    "FocusGuidanceRejected",
+    "FocusGuidanceStatusUnavailable",
+}
+assert focus_resources <= english, "missing manual-focus localization resources"
+
+placement_resources = {
+    "LayoutPlacementDisabled",
+    "LayoutPlacementLeft",
+    "LayoutPlacementRight",
+    "LayoutPlacementAbove",
+    "LayoutPlacementBelow",
+    "LayoutPeerRevokedDisplay",
+    "LayoutLoadingTitle",
+    "LayoutLoadingMessage",
+    "LayoutLoadedTitle",
+    "LayoutLoadedMessage",
+    "LayoutEmptyTitle",
+    "LayoutEmptyMessage",
+    "LayoutTimeoutTitle",
+    "LayoutTimeoutMessage",
+    "LayoutFailedTitle",
+    "LayoutFailedMessage",
+    "LayoutReadyTitle",
+    "LayoutReadyMessage",
+    "LayoutSavingTitle",
+    "LayoutSavingMessage",
+    "LayoutSavedTitle",
+    "LayoutSavedMessage",
+    "LayoutReconcilingTitle",
+    "LayoutReconcilingMessage",
+    "LayoutReconciledAppliedTitle",
+    "LayoutReconciledAppliedMessage",
+    "LayoutReconciledNotAppliedTitle",
+    "LayoutReconciledNotAppliedMessage",
+    "LayoutPeerMissingTitle",
+    "LayoutPeerMissingMessage",
+    "LayoutPeerRevokedTitle",
+    "LayoutPeerRevokedMessage",
+    "LayoutOutcomeUnknownTitle",
+    "LayoutOutcomeUnknownMessage",
+}
+assert placement_resources <= english, "missing peer-placement localization resources"
+
 mutation_seconds = float(
     re.search(
         r"MutationRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)", client
@@ -134,11 +211,134 @@ transfer_cancel_seconds = float(
     ).group(1)
 )
 assert mutation_seconds > 10, "UI mutation deadline must exceed two agent 5s waits"
+placement_mutation_seconds = float(
+    re.search(
+        r"PlacementMutationRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)",
+        client,
+    ).group(1)
+)
+assert placement_mutation_seconds > 10
+assert "PlacementMutationRequestTimeout" != "MutationRequestTimeout"
 assert transfer_minutes * 60 > 305, "UI transfer deadline must exceed agent 5s + 5min waits"
 assert transfer_list_seconds == 8
 assert transfer_cancel_seconds == 8
 assert "TransferListRequestTimeout" != "TransferCancelRequestTimeout"
 assert "Duration::from_secs(5)" in rust_runtime
+
+focus_acquire_seconds = float(
+    re.search(
+        r"FocusAcquireRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)",
+        client,
+    ).group(1)
+)
+focus_release_seconds = float(
+    re.search(
+        r"FocusReleaseRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(([0-9.]+)\)",
+        client,
+    ).group(1)
+)
+assert focus_acquire_seconds == 15
+assert focus_release_seconds == 15
+assert "RemoteFocusLeaseMilliseconds = 5_000" in client
+assert re.search(r'RequestRemoteFocusEnvelope\(\s*"request_remote_focus"', client)
+assert 'CommandEnvelope("release_focus")' in client
+assert client.count("DecodeStatusResponse,") == 5
+assert 'RequireEvent(document.RootElement, "status")' in client
+assert "return AgentStatusDecoder.DecodeStatus(payload);" in client
+assert 'ReadRequiredEnum(\n                root,\n                "focus_state"' in status_decoder
+assert "RequireExactStatusFields(root);" in status_decoder
+for exact_status_field in (
+    '"event"',
+    '"phase"',
+    '"connected_peer"',
+    '"input_owner"',
+    '"focus_state"',
+    '"readiness"',
+):
+    assert exact_status_field in status_decoder
+assert "if (fields.Count != 6)" in status_decoder
+for exact_focus_state in ("local", "controlling_peer", "controlled_by_peer"):
+    assert f'"{exact_focus_state}"' in status_decoder
+
+for guard in (
+    "state.Context.HasConnectedPeer",
+    "state.Context.IsConnectedPhase",
+    "state.Context.IsInputReady",
+    "state.Context.IsLocalTopologyAvailable",
+    "state.Context.IsSessionTopologyReady",
+):
+    assert guard in focus_reducer, f"missing focus acquisition guard: {guard}"
+assert "state.Authority == FocusAuthority.Local" in focus_reducer
+assert "FocusAuthority.ControllingPeer or FocusAuthority.ControlledByPeer" in focus_reducer
+assert "AcquireLeaseMilliseconds = 5_000" in focus_reducer
+assert "generation != state.Generation" in focus_reducer
+assert "FocusOperationPhase.OutcomeUnknown" in focus_reducer
+assert agent_view_model.count("_client.RequestRemoteFocusAsync(") == 1
+assert agent_view_model.count("_client.ReleaseFocusAsync(") == 1
+assert "FocusOperationDeadline = TimeSpan.FromSeconds(30)" in agent_view_model
+assert "new CancellationTokenSource(FocusOperationDeadline)" in agent_view_model
+assert "FocusControlReducer.AcquireLeaseMilliseconds),\n                cancellationToken" in (
+    agent_view_model
+)
+assert "_focusOperationCancellation?.Cancel()" in agent_view_model
+assert "FocusControlReducer.BeginEmergency" in agent_view_model
+assert "FocusControlReducer.ApplyMutationStatus" in agent_view_model
+assert "FocusControlReducer.ApplyReconciledStatus" in agent_view_model
+assert agent_view_model.count(
+    "FocusActionContext context = CreateFocusContext(status);"
+) == 1
+deterministic_rejection = re.search(
+    r"private static bool IsDeterministicFocusRejection.*?;",
+    agent_view_model,
+    re.DOTALL,
+).group(0)
+assert 'exception.Code == "focus_rejected"' in deterministic_rejection
+assert "not_connected" not in deterministic_rejection
+for binding in (
+    "FocusStateText",
+    "CanRequestRemoteFocus",
+    "CanReleaseFocus",
+    "IsFocusOperationInProgress",
+    "FocusGuidanceText",
+):
+    assert binding in overview_xaml, f"missing Overview focus binding: {binding}"
+
+for exact_placement in ("disabled", "left", "right", "above", "below"):
+    assert f'"{exact_placement}"' in client
+    assert f'"{exact_placement}"' in placement_reducer
+assert '"set_peer_placement"' in client
+assert 'RequireEvent(root, "peer_placement_changed")' in client
+assert 'RequireExactFields(root, "event", "peer_id", "placement")' in client
+assert 'RequireExactFields(root, "event", "peers")' in client
+assert '"local_grants",\n                "placement"' in client
+assert "peerId != expectedPeerId || placement != expectedPlacement" in client
+assert '"placement_apply_failed"' in client
+assert layout.count("_client.SetPeerPlacementAsync(") == 1, (
+    "layout must never blindly resend a placement mutation"
+)
+assert layout.count("_client.ListTrustedPeersAsync(") == 2, (
+    "layout must use only initial/manual listing and status-only reconciliation"
+)
+assert "_unresolvedPeerIds.Add(peer.PeerId)" in layout
+assert "_unresolvedPeerIds.Clear()" in layout
+assert "PeerPlacementReducer.MarkAmbiguous" in layout
+assert "PeerPlacementReducer.BeginReconciliation" in layout
+assert "PeerPlacementReducer.FailReconciliation" in layout
+assert 'SelectedPeer() is not { State: "active" } peer' in layout
+assert "PlacementSelector.IsEnabled = !_requestInProgress && active && !unresolved" in layout
+assert "PeerSelector.IsEnabled = !_requestInProgress" in layout
+for control in (
+    "PeerSelector",
+    "PlacementSelector",
+    "ApplyPlacementButton",
+    "CurrentPlacementText",
+    "LayoutProgress",
+):
+    assert control in layout_xaml, f"missing layout control: {control}"
+assert "PeerPlacementOperationPhase.OutcomeUnknown" in placement_reducer
+assert "state.PendingPlacement != placement" in placement_reducer
+assert "state.PeerId != peerId" in placement_reducer
+assert "proposedPlacement != state.AuthoritativePlacement" in placement_reducer
 
 assert "_trustedRefreshGeneration" in devices
 assert "_trustedMutationGeneration" in devices
@@ -168,8 +368,11 @@ assert "_sendInProgress = false;" in transfers
 assert "TransferOutcomeUnknown" in transfers
 assert "MaximumSelectedPaths = 32" in client
 assert "MaximumSelectedPathBytes = 4 * 1024" in client
-assert 'ReadRequiredText(root, "message", MaximumErrorMessageLength)' in client
-assert "AllowedAgentErrorCodes.Contains(code)" in client
+assert "AgentErrorEnvelopeDecoder.TryDecode(" in client
+assert 'property.Name is not ("event" or "code" or "message")' in error_decoder
+assert "if (seen.Count != 3)" in error_decoder
+assert "!allowedCodes.Contains(code)" in error_decoder
+assert "Invalid local IPC error envelope." in error_decoder
 assert 'CommandEnvelope("list_transfers")' in client
 assert 'CancelTransferEnvelope("cancel_transfer", transferId)' in client
 assert "TransferListRequestTimeout" in client
@@ -280,6 +483,7 @@ test_project = (
     "Nodavo.Windows.Lifecycle.Tests.csproj"
 ).read_text(encoding="utf-8")
 for linked_source in (
+    "Models/PeerPlacementState.cs",
     "Models/TransferSnapshot.cs",
     "Services/TransferSnapshotDecoder.cs",
     "ViewModels/TransfersViewModel.cs",
@@ -423,6 +627,12 @@ emergency_button = re.search(
     r'<Button\s+x:Uid="EmergencyStopButton".*?/>', overview_xaml, re.DOTALL
 ).group(0)
 assert "IsEnabled" not in emergency_button, "lifecycle state must not disable emergency stop"
+settings_emergency_button = re.search(
+    r'<Button\s+x:Uid="EmergencyStopButton".*?/>', settings_xaml, re.DOTALL
+).group(0)
+assert "IsEnabled" not in settings_emergency_button, (
+    "focus/lifecycle state must not disable Settings emergency stop"
+)
 assert "FullTrustProcessLauncher" not in package_script
 assert "windows.startupTask" in package_script
 assert "ImmediateRegistration" in package_script
@@ -507,5 +717,6 @@ assert architecture_loop < release_private_import, (
 
 print(
     "Windows product UI static checks passed: resources, XML, deadlines, "
-    "trust ownership/reconciliation, transfer polling/retry/progress, and package auth policy"
+    "focus/trust/layout ownership and reconciliation, transfer polling/retry/progress, "
+    "and package auth policy"
 )

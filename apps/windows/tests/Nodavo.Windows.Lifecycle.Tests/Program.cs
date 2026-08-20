@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Nodavo.Windows.Models;
@@ -15,8 +16,12 @@ internal static class LifecycleTests
         AgentServerAuthPolicyAcceptsExactDevelopmentAndRelease();
         AgentServerAuthPolicyRejectsIncompleteOrAlteredMetadata();
         StatusReadinessDecoderIsStrictAndRedacted();
+        AgentErrorEnvelopeDecoderIsStrictAndRedacted();
         ReadinessReducerKeepsSignalsIndependent();
         ClientDeadlinesExceedServerBudgetsAndRemainDistinct();
+        FocusReducerIsBoundedFailClosedAndGenerationSafe();
+        FocusClientAndOverviewUseOneShotBilingualControls();
+        PeerPlacementReducerIsExactFailClosedAndGenerationSafe();
         TransferSnapshotDecoderAcceptsOnlyExactBoundedWireData();
         TransferSnapshotDecoderRejectsPrivateAndMalformedDataGenerically();
         TransferReducerGuardsInstanceRevisionGenerationAndCancelOwnership();
@@ -30,50 +35,133 @@ internal static class LifecycleTests
         await MissingAgentReachesBoundedTimeoutAsync();
         await ExternalCancellationPreventsLaunchAsync();
         Console.WriteLine(
-            "Windows agent status, readiness, lifecycle, race, and timeout tests passed.");
+            "Windows agent status, readiness, focus, placement, transfer, lifecycle, race, and timeout tests passed.");
     }
 
     private static void StatusReadinessDecoderIsStrictAndRedacted()
     {
         AgentStatusSnapshot snapshot = DecodeStatus(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"blocked_by_desktop","local_topology":"available","session_topology":"synchronizing"}}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"blocked_by_desktop","local_topology":"available","session_topology":"synchronizing"}}
             """);
         Assert(snapshot.Readiness.Accessibility == "not_applicable", "Windows accessibility must be not applicable");
         Assert(snapshot.Readiness.Input == "blocked_by_desktop", "input readiness must decode exactly");
         Assert(snapshot.Readiness.LocalTopology == "available", "local topology must decode exactly");
         Assert(snapshot.Readiness.SessionTopology == "synchronizing", "session topology must decode exactly");
+        Assert(snapshot.FocusState == "local", "focus state must decode exactly");
 
         AssertStatusRejected(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available"}}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "missing focus state must fail closed",
+            "focus_state");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"future_focus","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "unknown focus state must fail closed",
+            "future_focus");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","focus_state":"controlling_peer","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "duplicate focus state must fail closed",
+            "controlling_peer");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","phase":"connected","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "duplicate status fields must fail closed",
+            "connected");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"},"private":"secret"}
+            """,
+            "unknown root status fields must fail closed",
+            "secret");
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}}
+            """,
+            "connected_peer must be explicit in an authoritative status",
+            "connected_peer");
+
+        AssertStatusRejected(
+            """
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available"}}
             """,
             "missing readiness fields must fail closed",
             "not_applicable");
         AssertStatusRejected(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready","peer_secret":"do-not-expose"}}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready","peer_secret":"do-not-expose"}}
             """,
             "unknown readiness fields must fail closed",
             "do-not-expose");
         AssertStatusRejected(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"future_input_state","local_topology":"available","session_topology":"ready"}}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"future_input_state","local_topology":"available","session_topology":"ready"}}
             """,
             "unknown readiness values must fail closed",
             "future_input_state");
         AssertStatusRejected(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"granted","input":"ready","local_topology":"available","session_topology":"ready"}}
             """,
             "Windows must reject a non-applicable accessibility state",
             "granted");
         AssertStatusRejected(
             """
-            {"event":"status","phase":"ready","input_owner":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}
+            {"event":"status","phase":"ready","connected_peer":null,"input_owner":"local","focus_state":"local","readiness":{"accessibility":"not_applicable","input":"ready","local_topology":"available","session_topology":"ready"}
             """,
             "malformed status JSON must fail closed",
             "session_topology");
+    }
+
+    private static void AgentErrorEnvelopeDecoderIsStrictAndRedacted()
+    {
+        var allowed = new HashSet<string>(StringComparer.Ordinal) { "focus_rejected" };
+        using JsonDocument valid = JsonDocument.Parse(
+            """{"event":"error","code":"focus_rejected","message":"rejected"}""");
+        Assert(
+            AgentErrorEnvelopeDecoder.TryDecode(
+                valid.RootElement,
+                allowed,
+                1_024,
+                out string code) &&
+            code == "focus_rejected",
+            "the exact allowlisted focus rejection must decode deterministically");
+
+        string[] malformed =
+        {
+            """{"event":"error","event":"error","code":"focus_rejected","message":"rejected"}""",
+            """{"event":"error","code":"focus_rejected","code":"focus_rejected","message":"rejected"}""",
+            """{"event":"error","code":"focus_rejected","message":"rejected","private":"secret"}""",
+            """{"event":"error","code":"future","message":"rejected"}""",
+            """{"event":"error","code":"focus_rejected"}""",
+        };
+        foreach (string json in malformed)
+        {
+            try
+            {
+                using JsonDocument document = JsonDocument.Parse(json);
+                _ = AgentErrorEnvelopeDecoder.TryDecode(
+                    document.RootElement,
+                    allowed,
+                    1_024,
+                    out _);
+            }
+            catch (InvalidDataException exception)
+            {
+                Assert(
+                    !exception.Message.Contains("secret", StringComparison.Ordinal),
+                    "malformed error details must stay redacted");
+                continue;
+            }
+            throw new InvalidOperationException(
+                "malformed error envelopes must remain ambiguous and fail closed");
+        }
     }
 
     private static void ReadinessReducerKeepsSignalsIndependent()
@@ -139,6 +227,281 @@ internal static class LifecycleTests
                 client,
                 @"CommandEnvelope\(\""emergency_stop\""\),\s*EmergencyRequestTimeout"),
             "get-status and emergency-stop must use their dedicated client deadlines");
+    }
+
+    private static void FocusReducerIsBoundedFailClosedAndGenerationSafe()
+    {
+        var ready = new FocusActionContext(true, true, true, true, true);
+        FocusControlState state = FocusControlState.Initial with
+        {
+            Authority = FocusAuthority.Local,
+            Notice = FocusNotice.None,
+            Context = ready,
+        };
+        Assert(FocusControlReducer.CanAcquire(state),
+            "local focus with every independent readiness guard must admit acquisition");
+
+        foreach (FocusActionContext blocked in new[]
+        {
+            ready with { HasConnectedPeer = false },
+            ready with { IsConnectedPhase = false },
+            ready with { IsInputReady = false },
+            ready with { IsLocalTopologyAvailable = false },
+            ready with { IsSessionTopologyReady = false },
+        })
+        {
+            Assert(!FocusControlReducer.CanAcquire(state with { Context = blocked }),
+                "every connected/readiness predicate must independently guard acquisition");
+        }
+
+        state = FocusControlReducer.BeginAcquire(state, 11);
+        Assert(
+            state.Authority == FocusAuthority.Local &&
+            state.Phase == FocusOperationPhase.AcquireInFlight &&
+            !FocusControlReducer.CanAcquire(state),
+            "beginning acquisition must not optimistically move authority or admit another request");
+        state = FocusControlReducer.ApplyMutationStatus(
+            state,
+            11,
+            FocusAuthority.Local,
+            ready);
+        Assert(
+            state.Phase == FocusOperationPhase.AcquireLeaseWindow &&
+            FocusControlReducer.IsProgressVisible(state),
+            "a local acquisition response must remain locked through the lease window");
+        Assert(
+            FocusControlReducer.MarkAcquireLeaseWindowElapsed(state, 10) == state,
+            "a stale generation must not end the acquisition lease window");
+        state = FocusControlReducer.MarkAcquireLeaseWindowElapsed(state, 11);
+        Assert(state.Phase == FocusOperationPhase.AcquireReconciliation,
+            "the exact generation may begin one status-only reconciliation after the full window");
+        state = FocusControlReducer.ApplyReconciledStatus(
+            state,
+            11,
+            FocusAuthority.Local,
+            ready);
+        Assert(state.Phase == FocusOperationPhase.Idle && FocusControlReducer.CanAcquire(state),
+            "a fresh local status after the full lease window may unlock acquisition");
+
+        state = FocusControlReducer.BeginAcquire(state, 12);
+        state = FocusControlReducer.MarkAmbiguousMutation(state, 12);
+        Assert(state.Phase == FocusOperationPhase.AcquireLeaseWindow,
+            "an ambiguous acquisition must use the same complete lease-window reconciliation");
+        FocusControlState deadlineExpired = FocusControlReducer.FailReconciliation(state, 12);
+        Assert(deadlineExpired.Phase == FocusOperationPhase.OutcomeUnknown,
+            "the overall operation deadline must lock an unfinished lease-window reconciliation");
+        state = FocusControlReducer.BeginEmergency(state, 13);
+        FocusControlState afterStaleAcquire = FocusControlReducer.ApplyMutationStatus(
+            state,
+            12,
+            FocusAuthority.ControllingPeer,
+            ready);
+        Assert(afterStaleAcquire == state && state.Phase == FocusOperationPhase.EmergencyInFlight,
+            "emergency generation must supersede stale focus completion without optimistic local focus");
+        state = FocusControlReducer.ApplyMutationStatus(
+            state,
+            13,
+            FocusAuthority.Local,
+            ready);
+        Assert(state.Phase == FocusOperationPhase.Idle && state.Authority == FocusAuthority.Local,
+            "only the exact emergency status may establish local focus");
+
+        var unavailable = FocusActionContext.Unavailable;
+        state = state with
+        {
+            Authority = FocusAuthority.ControllingPeer,
+            Context = unavailable,
+        };
+        Assert(FocusControlReducer.CanRelease(state),
+            "an exact nonlocal focus state must allow release even when readiness is unavailable");
+        state = FocusControlReducer.BeginRelease(state, 14);
+        state = FocusControlReducer.ApplyMutationStatus(
+            state,
+            14,
+            FocusAuthority.Local,
+            ready);
+        Assert(state.Phase == FocusOperationPhase.Idle && state.Authority == FocusAuthority.Local,
+            "an exact local release response must complete immediately");
+
+        state = state with { Authority = FocusAuthority.ControlledByPeer };
+        state = FocusControlReducer.BeginRelease(state, 15);
+        state = FocusControlReducer.MarkAmbiguousMutation(state, 15);
+        Assert(state.Phase == FocusOperationPhase.ReleaseReconciliation,
+            "an ambiguous release must stay locked and reconcile without resending");
+        state = FocusControlReducer.FailReconciliation(state, 15);
+        Assert(
+            state.Phase == FocusOperationPhase.OutcomeUnknown &&
+            !FocusControlReducer.CanAcquire(state) &&
+            !FocusControlReducer.CanRelease(state),
+            "failed reconciliation must remain locked with no inferred ownership");
+        state = FocusControlReducer.BeginStatusRefresh(state, 16);
+        state = FocusControlReducer.ApplyReconciledStatus(
+            state,
+            16,
+            FocusAuthority.Local,
+            ready);
+        Assert(state.Phase == FocusOperationPhase.Idle && state.Authority == FocusAuthority.Local,
+            "a later explicit authoritative refresh may unlock an unknown outcome");
+        Assert(FocusControlReducer.AcquireLeaseMilliseconds == 5_000,
+            "acquisition reconciliation must retain the exact five-second lease window");
+    }
+
+    private static void FocusClientAndOverviewUseOneShotBilingualControls()
+    {
+        string repository = FindRepositoryRoot();
+        string client = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Services/AgentClient.cs"));
+        string viewModel = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/ViewModels/AgentViewModel.cs"));
+        string xaml = File.ReadAllText(Path.Combine(
+            repository,
+            "apps/windows/src/Nodavo.Windows/Views/OverviewView.xaml"));
+        Match statusTimeout = Regex.Match(
+            client,
+            @"StatusRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Match acquireTimeout = Regex.Match(
+            client,
+            @"FocusAcquireRequestTimeout\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Match overallTimeout = Regex.Match(
+            viewModel,
+            @"FocusOperationDeadline\s*=\s*TimeSpan\.FromSeconds\((\d+)\)");
+        Assert(
+            Regex.IsMatch(client, @"RemoteFocusLeaseMilliseconds\s*=\s*5_000") &&
+            Regex.IsMatch(client,
+                @"FocusReleaseRequestTimeout\s*=\s*TimeSpan\.FromSeconds\(15\)") &&
+            Regex.IsMatch(
+                client,
+                "RequestRemoteFocusEnvelope\\(\\s*\"request_remote_focus\"") &&
+            client.Contains("CommandEnvelope(\"release_focus\")", StringComparison.Ordinal),
+            "focus IPC must use the fixed lease and a dedicated fifteen-second release deadline");
+        Assert(
+            client.Contains("RequireEvent(document.RootElement, \"status\")",
+                StringComparison.Ordinal) &&
+            client.Contains("return AgentStatusDecoder.DecodeStatus(payload);",
+                StringComparison.Ordinal) &&
+            Regex.Matches(client, @"DecodeStatusResponse,").Count == 5,
+            "status calls must classify allowlisted error envelopes before strict focus decoding");
+        Assert(
+            statusTimeout.Success && acquireTimeout.Success && overallTimeout.Success &&
+            int.Parse(acquireTimeout.Groups[1].Value) + 5 +
+                int.Parse(statusTimeout.Groups[1].Value) <
+                int.Parse(overallTimeout.Groups[1].Value) &&
+            viewModel.Contains(
+                "new CancellationTokenSource(FocusOperationDeadline)",
+                StringComparison.Ordinal) &&
+            viewModel.Contains("_focusOperationCancellation?.Cancel()", StringComparison.Ordinal),
+            "the complete one-shot focus workflow must fit one linked thirty-second deadline and emergency cancellation");
+        Assert(
+            Regex.Matches(viewModel, @"_client\.RequestRemoteFocusAsync\(").Count == 1 &&
+            Regex.Matches(viewModel, @"_client\.ReleaseFocusAsync\(").Count == 1 &&
+            viewModel.Contains("FocusControlReducer.AcquireLeaseMilliseconds", StringComparison.Ordinal) &&
+            viewModel.Contains("_client.GetStatusAsync()", StringComparison.Ordinal),
+            "the view model must issue each focus mutation once and reconcile with status only");
+        Match deterministicRejection = Regex.Match(
+            viewModel,
+            @"private static bool IsDeterministicFocusRejection.*?;",
+            RegexOptions.Singleline);
+        Assert(
+            deterministicRejection.Success &&
+            deterministicRejection.Value.Contains("focus_rejected", StringComparison.Ordinal) &&
+            !deterministicRejection.Value.Contains("not_connected", StringComparison.Ordinal),
+            "only focus_rejected is deterministic; not_connected must reconcile as ambiguous");
+        Assert(
+            xaml.Contains("FocusStateText", StringComparison.Ordinal) &&
+            xaml.Contains("CanRequestRemoteFocus", StringComparison.Ordinal) &&
+            xaml.Contains("CanReleaseFocus", StringComparison.Ordinal) &&
+            xaml.Contains("IsFocusOperationInProgress", StringComparison.Ordinal) &&
+            xaml.Contains("FocusGuidanceText", StringComparison.Ordinal),
+            "Overview must expose focus state, guarded actions, progress, and guidance");
+    }
+
+    private static void PeerPlacementReducerIsExactFailClosedAndGenerationSafe()
+    {
+        PeerPlacementControlState state = PeerPlacementReducer.SelectAuthoritativePeer(
+            "peer-a",
+            PeerPlacement.Disabled,
+            isActive: true,
+            outcomeUnknown: false,
+            generation: 1);
+        Assert(
+            PeerPlacementReducer.CanMutate(state, PeerPlacement.Right) &&
+            !PeerPlacementReducer.CanMutate(state, PeerPlacement.Disabled),
+            "only a different placement on an active authoritative peer may be sent");
+
+        state = PeerPlacementReducer.BeginMutation(state, 2, PeerPlacement.Right);
+        Assert(
+            state.AuthoritativePlacement == PeerPlacement.Disabled &&
+            state.PendingPlacement == PeerPlacement.Right &&
+            state.Phase == PeerPlacementOperationPhase.MutationInFlight &&
+            !PeerPlacementReducer.CanMutate(state, PeerPlacement.Left),
+            "beginning a placement mutation must not optimistically change authority");
+        Assert(
+            PeerPlacementReducer.ApplyExactAcknowledgement(
+                state,
+                1,
+                "peer-a",
+                PeerPlacement.Right) == state &&
+            PeerPlacementReducer.ApplyExactAcknowledgement(
+                state,
+                2,
+                "peer-b",
+                PeerPlacement.Right) == state &&
+            PeerPlacementReducer.ApplyExactAcknowledgement(
+                state,
+                2,
+                "peer-a",
+                PeerPlacement.Left) == state,
+            "stale, cross-peer, and mismatched placement acknowledgements must be ignored");
+
+        state = PeerPlacementReducer.MarkAmbiguous(state, 2);
+        Assert(
+            state.Phase == PeerPlacementOperationPhase.OutcomeUnknown &&
+            !PeerPlacementReducer.CanMutate(state, PeerPlacement.Left),
+            "an ambiguous reply must lock the exact peer without assuming an outcome");
+        state = PeerPlacementReducer.BeginReconciliation(state, 2);
+        state = PeerPlacementReducer.FailReconciliation(state, 2);
+        Assert(
+            state.Phase == PeerPlacementOperationPhase.OutcomeUnknown,
+            "a failed authoritative list must retain the exact-peer lock");
+
+        state = PeerPlacementReducer.BeginReconciliation(state, 2);
+        state = PeerPlacementReducer.ApplyAuthoritativeReconciliation(
+            state,
+            2,
+            "peer-a",
+            PeerPlacement.Right,
+            isActive: true);
+        Assert(
+            state.Phase == PeerPlacementOperationPhase.Idle &&
+            state.AuthoritativePlacement == PeerPlacement.Right &&
+            state.PendingPlacement is null &&
+            PeerPlacementReducer.CanMutate(state, PeerPlacement.Above),
+            "only an exact authoritative list result may unlock an ambiguous peer");
+
+        PeerPlacementControlState revoked = PeerPlacementReducer.SelectAuthoritativePeer(
+            "peer-revoked",
+            PeerPlacement.Left,
+            isActive: false,
+            outcomeUnknown: false,
+            generation: 3);
+        Assert(
+            !PeerPlacementReducer.CanMutate(revoked, PeerPlacement.Right),
+            "revoked peers must never admit placement mutation");
+        Assert(
+            PeerPlacementWire.Encode(PeerPlacement.Below) == "below" &&
+            PeerPlacementWire.Decode("above") == PeerPlacement.Above,
+            "the placement wire codec must retain exact bounded names");
+        try
+        {
+            _ = PeerPlacementWire.Decode("diagonal");
+        }
+        catch (InvalidDataException)
+        {
+            return;
+        }
+        throw new InvalidOperationException("unknown placement wire values must fail closed");
     }
 
     private static void OverviewXamlHasBilingualReadinessResourcesAndNoAccessibilityAction()

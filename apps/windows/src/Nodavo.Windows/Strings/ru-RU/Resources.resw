@@ -22,6 +22,9 @@
   <data name="ConnectionHeading.Text" xml:space="preserve"><value>Подключение</value></data>
   <data name="PeerLabel.Text" xml:space="preserve"><value>Устройство</value></data>
   <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Источник ввода</value></data>
+  <data name="FocusLabel.Text" xml:space="preserve"><value>Фокус</value></data>
+  <data name="FocusAcquireButton.Content" xml:space="preserve"><value>Управлять устройством</value></data>
+  <data name="FocusReleaseButton.Content" xml:space="preserve"><value>Вернуть ввод сюда</value></data>
   <data name="RefreshButton.Content" xml:space="preserve"><value>Обновить статус</value></data>
   <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Аварийно отключить</value></data>
   <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha оболочка</value></data>
@@ -142,7 +145,50 @@
   <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Введите IP-адрес с портом или корректный экземпляр mDNS.</value></data>
   <data name="PairingTimedOut" xml:space="preserve"><value>Другой компьютер не ответил до завершения защищённого тайм-аута сопряжения.</value></data>
   <data name="LayoutTitle.Text" xml:space="preserve"><value>Расположение</value></data>
-  <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Расположение дисплеев и переход через край ещё разрабатываются.</value></data>
+  <data name="LayoutSubtitle.Text" xml:space="preserve"><value>Выберите один доверенный компьютер и расположите его у одного края этого ПК либо отключите переход через край для этого peer.</value></data>
+  <data name="LayoutRefresh.Content" xml:space="preserve"><value>Обновить расположение</value></data>
+  <data name="LayoutPeerSelector.Header" xml:space="preserve"><value>Доверенный компьютер</value></data>
+  <data name="LayoutPeerSelector.PlaceholderText" xml:space="preserve"><value>Выберите доверенный компьютер</value></data>
+  <data name="LayoutCurrentPlacementLabel.Text" xml:space="preserve"><value>Текущее авторитетное расположение</value></data>
+  <data name="LayoutPlacementSelector.Header" xml:space="preserve"><value>Запрошенное расположение</value></data>
+  <data name="LayoutApplyPlacement.Content" xml:space="preserve"><value>Применить расположение</value></data>
+  <data name="LayoutPlacementHelp.Text" xml:space="preserve"><value>Расположение хранится отдельно для каждого доверенного peer. «Отключено» запрещает переход через край; слева, справа, сверху и снизу используют соответствующий внешний край после синхронизации обеих топологий дисплеев.</value></data>
+  <data name="LayoutPreAlpha.Title" xml:space="preserve"><value>Pre-alpha исходники расположения</value></data>
+  <data name="LayoutPreAlpha.Message" xml:space="preserve"><value>Расположение для каждого peer и точный локальный IPC реализованы в исходниках. Поведение при mixed-DPI, hot-plug, RDP, блокировке и suspend ещё требует квалификации в Windows runtime.</value></data>
+  <data name="LayoutPlacementDisabled" xml:space="preserve"><value>Отключено</value></data>
+  <data name="LayoutPlacementLeft" xml:space="preserve"><value>Слева</value></data>
+  <data name="LayoutPlacementRight" xml:space="preserve"><value>Справа</value></data>
+  <data name="LayoutPlacementAbove" xml:space="preserve"><value>Сверху</value></data>
+  <data name="LayoutPlacementBelow" xml:space="preserve"><value>Снизу</value></data>
+  <data name="LayoutPeerRevokedDisplay" xml:space="preserve"><value>{0} (отозвано)</value></data>
+  <data name="LayoutLoadingTitle" xml:space="preserve"><value>Загрузка расположения</value></data>
+  <data name="LayoutLoadingMessage" xml:space="preserve"><value>Чтение ограниченного авторитетного списка доверенных peer из пользовательского агента.</value></data>
+  <data name="LayoutLoadedTitle" xml:space="preserve"><value>Расположение загружено</value></data>
+  <data name="LayoutLoadedMessage" xml:space="preserve"><value>Выберите активный доверенный компьютер и проверьте его текущее расположение перед изменением.</value></data>
+  <data name="LayoutEmptyTitle" xml:space="preserve"><value>Нет доверенных компьютеров</value></data>
+  <data name="LayoutEmptyMessage" xml:space="preserve"><value>Завершите сопряжение с подтверждением кода на экране «Устройства», прежде чем настраивать расположение.</value></data>
+  <data name="LayoutTimeoutTitle" xml:space="preserve"><value>Агент не ответил</value></data>
+  <data name="LayoutTimeoutMessage" xml:space="preserve"><value>Авторитетный запрос расположения достиг локального тайм-аута.</value></data>
+  <data name="LayoutFailedTitle" xml:space="preserve"><value>Расположение недоступно</value></data>
+  <data name="LayoutFailedMessage" xml:space="preserve"><value>Запустите пользовательский агент и обновите расположение доверенных peer.</value></data>
+  <data name="LayoutReadyTitle" xml:space="preserve"><value>Расположение готово</value></data>
+  <data name="LayoutReadyMessage" xml:space="preserve"><value>Выберите другое расположение и примените его один раз. Текущее значение не меняется, пока агент его не подтвердит.</value></data>
+  <data name="LayoutSavingTitle" xml:space="preserve"><value>Сохранение расположения</value></data>
+  <data name="LayoutSavingMessage" xml:space="preserve"><value>Выбранный peer заблокирован, пока агент сохраняет и применяет точное расположение.</value></data>
+  <data name="LayoutSavedTitle" xml:space="preserve"><value>Расположение сохранено</value></data>
+  <data name="LayoutSavedMessage" xml:space="preserve"><value>Агент подтвердил точный peer и расположение.</value></data>
+  <data name="LayoutReconcilingTitle" xml:space="preserve"><value>Результат расположения неизвестен</value></data>
+  <data name="LayoutReconcilingMessage" xml:space="preserve"><value>Подтверждение потеряно, некорректно или явная ошибка произошла после сохранения. Nodavo перечитывает авторитетное доверие без повторной отправки изменения.</value></data>
+  <data name="LayoutReconciledAppliedTitle" xml:space="preserve"><value>Расположение подтверждено после обновления</value></data>
+  <data name="LayoutReconciledAppliedMessage" xml:space="preserve"><value>Авторитетный список доверенных peer содержит запрошенное расположение.</value></data>
+  <data name="LayoutReconciledNotAppliedTitle" xml:space="preserve"><value>Расположение не применено</value></data>
+  <data name="LayoutReconciledNotAppliedMessage" xml:space="preserve"><value>В авторитетном списке доверенных peer осталось другое расположение.</value></data>
+  <data name="LayoutPeerMissingTitle" xml:space="preserve"><value>Доверенный компьютер больше не найден</value></data>
+  <data name="LayoutPeerMissingMessage" xml:space="preserve"><value>Авторитетный список больше не содержит точный peer. Результат расположения не предполагается.</value></data>
+  <data name="LayoutPeerRevokedTitle" xml:space="preserve"><value>Доверие к компьютеру отозвано</value></data>
+  <data name="LayoutPeerRevokedMessage" xml:space="preserve"><value>Отозванное доверие видно для проверки, но ему нельзя назначить расположение.</value></data>
+  <data name="LayoutOutcomeUnknownTitle" xml:space="preserve"><value>Результат расположения всё ещё неизвестен</value></data>
+  <data name="LayoutOutcomeUnknownMessage" xml:space="preserve"><value>Этот точный peer остаётся заблокирован. Перед следующей отправкой расположения обновление должно успешно загрузить авторитетный список доверия.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Передачи</value></data>
   <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Ставьте в очередь только файлы и папки, которые явно выбрали на этом ПК.</value></data>
   <data name="TransferAddFiles.Content" xml:space="preserve"><value>Добавить файлы…</value></data>
@@ -281,4 +327,21 @@
   <data name="NoPeer" xml:space="preserve"><value>Нет подключённого устройства</value></data>
   <data name="InputOwnerLocal" xml:space="preserve"><value>Этот ПК</value></data>
   <data name="InputOwnerRemote" xml:space="preserve"><value>Удалённое устройство</value></data>
+  <data name="FocusStateLocal" xml:space="preserve"><value>Локальный ввод</value></data>
+  <data name="FocusStateControllingPeer" xml:space="preserve"><value>Управление другим устройством</value></data>
+  <data name="FocusStateControlledByPeer" xml:space="preserve"><value>Управляет другое устройство</value></data>
+  <data name="FocusStateUnavailable" xml:space="preserve"><value>Недоступно</value></data>
+  <data name="FocusGuidanceReady" xml:space="preserve"><value>Запрос управления создаёт одну фиксированную lease на пять секунд. Nodavo не повторяет запрос с неизвестным результатом.</value></data>
+  <data name="FocusGuidanceConnectPeer" xml:space="preserve"><value>Подключите доверенное устройство до запроса удалённого фокуса.</value></data>
+  <data name="FocusGuidanceWaitForReadiness" xml:space="preserve"><value>Дождитесь готовности подключённой сессии, ввода, локальных дисплеев и peer-топологии.</value></data>
+  <data name="FocusGuidanceControllingPeer" xml:space="preserve"><value>Ввод направляется на другое устройство. Верните ввод сюда перед следующим действием с фокусом.</value></data>
+  <data name="FocusGuidanceControlledByPeer" xml:space="preserve"><value>Сейчас этим ПК управляет другое устройство. Верните ввод сюда или используйте аварийную остановку.</value></data>
+  <data name="FocusGuidanceAcquiring" xml:space="preserve"><value>Запрашивается одна focus lease на пять секунд. Этот mutation-запрос не будет повторён.</value></data>
+  <data name="FocusGuidanceAcquireLeaseWindow" xml:space="preserve"><value>Результат получения фокуса неизвестен. Элементы управления заблокированы на всё пятисекундное окно lease.</value></data>
+  <data name="FocusGuidanceReleasing" xml:space="preserve"><value>Ввод возвращается локально. Ожидается точный статус агента.</value></data>
+  <data name="FocusGuidanceReconciling" xml:space="preserve"><value>Авторитетный статус фокуса загружается без повторения focus mutation.</value></data>
+  <data name="FocusGuidanceEmergency" xml:space="preserve"><value>Аварийная остановка заменила любую предыдущую операцию с фокусом. Ожидается точный статус агента.</value></data>
+  <data name="FocusGuidanceOutcomeUnknown" xml:space="preserve"><value>Результат операции с фокусом всё ещё неизвестен. Элементы заблокированы до успешного обновления статуса; аварийная остановка остаётся доступной.</value></data>
+  <data name="FocusGuidanceRejected" xml:space="preserve"><value>Агент явно отклонил действие с фокусом. Проверьте готовность или верните фокус и повторите действие явно.</value></data>
+  <data name="FocusGuidanceStatusUnavailable" xml:space="preserve"><value>Обновите статус перед ручным управлением фокусом. Локальное или удалённое владение фокусом не предполагается.</value></data>
 </root>

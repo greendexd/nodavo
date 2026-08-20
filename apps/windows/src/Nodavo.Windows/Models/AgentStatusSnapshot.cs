@@ -4,6 +4,7 @@ internal sealed record AgentStatusSnapshot(
     string Phase,
     string? ConnectedPeer,
     string InputOwner,
+    string FocusState,
     AgentReadinessSnapshot Readiness);
 
 internal sealed record AgentReadinessSnapshot(
@@ -25,7 +26,8 @@ internal sealed record TrustedPeerSnapshot(
     string PeerId,
     string DisplayName,
     string State,
-    IReadOnlySet<string> LocalGrants)
+    IReadOnlySet<string> LocalGrants,
+    PeerPlacement Placement)
 {
     internal bool HasGrant(string capability) => LocalGrants.Contains(capability);
 }
@@ -34,5 +36,9 @@ internal sealed record CapabilityChangeSnapshot(
     string PeerId,
     string Capability,
     bool Enabled);
+
+internal sealed record PeerPlacementChangeSnapshot(
+    string PeerId,
+    PeerPlacement Placement);
 
 internal sealed record TransferQueuedSnapshot(string RedactedTransferId);

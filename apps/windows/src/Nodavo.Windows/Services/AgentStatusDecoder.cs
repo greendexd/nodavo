@@ -16,6 +16,7 @@ internal static class AgentStatusDecoder
                 MaxDepth = 8,
             });
             JsonElement root = document.RootElement;
+            RequireExactStatusFields(root);
             RequireEvent(root, "status");
 
             string phase = ReadRequiredEnum(
@@ -27,10 +28,16 @@ internal static class AgentStatusDecoder
                 "connected",
                 "stopping");
             string inputOwner = ReadRequiredEnum(root, "input_owner", "local", "remote");
+            string focusState = ReadRequiredEnum(
+                root,
+                "focus_state",
+                "local",
+                "controlling_peer",
+                "controlled_by_peer");
             string? connectedPeer = ReadOptionalPeer(root);
             AgentReadinessSnapshot readiness = DecodeReadiness(root);
 
-            return new AgentStatusSnapshot(phase, connectedPeer, inputOwner, readiness);
+            return new AgentStatusSnapshot(phase, connectedPeer, inputOwner, focusState, readiness);
         }
         catch (JsonException exception)
         {
@@ -91,6 +98,34 @@ internal static class AgentStatusDecoder
         }
 
         if (fields.Count != 4)
+        {
+            throw new InvalidDataException("Invalid agent status response.");
+        }
+    }
+
+    private static void RequireExactStatusFields(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidDataException("Invalid agent status response.");
+        }
+
+        var fields = new HashSet<string>(StringComparer.Ordinal);
+        foreach (JsonProperty property in root.EnumerateObject())
+        {
+            if (property.Name is not (
+                    "event" or
+                    "phase" or
+                    "connected_peer" or
+                    "input_owner" or
+                    "focus_state" or
+                    "readiness") ||
+                !fields.Add(property.Name))
+            {
+                throw new InvalidDataException("Invalid agent status response.");
+            }
+        }
+        if (fields.Count != 6)
         {
             throw new InvalidDataException("Invalid agent status response.");
         }

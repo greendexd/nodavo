@@ -43,11 +43,7 @@ struct MainWindow: View {
             case .devices:
                 DevicesView(model: model)
             case .layout:
-                PlaceholderSection(
-                    title: "section_layout",
-                    symbol: "square.grid.2x2",
-                    message: "layout_in_progress"
-                )
+                LayoutView(model: model)
             case .transfers:
                 TransfersView(model: model)
             case .settings:
@@ -184,7 +180,11 @@ private struct DevicesView: View {
                     Button("trusted_devices_refresh") {
                         model.refreshTrustedPeers()
                     }
-                    .disabled(model.trustedPeersIsLoading)
+                    .disabled(
+                        model.trustedPeersIsLoading
+                            || model.placementMutationInProgress
+                            || !model.deviceOperationPeerIDs.isEmpty
+                    )
                 }
             }
 
@@ -316,6 +316,139 @@ private extension TrustedPeerState {
         switch self {
         case .active: "checkmark.shield.fill"
         case .revoked: "xmark.shield"
+        }
+    }
+}
+
+private struct LayoutView: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section {
+                if model.trustedPeersIsLoading && model.trustedPeers.isEmpty {
+                    ProgressView("layout_loading")
+                } else if model.trustedPeers.isEmpty {
+                    Text("layout_no_devices")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("layout_device", selection: selectedPeerBinding) {
+                        ForEach(model.trustedPeers) { peer in
+                            Text(peer.displayName).tag(peer.peerID)
+                        }
+                    }
+                    .disabled(model.placementMutationInProgress)
+
+                    if let peer = model.selectedLayoutPeer {
+                        LabeledContent("layout_device_id", value: peer.redactedID)
+                        Label(peer.state.localizedKey, systemImage: peer.state.symbol)
+                            .foregroundStyle(peer.state == .active ? .green : .secondary)
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("layout_selected_device")
+                    Spacer()
+                    if model.trustedPeersIsLoading && !model.trustedPeers.isEmpty {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button("trusted_devices_refresh") {
+                        model.refreshTrustedPeers()
+                    }
+                    .disabled(
+                        model.trustedPeersIsLoading
+                            || model.placementMutationInProgress
+                            || !model.deviceOperationPeerIDs.isEmpty
+                    )
+                }
+            }
+
+            Section("layout_position") {
+                Picker("layout_position", selection: placementBinding) {
+                    ForEach(PeerPlacement.allCases) { placement in
+                        Label(placement.localizedKey, systemImage: placement.symbol)
+                            .tag(placement)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+                .disabled(!model.layoutCanChangePlacement)
+
+                if model.placementMutationInProgress {
+                    ProgressView("layout_saving")
+                }
+                if model.selectedLayoutPeer?.state == .revoked {
+                    Label("layout_revoked_help", systemImage: "xmark.shield")
+                        .foregroundStyle(.secondary)
+                } else if model.selectedLayoutPlacementOutcomeUnknown {
+                    Label("layout_outcome_unknown_help", systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            Section("layout_how_it_works") {
+                Text("layout_explanation")
+                    .foregroundStyle(.secondary)
+                Text("layout_disabled_explanation")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let errorKey = model.layoutErrorKey {
+                Section {
+                    Label(LocalizedStringKey(errorKey), systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.red)
+                }
+            }
+
+            Section {
+                Label("layout_prealpha_notice", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle("section_layout")
+        .onAppear {
+            if model.trustedPeersState == .idle {
+                model.refreshTrustedPeers()
+            }
+        }
+    }
+
+    private var selectedPeerBinding: Binding<String> {
+        Binding(
+            get: { model.selectedLayoutPeerID ?? "" },
+            set: { model.selectLayoutPeer($0) }
+        )
+    }
+
+    private var placementBinding: Binding<PeerPlacement> {
+        Binding(
+            get: { model.selectedLayoutPeer?.placement ?? .disabled },
+            set: { model.setSelectedPeerPlacement($0) }
+        )
+    }
+}
+
+private extension PeerPlacement {
+    var localizedKey: LocalizedStringKey {
+        switch self {
+        case .disabled: "layout_placement_disabled"
+        case .left: "layout_placement_left"
+        case .right: "layout_placement_right"
+        case .above: "layout_placement_above"
+        case .below: "layout_placement_below"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .disabled: "nosign"
+        case .left: "arrow.left.square"
+        case .right: "arrow.right.square"
+        case .above: "arrow.up.square"
+        case .below: "arrow.down.square"
         }
     }
 }
@@ -607,10 +740,19 @@ private struct OverviewView: View {
 
             HStack {
                 Button("control_peer") { model.requestRemoteFocus() }
-                    .disabled(model.connectedPeer == nil || model.focusState != "local")
+                    .disabled(!model.focusCanRequestRemote)
                 Button("return_focus") { model.releaseFocus() }
-                    .disabled(model.connectedPeer == nil || model.focusState == "local")
+                    .disabled(!model.focusCanRelease)
                 Button("emergency_stop", role: .destructive) { model.emergencyStop() }
+                if model.focusOperationInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+            }
+
+            if model.focusOutcomeUnknown {
+                Label("focus_outcome_unknown", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
             }
 
             Spacer()
@@ -840,27 +982,5 @@ private extension SessionTopologyReadiness {
         case .synchronizing: "readiness_session_synchronizing"
         case .ready: "readiness_session_ready"
         }
-    }
-}
-
-private struct PlaceholderSection: View {
-    let title: LocalizedStringKey
-    let symbol: String
-    let message: LocalizedStringKey
-
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: symbol)
-                .font(.system(size: 42))
-                .foregroundStyle(.secondary)
-            Text(title)
-                .font(.title2.bold())
-            Text(message)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .navigationTitle(title)
     }
 }

@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 12 -->
+<!-- doc-id: architecture; lang: ru; translation-of: architecture.md; revision: 13 -->
 
 # Архитектура
 
@@ -86,6 +86,8 @@ Activation обновления намеренно находится вне р�
 
 Display hot-plug является session transaction, а не изменением geometry на месте. Platform callbacks только помечают coalesced dirty generation. Владелец session закрывает routing admission, дренирует уже принятый input под старой lease, возвращает focus локально, проверяет стабильный ограниченный полный graph со свежими process-local identities, заменяет active-only native/session map и публикует новую topology revision. Новый focus недоступен до acknowledgement точной revision. Повторные изменения сохраняют только последнюю candidate и не продлевают фиксированный refresh deadline; safety, revoke и disconnect остаются более приоритетными transitions.
 
+Каждая trust record хранит одно семантическое placement peer: отключено, слева, справа, сверху или снизу. Native и session display identifiers не сохраняются. После commit обеих актуальных topologies, активного peer input grant и точного acknowledgement каждой локальной revision, directionally опубликованной для inbound control, session выводит из placement не более 32 детерминированных exterior `Stretch` routes. Outbound-only локальный graph намеренно не публикуется и требует только того же стабильного committed snapshot. Topology transition, снятие grant или смена placement очищает derived routes; focus recovery и восстановление local ownership очищают active route и pending pointer entry. Placement mutation сначала сохраняется; если focus не локален, session восстанавливает ownership и отключается, после чего UI сверяет authoritative сохранённое значение. Native shells отправляют mutation один раз и после неоднозначного acknowledgement используют listing trusted peers, а не повторную отправку.
+
 Capture и injection macOS используют один immutable process snapshot из CoreGraphics. Capture и injection Windows используют один process-singleton display service с per-monitor-v2 awareness, DisplayConfig identities, ранним broadcast wake и authoritative polling. Обе платформы связывают suppression с callback/admission barrier, поэтому input нельзя принять удалённо после его возврата локальной OS. Native owners после timeout poison’ят restart в этом process вместо допуска пересекающихся capture, hooks или injectors.
 
 ## Discovery и pairing
@@ -118,7 +120,7 @@ Agent 1.0 по умолчанию работает в user session. Privileged W
 
 ## Локальные сигналы готовности
 
-Через аутентифицированный UI-протокол агент публикует один ограниченный snapshot готовности без пользовательского контента. Локальный ввод, обнаружение локальных дисплеев и синхронизация аутентифицированной peer-топологии — независимые сигналы: доступный дисплей не означает, что layout второго устройства готов. Peer-топология получает состояние `synchronizing` при установлении соединения и становится готовой только после установки точной удалённой topology и совпадающего acknowledgement локальной revision; любой teardown или recovery возвращает `not_connected`.
+Через аутентифицированный UI-протокол агент публикует один ограниченный snapshot готовности без пользовательского контента. Локальный ввод, обнаружение локальных дисплеев и синхронизация аутентифицированной peer-топологии — независимые сигналы: доступный дисплей не означает, что layout второго устройства готов. Peer-топология получает состояние `synchronizing` при установлении соединения и становится готовой только после установки точной remote topology и либо точного acknowledgement локальной revision, опубликованной для inbound control, либо намеренно unpublished local graph при отсутствии inbound input grant; любой teardown или recovery возвращает `not_connected`.
 
 Platform probes выполняются вне async dispatcher с конечным deadline и коротким cache. Они проверяют только trust/default-desktop state, обнаружение дисплеев, capability API и создание prerequisite injector, который не отправляет events; capture runtime не создаётся и не регистрируется, ввод не route, suppress или inject. Поэтому `ready` означает текущую доступность локальных prerequisites, а не выполненный live capture. Явное действие macOS запрашивает Accessibility от identity агента, игнорирует возвращаемое prompt API значение и сразу повторно проверяет фактический trust. В Windows нет Accessibility action: не-default или secure input desktop только обозначается как blocked, без предложения elevation или secure-desktop control. Public snapshot не содержит paths, process IDs, native display IDs, desktop names, peer identifiers или permission-prompt metadata.
 

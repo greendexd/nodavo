@@ -1,9 +1,10 @@
-//! Session-local native/display topology boundary and edge policy.
+//! Session-local native/display topology boundary and per-peer placement policy.
 //!
 //! Native identifiers stay in [`LocalDisplayMap`]. Only fresh session-scoped
 //! identifiers enter topology messages or pointer payloads.
 
 use nodavo_input::{DisplayId, InputEvent, NormalizedAxis, NormalizedPosition};
+use nodavo_local_ipc::PeerPlacement;
 use nodavo_protocol::{
     DisplayDescriptor, DisplayRotation, DisplayTopology, MAX_TOPOLOGY_DISPLAYS, SessionDisplayId,
 };
@@ -18,6 +19,7 @@ const DEFAULT_HYSTERESIS_MILLI: u32 = 12_000;
 const DEFAULT_ENTRY_INSET_MILLI: u32 = 4_000;
 const DEFAULT_DEBOUNCE_MS: u32 = 80;
 const DEFAULT_COOLDOWN_MS: u32 = 300;
+const MAX_DERIVED_EDGE_ROUTES: usize = 32;
 
 /// Platform-owned geometry converted to bounded integer units before it enters
 /// session policy. `native_id` never leaves this process.
@@ -208,29 +210,26 @@ pub(crate) struct PeerTopologyState {
     remote: Option<DisplayTopology>,
     published_local_revision: Option<u64>,
     ready_local_revision: Option<u64>,
+    local_transition_pending: bool,
     edge: EdgeSwitchController,
     routes: Vec<EdgeRoute>,
+    placement: PeerPlacement,
+    peer_input_granted: bool,
+    activation_band_milli: u32,
+    hysteresis_milli: u32,
     entry_inset_milli: u32,
+    debounce_ms: u32,
+    cooldown_ms: u32,
     active_route: Option<EdgeRoute>,
     pending_target: Option<InputEvent>,
 }
 
 impl PeerTopologyState {
-    pub(crate) fn from_environment() -> Result<Self, TopologyRuntimeError> {
-        let routes = parse_routes(std::env::var("NODAVO_EDGE_ROUTES").ok().as_deref())?;
-        #[cfg(test)]
-        let routes = if routes.is_empty() {
-            vec![EdgeRoute::new(
-                SessionDisplayId::new(1),
-                DisplayEdge::Right,
-                SessionDisplayId::new(1),
-                DisplayEdge::Left,
-                EdgeAlignment::Stretch,
-                true,
-            )]
-        } else {
-            routes
-        };
+    pub(crate) fn from_environment(
+        placement: PeerPlacement,
+        peer_input_granted: bool,
+    ) -> Result<Self, TopologyRuntimeError> {
+        let routes = Vec::new();
         let activation = env_u32(
             "NODAVO_EDGE_ACTIVATION_MILLI",
             DEFAULT_ACTIVATION_BAND_MILLI,
@@ -254,9 +253,16 @@ impl PeerTopologyState {
             remote: None,
             published_local_revision: None,
             ready_local_revision: None,
+            local_transition_pending: false,
             edge: EdgeSwitchController::new(config),
             routes,
+            placement,
+            peer_input_granted,
+            activation_band_milli: activation,
+            hysteresis_milli: hysteresis,
             entry_inset_milli: entry_inset,
+            debounce_ms: debounce,
+            cooldown_ms: cooldown,
             active_route: None,
             pending_target: None,
         })
@@ -279,31 +285,74 @@ impl PeerTopologyState {
             remote: None,
             published_local_revision: None,
             ready_local_revision: None,
+            local_transition_pending: false,
             edge: EdgeSwitchController::new(config),
             routes,
+            placement: PeerPlacement::Right,
+            peer_input_granted: true,
+            activation_band_milli: DEFAULT_ACTIVATION_BAND_MILLI,
+            hysteresis_milli: DEFAULT_HYSTERESIS_MILLI,
             entry_inset_milli: DEFAULT_ENTRY_INSET_MILLI,
+            debounce_ms: 0,
+            cooldown_ms: 0,
             active_route: None,
             pending_target: None,
         }
     }
 
     pub(crate) fn prepare_local_candidate(
-        &self,
+        &mut self,
         snapshots: &[NativeDisplaySnapshot],
     ) -> Result<Option<LocalTopologyCandidate>, TopologyRuntimeError> {
-        self.local.prepare_reconcile(snapshots)
+        let candidate = match self.local.prepare_reconcile(snapshots) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                self.local_transition_pending = true;
+                let _ = self.clear_derived_routes();
+                return Err(error);
+            }
+        };
+        if candidate.is_some() {
+            self.local_transition_pending = true;
+            self.clear_derived_routes()?;
+        }
+        Ok(candidate)
+    }
+
+    pub(crate) fn begin_local_transition(&mut self) -> Result<(), TopologyRuntimeError> {
+        self.local_transition_pending = true;
+        self.clear_derived_routes()
+    }
+
+    pub(crate) fn finish_unchanged_local_transition(&mut self) -> Result<(), TopologyRuntimeError> {
+        if self.local.topology().is_none() {
+            return Err(TopologyRuntimeError::DisplayMappingUnavailable);
+        }
+        self.local_transition_pending = false;
+        self.rebuild_routes()
     }
 
     pub(crate) fn commit_local_candidate(
         &mut self,
         candidate: LocalTopologyCandidate,
     ) -> Result<DisplayTopology, TopologyRuntimeError> {
-        self.local.commit(candidate)
+        let topology = self.local.commit(candidate)?;
+        Ok(topology)
+    }
+
+    pub(crate) fn mark_unpublished_local_ready(&mut self) -> Result<(), TopologyRuntimeError> {
+        if self.local.topology().is_none() || self.published_local_revision.is_some() {
+            return Err(TopologyRuntimeError::UnexpectedAcknowledgement);
+        }
+        self.local_transition_pending = false;
+        self.rebuild_routes()
     }
 
     pub(crate) fn invalidate_local_authorization(&mut self) {
         self.published_local_revision = None;
         self.ready_local_revision = None;
+        self.local_transition_pending = true;
+        let _ = self.clear_derived_routes();
     }
 
     pub(crate) fn invalidate_remote_authorization(&mut self) {
@@ -311,6 +360,7 @@ impl PeerTopologyState {
         self.remote = None;
         self.active_route = None;
         self.pending_target = None;
+        let _ = self.clear_derived_routes();
     }
 
     pub(crate) fn stage_remote(
@@ -321,6 +371,7 @@ impl PeerTopologyState {
         if topology.revision() != authorized_revision {
             return Err(TopologyRuntimeError::RevisionMismatch);
         }
+        self.clear_derived_routes()?;
         self.staged_remote = Some(topology);
         Ok(())
     }
@@ -337,12 +388,23 @@ impl PeerTopologyState {
             return Err(TopologyRuntimeError::RevisionMismatch);
         }
         self.remote = Some(staged);
+        self.rebuild_routes()?;
         Ok(())
+    }
+
+    pub(crate) fn set_peer_placement(
+        &mut self,
+        placement: PeerPlacement,
+    ) -> Result<(), TopologyRuntimeError> {
+        self.placement = placement;
+        self.rebuild_routes()
     }
 
     pub(crate) fn record_local_publish(&mut self, revision: u64) {
         self.published_local_revision = Some(revision);
         self.ready_local_revision = None;
+        self.local_transition_pending = true;
+        let _ = self.clear_derived_routes();
     }
 
     #[must_use]
@@ -352,8 +414,11 @@ impl PeerTopologyState {
 
     #[must_use]
     pub(crate) fn local_is_ready(&self) -> bool {
-        self.published_local_revision.is_some()
-            && self.published_local_revision == self.ready_local_revision
+        !self.local_transition_pending
+            && self.local.topology().is_some()
+            && self
+                .published_local_revision
+                .is_none_or(|published| self.ready_local_revision == Some(published))
     }
 
     pub(crate) fn mark_local_ready(&mut self, revision: u64) -> Result<(), TopologyRuntimeError> {
@@ -361,7 +426,8 @@ impl PeerTopologyState {
             return Err(TopologyRuntimeError::UnexpectedAcknowledgement);
         }
         self.ready_local_revision = Some(revision);
-        Ok(())
+        self.local_transition_pending = false;
+        self.rebuild_routes()
     }
 
     pub(crate) fn prepare_manual_focus(&mut self) -> Result<(), TopologyRuntimeError> {
@@ -395,6 +461,16 @@ impl PeerTopologyState {
         focus: FocusState,
         now: MonotonicMillis,
     ) -> Result<LocalPointerAction, TopologyRuntimeError> {
+        if self.routes.is_empty() {
+            return Ok(match focus {
+                FocusState::RequestingRemote { .. } | FocusState::ControllingRemote { .. } => {
+                    LocalPointerAction::Suppressed
+                }
+                FocusState::Local | FocusState::ControlledByRemote { .. } => {
+                    LocalPointerAction::Local
+                }
+            });
+        }
         let session = self
             .local
             .session_id(position.display())
@@ -461,9 +537,159 @@ impl PeerTopologyState {
         self.pending_target = None;
     }
 
+    fn clear_derived_routes(&mut self) -> Result<(), TopologyRuntimeError> {
+        self.routes.clear();
+        self.active_route = None;
+        self.pending_target = None;
+        self.edge.replace_config(edge_config(
+            Vec::new(),
+            self.activation_band_milli,
+            self.hysteresis_milli,
+            self.entry_inset_milli,
+            self.debounce_ms,
+            self.cooldown_ms,
+        )?);
+        Ok(())
+    }
+
+    fn rebuild_routes(&mut self) -> Result<(), TopologyRuntimeError> {
+        self.active_route = None;
+        self.pending_target = None;
+        let routes =
+            if self.peer_input_granted && self.local_is_ready() && self.staged_remote.is_none() {
+                self.local
+                    .topology()
+                    .zip(self.remote.as_ref())
+                    .map_or_else(Vec::new, |(local, remote)| {
+                        derive_exterior_routes(self.placement, local, remote)
+                    })
+            } else {
+                Vec::new()
+            };
+        let config = edge_config(
+            routes.clone(),
+            self.activation_band_milli,
+            self.hysteresis_milli,
+            self.entry_inset_milli,
+            self.debounce_ms,
+            self.cooldown_ms,
+        )?;
+        self.routes = routes;
+        self.edge.replace_config(config);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn remote(&self) -> Option<&DisplayTopology> {
         self.remote.as_ref()
+    }
+}
+
+fn edge_config(
+    routes: Vec<EdgeRoute>,
+    activation_band_milli: u32,
+    hysteresis_milli: u32,
+    entry_inset_milli: u32,
+    debounce_ms: u32,
+    cooldown_ms: u32,
+) -> Result<EdgeSwitchConfig, TopologyRuntimeError> {
+    EdgeSwitchConfig::new(
+        routes,
+        activation_band_milli,
+        hysteresis_milli,
+        entry_inset_milli,
+        debounce_ms,
+        cooldown_ms,
+    )
+    .map_err(|_| TopologyRuntimeError::InvalidEdgeConfiguration)
+}
+
+fn derive_exterior_routes(
+    placement: PeerPlacement,
+    local: &DisplayTopology,
+    remote: &DisplayTopology,
+) -> Vec<EdgeRoute> {
+    let Some((source_edge, destination_edge)) = placement_edges(placement) else {
+        return Vec::new();
+    };
+    let sources = exterior_displays(local, source_edge);
+    let destinations = exterior_displays(remote, destination_edge);
+    if sources.is_empty() || destinations.is_empty() {
+        return Vec::new();
+    }
+    let source_count = sources.len();
+    let destination_count = destinations.len();
+    sources
+        .into_iter()
+        .take(MAX_DERIVED_EDGE_ROUTES)
+        .enumerate()
+        .map(|(index, source)| {
+            // Pair the centers of the ordered exterior spans. This stays
+            // deterministic when the two workstations expose different counts.
+            let destination_index = ((2 * index + 1) * destination_count) / (2 * source_count);
+            let destination = destinations[destination_index.min(destination_count - 1)];
+            EdgeRoute::new(
+                source.id(),
+                source_edge,
+                destination.id(),
+                destination_edge,
+                EdgeAlignment::Stretch,
+                true,
+            )
+        })
+        .collect()
+}
+
+const fn placement_edges(placement: PeerPlacement) -> Option<(DisplayEdge, DisplayEdge)> {
+    match placement {
+        PeerPlacement::Disabled => None,
+        PeerPlacement::Left => Some((DisplayEdge::Left, DisplayEdge::Right)),
+        PeerPlacement::Right => Some((DisplayEdge::Right, DisplayEdge::Left)),
+        PeerPlacement::Above => Some((DisplayEdge::Top, DisplayEdge::Bottom)),
+        PeerPlacement::Below => Some((DisplayEdge::Bottom, DisplayEdge::Top)),
+    }
+}
+
+fn exterior_displays(topology: &DisplayTopology, edge: DisplayEdge) -> Vec<&DisplayDescriptor> {
+    let exterior = topology
+        .displays()
+        .iter()
+        .map(|display| edge_coordinate(display, edge))
+        .reduce(|left, right| match edge {
+            DisplayEdge::Left | DisplayEdge::Top => left.min(right),
+            DisplayEdge::Right | DisplayEdge::Bottom => left.max(right),
+        });
+    let Some(exterior) = exterior else {
+        return Vec::new();
+    };
+    let mut displays = topology
+        .displays()
+        .iter()
+        .filter(|display| edge_coordinate(display, edge) == exterior)
+        .collect::<Vec<_>>();
+    displays.sort_unstable_by_key(|display| match edge {
+        DisplayEdge::Left | DisplayEdge::Right => {
+            (i64::from(display.origin_y_milli()), display.id().get())
+        }
+        DisplayEdge::Top | DisplayEdge::Bottom => {
+            (i64::from(display.origin_x_milli()), display.id().get())
+        }
+    });
+    displays
+}
+
+fn edge_coordinate(display: &DisplayDescriptor, edge: DisplayEdge) -> i64 {
+    match edge {
+        DisplayEdge::Left => i64::from(display.origin_x_milli()),
+        DisplayEdge::Right => {
+            i64::from(display.origin_x_milli())
+                + i64::try_from(display.logical_width_milli()).unwrap_or(i64::MAX)
+        }
+        DisplayEdge::Top => i64::from(display.origin_y_milli()),
+        DisplayEdge::Bottom => {
+            i64::from(display.origin_y_milli())
+                + i64::try_from(display.logical_height_milli()).unwrap_or(i64::MAX)
+        }
     }
 }
 
@@ -508,61 +734,6 @@ fn env_u32(name: &str, default: u32) -> Result<u32, TopologyRuntimeError> {
     })
 }
 
-fn parse_routes(value: Option<&str>) -> Result<Vec<EdgeRoute>, TopologyRuntimeError> {
-    let Some(value) = value.filter(|value| !value.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    value
-        .split(',')
-        .map(|route| {
-            let (source, destination) = route
-                .split_once('>')
-                .ok_or(TopologyRuntimeError::InvalidEdgeConfiguration)?;
-            let (destination, alignment) = destination
-                .rsplit_once(':')
-                .ok_or(TopologyRuntimeError::InvalidEdgeConfiguration)?;
-            let (source_display, source_edge) = parse_endpoint(source)?;
-            let (destination_display, destination_edge) = parse_endpoint(destination)?;
-            Ok(EdgeRoute::new(
-                source_display,
-                source_edge,
-                destination_display,
-                destination_edge,
-                parse_alignment(alignment)?,
-                true,
-            ))
-        })
-        .collect()
-}
-
-fn parse_endpoint(value: &str) -> Result<(SessionDisplayId, DisplayEdge), TopologyRuntimeError> {
-    let (display, edge) = value
-        .split_once(':')
-        .ok_or(TopologyRuntimeError::InvalidEdgeConfiguration)?;
-    let display = display
-        .parse()
-        .map(SessionDisplayId::new)
-        .map_err(|_| TopologyRuntimeError::InvalidEdgeConfiguration)?;
-    let edge = match edge {
-        "left" => DisplayEdge::Left,
-        "right" => DisplayEdge::Right,
-        "top" => DisplayEdge::Top,
-        "bottom" => DisplayEdge::Bottom,
-        _ => return Err(TopologyRuntimeError::InvalidEdgeConfiguration),
-    };
-    Ok((display, edge))
-}
-
-fn parse_alignment(value: &str) -> Result<EdgeAlignment, TopologyRuntimeError> {
-    match value {
-        "start" => Ok(EdgeAlignment::Start),
-        "center" => Ok(EdgeAlignment::Center),
-        "end" => Ok(EdgeAlignment::End),
-        "stretch" => Ok(EdgeAlignment::Stretch),
-        _ => Err(TopologyRuntimeError::InvalidEdgeConfiguration),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use nodavo_protocol::TopologyValidationError;
@@ -580,6 +751,24 @@ mod tests {
             1_000,
             DisplayRotation::Degrees0,
         )
+    }
+
+    fn positioned_descriptor(
+        id: u32,
+        horizontal_origin: i32,
+        vertical_origin: i32,
+    ) -> DisplayDescriptor {
+        DisplayDescriptor::new(
+            SessionDisplayId::new(id),
+            horizontal_origin,
+            vertical_origin,
+            1_920,
+            1_080,
+            1_000,
+            1_000,
+            DisplayRotation::Degrees0,
+        )
+        .unwrap()
     }
 
     fn topology(revision: u64) -> Result<DisplayTopology, TopologyValidationError> {
@@ -736,20 +925,6 @@ mod tests {
     }
 
     #[test]
-    fn route_parser_requires_fully_explicit_adjacency() {
-        assert_eq!(parse_routes(None), Ok(Vec::new()));
-        let routes = parse_routes(Some("1:right>2:left:center")).unwrap();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].source_display(), SessionDisplayId::new(1));
-        assert_eq!(routes[0].destination_display(), SessionDisplayId::new(2));
-        assert_eq!(routes[0].alignment(), EdgeAlignment::Center);
-        assert_eq!(
-            parse_routes(Some("right>left")),
-            Err(TopologyRuntimeError::InvalidEdgeConfiguration)
-        );
-    }
-
-    #[test]
     fn local_ready_requires_the_exact_published_revision() {
         let mut state = PeerTopologyState::with_routes(vec![route()]);
         state.record_local_publish(3);
@@ -788,5 +963,128 @@ mod tests {
                 .unwrap(),
             LocalPointerAction::Suppressed
         );
+    }
+
+    #[test]
+    fn placement_derives_only_deterministic_exterior_stretch_routes() {
+        let local = DisplayTopology::new(
+            1,
+            vec![
+                positioned_descriptor(1, 0, 0),
+                positioned_descriptor(2, 1_920_000, 0),
+                positioned_descriptor(3, 1_920_000, 1_080_000),
+            ],
+        )
+        .unwrap();
+        let remote = DisplayTopology::new(
+            1,
+            vec![
+                positioned_descriptor(10, 0, 0),
+                positioned_descriptor(11, 0, 1_080_000),
+                positioned_descriptor(12, 1_920_000, 0),
+            ],
+        )
+        .unwrap();
+
+        let routes = derive_exterior_routes(PeerPlacement::Right, &local, &remote);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].source_display(), SessionDisplayId::new(2));
+        assert_eq!(routes[1].source_display(), SessionDisplayId::new(3));
+        assert_eq!(routes[0].destination_display(), SessionDisplayId::new(10));
+        assert_eq!(routes[1].destination_display(), SessionDisplayId::new(11));
+        assert!(routes.iter().all(|route| {
+            route.source_edge() == DisplayEdge::Right
+                && route.destination_edge() == DisplayEdge::Left
+                && route.alignment() == EdgeAlignment::Stretch
+        }));
+        assert!(routes.len() <= MAX_DERIVED_EDGE_ROUTES);
+        assert!(derive_exterior_routes(PeerPlacement::Disabled, &local, &remote).is_empty());
+    }
+
+    #[test]
+    fn route_activation_requires_grant_and_committed_topologies_and_changes_clear_state() {
+        let mut state = PeerTopologyState::with_routes(Vec::new());
+        state.placement = PeerPlacement::Right;
+        state.peer_input_granted = false;
+        let candidate = state
+            .prepare_local_candidate(&[snapshot(7)])
+            .unwrap()
+            .unwrap();
+        state.commit_local_candidate(candidate).unwrap();
+        state.mark_unpublished_local_ready().unwrap();
+        state.stage_remote(topology(1).unwrap(), 1).unwrap();
+        state.commit_remote(1).unwrap();
+        assert!(
+            state.routes.is_empty(),
+            "a missing input grant armed routes"
+        );
+
+        state.peer_input_granted = true;
+        state.rebuild_routes().unwrap();
+        assert_eq!(state.routes.len(), 1);
+        let pending_local = state
+            .prepare_local_candidate(&[snapshot(7), snapshot(8)])
+            .unwrap()
+            .unwrap();
+        state.set_peer_placement(PeerPlacement::Left).unwrap();
+        assert!(
+            state.routes.is_empty(),
+            "placement rearmed a route across a pending local topology"
+        );
+        state.commit_local_candidate(pending_local).unwrap();
+        state.mark_unpublished_local_ready().unwrap();
+        assert!(!state.routes.is_empty());
+        state.stage_remote(topology(2).unwrap(), 2).unwrap();
+        state.set_peer_placement(PeerPlacement::Right).unwrap();
+        assert!(
+            state.routes.is_empty(),
+            "placement rearmed a route across a staged remote topology"
+        );
+        state.commit_remote(2).unwrap();
+        assert!(!state.routes.is_empty());
+        state.active_route = state.routes.first().copied();
+        state.pending_target = Some(InputEvent::PointerMotion {
+            position: NormalizedPosition::new(
+                DisplayId::new(1),
+                NormalizedAxis::MAX,
+                NormalizedAxis::MIN,
+            ),
+        });
+        let mut invalid = snapshot(9);
+        invalid.pixel_width = 0;
+        assert!(state.prepare_local_candidate(&[invalid]).is_err());
+        assert!(state.routes.is_empty());
+        assert!(state.active_route.is_none());
+        assert!(state.pending_target.is_none());
+        state.set_peer_placement(PeerPlacement::Disabled).unwrap();
+        assert!(state.routes.is_empty());
+        assert!(state.active_route.is_none());
+        assert!(state.pending_target.is_none());
+    }
+
+    #[test]
+    fn published_local_topology_ack_is_the_exact_route_activation_gate() {
+        let mut state = PeerTopologyState::with_routes(Vec::new());
+        state.placement = PeerPlacement::Right;
+        let candidate = state
+            .prepare_local_candidate(&[snapshot(70)])
+            .unwrap()
+            .unwrap();
+        let local_topology = state.commit_local_candidate(candidate).unwrap();
+        state.stage_remote(topology(9).unwrap(), 9).unwrap();
+        state.commit_remote(9).unwrap();
+        assert!(state.routes.is_empty());
+
+        state.record_local_publish(local_topology.revision());
+        assert!(!state.local_is_ready());
+        assert!(state.routes.is_empty());
+        assert_eq!(
+            state.mark_local_ready(local_topology.revision() + 1),
+            Err(TopologyRuntimeError::UnexpectedAcknowledgement)
+        );
+        assert!(state.routes.is_empty());
+        state.mark_local_ready(local_topology.revision()).unwrap();
+        assert!(state.local_is_ready());
+        assert_eq!(state.routes.len(), 1);
     }
 }

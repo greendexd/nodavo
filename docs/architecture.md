@@ -1,4 +1,4 @@
-<!-- doc-id: architecture; lang: en; revision: 12 -->
+<!-- doc-id: architecture; lang: en; revision: 13 -->
 
 # Architecture
 
@@ -86,6 +86,8 @@ On disconnect, timeout, lock, sleep, crash, or emergency stop, both sides releas
 
 Display hot-plug is a session transaction rather than an in-place geometry edit. Platform callbacks only mark a coalesced dirty generation. The session owner closes routing admission, drains already admitted input under the old lease, returns focus locally, validates a stable bounded full graph with fresh process-local identities, replaces the active-only native/session map, and publishes a new topology revision. New focus is unavailable until the exact revision is acknowledged. Repeated changes retain only the latest candidate and cannot extend the fixed refresh deadline; safety, revoke, and disconnect remain higher-priority transitions.
 
+Each trust record stores one semantic peer placement: disabled, left, right, above, or below. It never stores native or session display identifiers. After both current topologies are committed, the peer input grant is active, and every local revision directionally published for inbound control is exactly acknowledged, the session derives at most 32 deterministic exterior `Stretch` routes from that placement. An outbound-only local graph is intentionally not published and needs only the same stable committed snapshot. A topology transition, grant removal, or placement change clears derived routes; focus recovery and local-ownership restoration clear the active route and pending pointer entry. A placement mutation is persisted first; if focus is not local, the session restores ownership and disconnects before the UI reconciles the authoritative saved value. The native shells send a mutation once and use trusted-peer listing, not a resend, after an ambiguous acknowledgement.
+
 macOS capture and injection share one immutable process snapshot sourced from CoreGraphics. Windows capture and injection share one process-singleton display service with per-monitor-v2 awareness, DisplayConfig identities, an early broadcast wake, and authoritative polling. Both platforms bind suppression to a callback/admission barrier so an input cannot be accepted remotely after being returned to the local OS. Timed-out native owners poison restart within that process instead of permitting overlapping capture, hooks, or injectors.
 
 ## Discovery and pairing
@@ -118,7 +120,7 @@ The default 1.0 agent runs in the user session. A privileged Windows service is 
 
 ## Local readiness projection
 
-The agent exposes one bounded, content-free readiness snapshot through the authenticated UI protocol. Local input, local display discovery, and authenticated peer-topology synchronization are separate signals: an available display never implies that a peer layout is ready. Peer topology is `synchronizing` from connection establishment until the exact remote topology and matching local revision acknowledgement are installed; every teardown and recovery returns it to `not_connected`.
+The agent exposes one bounded, content-free readiness snapshot through the authenticated UI protocol. Local input, local display discovery, and authenticated peer-topology synchronization are separate signals: an available display never implies that a peer layout is ready. Peer topology is `synchronizing` from connection establishment until the exact remote topology is installed and either the local revision published for inbound control is exactly acknowledged or the local graph remains intentionally unpublished because no inbound input grant exists; every teardown and recovery returns it to `not_connected`.
 
 Platform probes run outside the async dispatcher behind a finite deadline and a short cache. They check only trust/default-desktop state, display discovery, API capability, and construction of a non-posting injector prerequisite; they never create or register a capture runtime, route, suppress, or inject input. Consequently `ready` means that local prerequisites are currently available, not that live capture has been exercised. On macOS the explicit permission action asks for Accessibility in the agent identity, ignores the prompt API's return value, and immediately rechecks actual trust. Windows exposes no Accessibility action and reports a non-default or secure input desktop only as blocked; it never offers elevation or secure-desktop control. The public snapshot contains no paths, process IDs, native display IDs, desktop names, peer identifiers, or permission-prompt metadata.
 

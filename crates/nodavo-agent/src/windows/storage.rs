@@ -218,6 +218,7 @@ mod tests {
             grants: CapabilityGrants::NONE.with(Capability::RemoteInput),
             grant_epoch: nodavo_protocol::GrantEpoch::new(1),
             display_name: "Test peer".to_owned(),
+            placement: nodavo_local_ipc::PeerPlacement::Disabled,
             established_at_unix_ms: 10,
             revoked_at_unix_ms: None,
             server_name: "peer.nodavo.invalid".to_owned(),

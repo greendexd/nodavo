@@ -19,3 +19,4 @@ Use sequential names such as `0001-transport-quic.md` and include:
 - [ADR-0003: First-contact pairing bootstrap](0003-first-contact-pairing-bootstrap.md) ([Русский](0003-first-contact-pairing-bootstrap.ru.md))
 - [ADR-0004: Per-message signed XPC for macOS local IPC](0004-macos-signed-local-ipc.md) ([Русский](0004-macos-signed-local-ipc.ru.md))
 - [ADR-0005: Stable external supervision for update activation](0005-stable-update-supervision.md) ([Русский](0005-stable-update-supervision.ru.md))
+- [ADR-0006: Persist semantic peer placement, derive ephemeral edge routes](0006-semantic-peer-placement.md) ([Русский](0006-semantic-peer-placement.ru.md))

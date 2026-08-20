@@ -50,6 +50,11 @@ pub enum UiCommand {
         capability: CapabilityName,
         enabled: bool,
     },
+    /// Persists one explicit relative placement for exactly one trusted peer.
+    SetPeerPlacement {
+        peer_id: String,
+        placement: PeerPlacement,
+    },
     RevokePeer {
         peer_id: String,
     },
@@ -101,6 +106,21 @@ pub enum TrustedPeerState {
     Revoked,
 }
 
+/// User-authorized relative placement of one peer workstation.
+///
+/// This semantic preference is persistent. Display and session identifiers are
+/// deliberately absent because they are ephemeral and private to one session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerPlacement {
+    #[default]
+    Disabled,
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
 /// Public local summary of one trust record.
 ///
 /// Certificate material, network locations, grant epochs, and private storage
@@ -111,6 +131,7 @@ pub struct TrustedPeerSummary {
     pub display_name: String,
     pub state: TrustedPeerState,
     pub local_grants: Vec<CapabilityName>,
+    pub placement: PeerPlacement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +154,10 @@ pub enum AgentEvent {
         peer_id: String,
         capability: CapabilityName,
         enabled: bool,
+    },
+    PeerPlacementChanged {
+        peer_id: String,
+        placement: PeerPlacement,
     },
     TransferQueued {
         transfer_id: String,
@@ -775,11 +800,11 @@ mod tests {
     use super::{
         AccessibilityReadiness, AgentEvent, CapabilityName, InputReadiness, IpcError,
         LocalTopologyReadiness, MAX_IPC_MESSAGE_SIZE, MAX_TERMINAL_TRANSFERS, MAX_TRANSFER_BYTES,
-        MAX_TRANSFER_SNAPSHOTS, MAX_TRUSTED_PEERS, MAX_UPDATE_VERSION_BYTES, ReadinessSnapshot,
-        SessionTopologyReadiness, TransferDirection, TransferFailureCode, TransferPhase,
-        TransferSnapshot, TransferSnapshotError, TrustedPeerState, TrustedPeerSummary, UiCommand,
-        UpdateFailureCode, UpdatePhase, UpdateSnapshot, UpdateSnapshotError, read_frame,
-        write_frame,
+        MAX_TRANSFER_SNAPSHOTS, MAX_TRUSTED_PEERS, MAX_UPDATE_VERSION_BYTES, PeerPlacement,
+        ReadinessSnapshot, SessionTopologyReadiness, TransferDirection, TransferFailureCode,
+        TransferPhase, TransferSnapshot, TransferSnapshotError, TrustedPeerState,
+        TrustedPeerSummary, UiCommand, UpdateFailureCode, UpdatePhase, UpdateSnapshot,
+        UpdateSnapshotError, read_frame, write_frame,
     };
 
     #[tokio::test]
@@ -873,6 +898,37 @@ mod tests {
     }
 
     #[test]
+    fn peer_placement_command_and_ack_have_exact_bounded_wire_shapes() {
+        let command: UiCommand = serde_json::from_str(
+            r#"{"command":"set_peer_placement","peer_id":"peer","placement":"above"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            UiCommand::SetPeerPlacement {
+                peer_id: "peer".to_owned(),
+                placement: PeerPlacement::Above,
+            }
+        );
+        assert!(
+            serde_json::from_str::<UiCommand>(
+                r#"{"command":"set_peer_placement","peer_id":"peer","placement":"diagonal"}"#,
+            )
+            .is_err()
+        );
+
+        let event = AgentEvent::PeerPlacementChanged {
+            peer_id: "peer".to_owned(),
+            placement: PeerPlacement::Below,
+        };
+        let encoded = serde_json::to_value(event).unwrap();
+        assert_eq!(encoded["event"], "peer_placement_changed");
+        assert_eq!(encoded["placement"], "below");
+        assert!(encoded.get("display_id").is_none());
+        assert!(encoded.get("session_id").is_none());
+    }
+
+    #[test]
     fn accessibility_command_and_readiness_have_exact_stable_wire_names() {
         assert_eq!(
             serde_json::from_str::<UiCommand>(r#"{"command":"request_accessibility_permission"}"#)
@@ -950,12 +1006,14 @@ mod tests {
                     CapabilityName::ClipboardWrite,
                     CapabilityName::Files,
                 ],
+                placement: PeerPlacement::Disabled,
             })
             .collect();
         let encoded = serde_json::to_value(AgentEvent::TrustedPeers { peers }).unwrap();
         assert!(serde_json::to_vec(&encoded).unwrap().len() < MAX_IPC_MESSAGE_SIZE);
         let first = &encoded["peers"][0];
         assert_eq!(first["state"], "active");
+        assert_eq!(first["placement"], "disabled");
         assert!(first.get("certificate_der").is_none());
         assert!(first.get("last_endpoint").is_none());
         assert!(first.get("grant_epoch").is_none());

@@ -36,6 +36,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         "peer_not_found",
         "storage_unavailable",
         "grant_epoch_exhausted",
+        "placement_apply_failed",
         "pairing_failed",
         "not_connected",
         "focus_rejected",
@@ -50,8 +51,17 @@ internal sealed class AgentClient : IAgentReadinessProbe
     // Emergency stop may use the server's full twenty-second fail-closed safety window.
     // Keep this independent from ordinary status polling and leave transport margin.
     private static readonly TimeSpan EmergencyRequestTimeout = TimeSpan.FromSeconds(25);
+    // Manual acquisition always asks for exactly one five-second lease. Both focus
+    // mutations have independent deadlines and are never resent after ambiguity.
+    private const uint RemoteFocusLeaseMilliseconds = 5_000;
+    private static readonly TimeSpan FocusAcquireRequestTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan FocusReleaseRequestTimeout = TimeSpan.FromSeconds(15);
     // The agent may spend two sequential five-second safety windows applying a grant.
     private static readonly TimeSpan MutationRequestTimeout = TimeSpan.FromSeconds(15);
+    // Placement persistence may be followed by two five-second in-session safety
+    // waits. Keep it separate from grant mutation even though both are currently
+    // fifteen seconds, so either server contract can evolve without deadline reuse.
+    private static readonly TimeSpan PlacementMutationRequestTimeout = TimeSpan.FromSeconds(15);
     // Keep the existing conservative selected-path admission deadline independent.
     // A successful response is immediate local admission, not delivery completion.
     private static readonly TimeSpan TransferRequestTimeout = TimeSpan.FromMinutes(5.25);
@@ -81,7 +91,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         RequestAsync(
             new CommandEnvelope("get_status"),
             StatusRequestTimeout,
-            AgentStatusDecoder.DecodeStatus,
+            DecodeStatusResponse,
             cancellationToken);
 
     async Task<bool> IAgentReadinessProbe.IsAgentReachableAsync(
@@ -109,7 +119,25 @@ internal sealed class AgentClient : IAgentReadinessProbe
         RequestAsync(
             new CommandEnvelope("emergency_stop"),
             EmergencyRequestTimeout,
-            AgentStatusDecoder.DecodeStatus,
+            DecodeStatusResponse,
+            cancellationToken);
+
+    internal Task<AgentStatusSnapshot> RequestRemoteFocusAsync(
+        CancellationToken cancellationToken = default) =>
+        RequestAsync(
+            new RequestRemoteFocusEnvelope(
+                "request_remote_focus",
+                RemoteFocusLeaseMilliseconds),
+            FocusAcquireRequestTimeout,
+            DecodeStatusResponse,
+            cancellationToken);
+
+    internal Task<AgentStatusSnapshot> ReleaseFocusAsync(
+        CancellationToken cancellationToken = default) =>
+        RequestAsync(
+            new CommandEnvelope("release_focus"),
+            FocusReleaseRequestTimeout,
+            DecodeStatusResponse,
             cancellationToken);
 
     internal Task<PairingCodeSnapshot> BeginPairingAsync(
@@ -175,6 +203,23 @@ internal sealed class AgentClient : IAgentReadinessProbe
             cancellationToken);
     }
 
+    internal Task<PeerPlacementChangeSnapshot> SetPeerPlacementAsync(
+        string peerId,
+        PeerPlacement placement,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateText(peerId, MaximumIdentifierLength, "peer identifier");
+        string encodedPlacement = PeerPlacementWire.Encode(placement);
+        return RequestAsync(
+            new SetPeerPlacementEnvelope(
+                "set_peer_placement",
+                peerId,
+                encodedPlacement),
+            PlacementMutationRequestTimeout,
+            payload => DecodePeerPlacementChanged(payload, peerId, placement),
+            cancellationToken);
+    }
+
     internal Task<AgentStatusSnapshot> RevokePeerAsync(
         string peerId,
         CancellationToken cancellationToken = default)
@@ -183,7 +228,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         return RequestAsync(
             new RevokePeerEnvelope("revoke_peer", peerId),
             MutationRequestTimeout,
-            AgentStatusDecoder.DecodeStatus,
+            DecodeStatusResponse,
             cancellationToken);
     }
 
@@ -335,6 +380,16 @@ internal sealed class AgentClient : IAgentReadinessProbe
         return new PairingCodeSnapshot(pairingId, peerName, code);
     }
 
+    private static AgentStatusSnapshot DecodeStatusResponse(byte[] payload)
+    {
+        // Recognize only the bounded allowlisted agent error envelope before the
+        // strict status decoder requires focus_state. This is what makes an exact
+        // focus_rejected deterministic while malformed/unknown errors stay ambiguous.
+        using JsonDocument document = ParseResponse(payload);
+        RequireEvent(document.RootElement, "status");
+        return AgentStatusDecoder.DecodeStatus(payload);
+    }
+
     private static PairingResultSnapshot DecodePairingResult(byte[] payload)
     {
         using JsonDocument document = ParseResponse(payload);
@@ -354,6 +409,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
         using JsonDocument document = ParseResponse(payload);
         JsonElement root = document.RootElement;
         RequireEvent(root, "trusted_peers");
+        RequireExactFields(root, "event", "peers");
         if (!root.TryGetProperty("peers", out JsonElement peers) ||
             peers.ValueKind != JsonValueKind.Array || peers.GetArrayLength() > MaximumTrustedPeers)
         {
@@ -368,9 +424,25 @@ internal sealed class AgentClient : IAgentReadinessProbe
             {
                 throw new InvalidDataException("Invalid trusted peer.");
             }
+            RequireExactFields(
+                peer,
+                "peer_id",
+                "display_name",
+                "state",
+                "local_grants",
+                "placement");
             string peerId = ReadRequiredText(peer, "peer_id", MaximumIdentifierLength);
             string displayName = ReadRequiredText(peer, "display_name", MaximumIdentifierLength);
             string state = ReadRequiredEnum(peer, "state", "active", "revoked");
+            PeerPlacement placement = PeerPlacementWire.Decode(
+                ReadRequiredEnum(
+                    peer,
+                    "placement",
+                    "disabled",
+                    "left",
+                    "right",
+                    "above",
+                    "below"));
             if (!peerIds.Add(peerId) ||
                 !peer.TryGetProperty("local_grants", out JsonElement grants) ||
                 grants.ValueKind != JsonValueKind.Array ||
@@ -392,7 +464,7 @@ internal sealed class AgentClient : IAgentReadinessProbe
                     throw new InvalidDataException("Duplicate trusted-peer capability.");
                 }
             }
-            decoded.Add(new TrustedPeerSnapshot(peerId, displayName, state, localGrants));
+            decoded.Add(new TrustedPeerSnapshot(peerId, displayName, state, localGrants, placement));
         }
         return decoded;
     }
@@ -411,6 +483,32 @@ internal sealed class AgentClient : IAgentReadinessProbe
             throw new InvalidDataException("Invalid capability acknowledgement.");
         }
         return new CapabilityChangeSnapshot(peerId, capability, enabled.GetBoolean());
+    }
+
+    private static PeerPlacementChangeSnapshot DecodePeerPlacementChanged(
+        byte[] payload,
+        string expectedPeerId,
+        PeerPlacement expectedPlacement)
+    {
+        using JsonDocument document = ParseResponse(payload);
+        JsonElement root = document.RootElement;
+        RequireEvent(root, "peer_placement_changed");
+        RequireExactFields(root, "event", "peer_id", "placement");
+        string peerId = ReadRequiredText(root, "peer_id", MaximumIdentifierLength);
+        PeerPlacement placement = PeerPlacementWire.Decode(
+            ReadRequiredEnum(
+                root,
+                "placement",
+                "disabled",
+                "left",
+                "right",
+                "above",
+                "below"));
+        if (peerId != expectedPeerId || placement != expectedPlacement)
+        {
+            throw new InvalidDataException("Mismatched peer-placement acknowledgement.");
+        }
+        return new PeerPlacementChangeSnapshot(peerId, placement);
     }
 
     private static TransferQueuedSnapshot DecodeTransferQueued(byte[] payload)
@@ -492,17 +590,15 @@ internal sealed class AgentClient : IAgentReadinessProbe
             throw new InvalidDataException("Unexpected local IPC event.");
         }
 
-        string? actual = eventName.GetString();
-        if (actual == "error")
+        if (AgentErrorEnvelopeDecoder.TryDecode(
+                root,
+                AllowedAgentErrorCodes,
+                MaximumErrorMessageLength,
+                out string errorCode))
         {
-            string code = ReadRequiredText(root, "code", 128);
-            _ = ReadRequiredText(root, "message", MaximumErrorMessageLength);
-            if (!AllowedAgentErrorCodes.Contains(code))
-            {
-                throw new InvalidDataException("Unknown local IPC error code.");
-            }
-            throw new AgentProtocolException(code);
+            throw new AgentProtocolException(errorCode);
         }
+        string? actual = eventName.GetString();
         if (!string.Equals(actual, expected, StringComparison.Ordinal))
         {
             throw new InvalidDataException("Unexpected local IPC event.");
@@ -582,9 +678,18 @@ internal sealed class AgentClient : IAgentReadinessProbe
         [property: JsonPropertyName("capability")] string Capability,
         [property: JsonPropertyName("enabled")] bool Enabled);
 
+    private sealed record SetPeerPlacementEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("peer_id")] string PeerId,
+        [property: JsonPropertyName("placement")] string Placement);
+
     private sealed record RevokePeerEnvelope(
         [property: JsonPropertyName("command")] string Command,
         [property: JsonPropertyName("peer_id")] string PeerId);
+
+    private sealed record RequestRemoteFocusEnvelope(
+        [property: JsonPropertyName("command")] string Command,
+        [property: JsonPropertyName("ttl_ms")] uint TtlMilliseconds);
 
     private sealed record SendFilesEnvelope(
         [property: JsonPropertyName("command")] string Command,

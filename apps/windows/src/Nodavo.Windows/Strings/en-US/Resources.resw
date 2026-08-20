@@ -22,6 +22,9 @@
   <data name="ConnectionHeading.Text" xml:space="preserve"><value>Connection</value></data>
   <data name="PeerLabel.Text" xml:space="preserve"><value>Peer</value></data>
   <data name="InputOwnerLabel.Text" xml:space="preserve"><value>Input owner</value></data>
+  <data name="FocusLabel.Text" xml:space="preserve"><value>Focus</value></data>
+  <data name="FocusAcquireButton.Content" xml:space="preserve"><value>Control peer</value></data>
+  <data name="FocusReleaseButton.Content" xml:space="preserve"><value>Return input here</value></data>
   <data name="RefreshButton.Content" xml:space="preserve"><value>Refresh status</value></data>
   <data name="EmergencyStopButton.Content" xml:space="preserve"><value>Emergency stop</value></data>
   <data name="PreAlphaNotice.Title" xml:space="preserve"><value>Pre-alpha shell</value></data>
@@ -142,7 +145,50 @@
   <data name="PairingInvalidEndpoint" xml:space="preserve"><value>Enter an IP address with port or a valid mDNS instance.</value></data>
   <data name="PairingTimedOut" xml:space="preserve"><value>The other computer did not respond before the protected pairing deadline.</value></data>
   <data name="LayoutTitle.Text" xml:space="preserve"><value>Layout</value></data>
-  <data name="LayoutUnavailable.Text" xml:space="preserve"><value>Display arrangement and edge switching are under implementation.</value></data>
+  <data name="LayoutSubtitle.Text" xml:space="preserve"><value>Choose one trusted computer and place it on one edge of this PC, or disable edge switching for that peer.</value></data>
+  <data name="LayoutRefresh.Content" xml:space="preserve"><value>Refresh layout</value></data>
+  <data name="LayoutPeerSelector.Header" xml:space="preserve"><value>Trusted computer</value></data>
+  <data name="LayoutPeerSelector.PlaceholderText" xml:space="preserve"><value>Select a trusted computer</value></data>
+  <data name="LayoutCurrentPlacementLabel.Text" xml:space="preserve"><value>Current authoritative placement</value></data>
+  <data name="LayoutPlacementSelector.Header" xml:space="preserve"><value>Requested placement</value></data>
+  <data name="LayoutApplyPlacement.Content" xml:space="preserve"><value>Apply placement</value></data>
+  <data name="LayoutPlacementHelp.Text" xml:space="preserve"><value>Placement is stored per trusted peer. Disabled prevents edge switching; left, right, above, and below use the matching exterior edge after both display topologies are synchronized.</value></data>
+  <data name="LayoutPreAlpha.Title" xml:space="preserve"><value>Pre-alpha layout source</value></data>
+  <data name="LayoutPreAlpha.Message" xml:space="preserve"><value>Per-peer placement and exact local IPC are implemented in source. Physical mixed-DPI, hot-plug, RDP, lock, and suspend behavior still requires Windows runtime qualification.</value></data>
+  <data name="LayoutPlacementDisabled" xml:space="preserve"><value>Disabled</value></data>
+  <data name="LayoutPlacementLeft" xml:space="preserve"><value>Left</value></data>
+  <data name="LayoutPlacementRight" xml:space="preserve"><value>Right</value></data>
+  <data name="LayoutPlacementAbove" xml:space="preserve"><value>Above</value></data>
+  <data name="LayoutPlacementBelow" xml:space="preserve"><value>Below</value></data>
+  <data name="LayoutPeerRevokedDisplay" xml:space="preserve"><value>{0} (revoked)</value></data>
+  <data name="LayoutLoadingTitle" xml:space="preserve"><value>Loading layout</value></data>
+  <data name="LayoutLoadingMessage" xml:space="preserve"><value>Reading the bounded authoritative trusted-peer list from the per-user agent.</value></data>
+  <data name="LayoutLoadedTitle" xml:space="preserve"><value>Layout loaded</value></data>
+  <data name="LayoutLoadedMessage" xml:space="preserve"><value>Select an active trusted computer and review its current placement before applying a change.</value></data>
+  <data name="LayoutEmptyTitle" xml:space="preserve"><value>No trusted computers</value></data>
+  <data name="LayoutEmptyMessage" xml:space="preserve"><value>Complete code-confirmed pairing on the Devices screen before configuring placement.</value></data>
+  <data name="LayoutTimeoutTitle" xml:space="preserve"><value>Agent did not respond</value></data>
+  <data name="LayoutTimeoutMessage" xml:space="preserve"><value>The authoritative layout request reached its local deadline.</value></data>
+  <data name="LayoutFailedTitle" xml:space="preserve"><value>Layout unavailable</value></data>
+  <data name="LayoutFailedMessage" xml:space="preserve"><value>Start the per-user agent and refresh the trusted-peer layout.</value></data>
+  <data name="LayoutReadyTitle" xml:space="preserve"><value>Placement ready</value></data>
+  <data name="LayoutReadyMessage" xml:space="preserve"><value>Choose a different placement and apply it once. The current value does not change until the agent confirms it.</value></data>
+  <data name="LayoutSavingTitle" xml:space="preserve"><value>Saving placement</value></data>
+  <data name="LayoutSavingMessage" xml:space="preserve"><value>The selected peer is locked while the agent persists and applies this exact placement.</value></data>
+  <data name="LayoutSavedTitle" xml:space="preserve"><value>Placement saved</value></data>
+  <data name="LayoutSavedMessage" xml:space="preserve"><value>The agent acknowledged the exact peer and placement.</value></data>
+  <data name="LayoutReconcilingTitle" xml:space="preserve"><value>Placement outcome unknown</value></data>
+  <data name="LayoutReconcilingMessage" xml:space="preserve"><value>The acknowledgement was lost, invalid, or an explicit error followed persistence. Nodavo is reloading authoritative trust without resending the change.</value></data>
+  <data name="LayoutReconciledAppliedTitle" xml:space="preserve"><value>Placement confirmed after reload</value></data>
+  <data name="LayoutReconciledAppliedMessage" xml:space="preserve"><value>The authoritative trusted-peer list contains the requested placement.</value></data>
+  <data name="LayoutReconciledNotAppliedTitle" xml:space="preserve"><value>Placement was not applied</value></data>
+  <data name="LayoutReconciledNotAppliedMessage" xml:space="preserve"><value>The authoritative trusted-peer list retained a different placement.</value></data>
+  <data name="LayoutPeerMissingTitle" xml:space="preserve"><value>Trusted computer no longer present</value></data>
+  <data name="LayoutPeerMissingMessage" xml:space="preserve"><value>The authoritative list no longer contains the exact peer. No placement outcome is inferred.</value></data>
+  <data name="LayoutPeerRevokedTitle" xml:space="preserve"><value>Trusted computer is revoked</value></data>
+  <data name="LayoutPeerRevokedMessage" xml:space="preserve"><value>Revoked trust is visible for review but cannot be assigned a placement.</value></data>
+  <data name="LayoutOutcomeUnknownTitle" xml:space="preserve"><value>Placement outcome still unknown</value></data>
+  <data name="LayoutOutcomeUnknownMessage" xml:space="preserve"><value>This exact peer remains locked. Refreshing must successfully load the authoritative trusted-peer list before another placement can be sent.</value></data>
   <data name="TransfersTitle.Text" xml:space="preserve"><value>Transfers</value></data>
   <data name="TransfersSubtitle.Text" xml:space="preserve"><value>Queue only files and folders you explicitly select on this PC.</value></data>
   <data name="TransferAddFiles.Content" xml:space="preserve"><value>Add files…</value></data>
@@ -281,4 +327,21 @@
   <data name="NoPeer" xml:space="preserve"><value>No peer connected</value></data>
   <data name="InputOwnerLocal" xml:space="preserve"><value>This PC</value></data>
   <data name="InputOwnerRemote" xml:space="preserve"><value>Remote peer</value></data>
+  <data name="FocusStateLocal" xml:space="preserve"><value>Local input</value></data>
+  <data name="FocusStateControllingPeer" xml:space="preserve"><value>Controlling the peer</value></data>
+  <data name="FocusStateControlledByPeer" xml:space="preserve"><value>Controlled by the peer</value></data>
+  <data name="FocusStateUnavailable" xml:space="preserve"><value>Unavailable</value></data>
+  <data name="FocusGuidanceReady" xml:space="preserve"><value>Control peer requests one fixed five-second lease. Nodavo never resends an uncertain request.</value></data>
+  <data name="FocusGuidanceConnectPeer" xml:space="preserve"><value>Connect a trusted peer before requesting remote focus.</value></data>
+  <data name="FocusGuidanceWaitForReadiness" xml:space="preserve"><value>Wait for connected session, input, local displays, and peer topology to report ready.</value></data>
+  <data name="FocusGuidanceControllingPeer" xml:space="preserve"><value>Input is routed to the peer. Return input here before starting another focus action.</value></data>
+  <data name="FocusGuidanceControlledByPeer" xml:space="preserve"><value>The peer currently controls this PC. Return input here or use Emergency stop.</value></data>
+  <data name="FocusGuidanceAcquiring" xml:space="preserve"><value>Requesting one five-second focus lease. This mutation will not be resent.</value></data>
+  <data name="FocusGuidanceAcquireLeaseWindow" xml:space="preserve"><value>The acquisition outcome is uncertain. Focus controls stay locked through the complete five-second lease window.</value></data>
+  <data name="FocusGuidanceReleasing" xml:space="preserve"><value>Returning input locally. Waiting for an exact agent status.</value></data>
+  <data name="FocusGuidanceReconciling" xml:space="preserve"><value>Reloading authoritative focus status without repeating the focus mutation.</value></data>
+  <data name="FocusGuidanceEmergency" xml:space="preserve"><value>Emergency stop superseded any earlier focus work. Waiting for the agent's exact status.</value></data>
+  <data name="FocusGuidanceOutcomeUnknown" xml:space="preserve"><value>The focus outcome is still unknown. Controls stay locked until Refresh status succeeds; Emergency stop remains available.</value></data>
+  <data name="FocusGuidanceRejected" xml:space="preserve"><value>The agent explicitly rejected the focus action. Review readiness or return focus, then retry explicitly.</value></data>
+  <data name="FocusGuidanceStatusUnavailable" xml:space="preserve"><value>Refresh status before using manual focus. No local or remote focus ownership is assumed.</value></data>
 </root>

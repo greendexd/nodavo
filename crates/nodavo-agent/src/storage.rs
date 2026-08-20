@@ -21,7 +21,7 @@ use nodavo_identity::{
     CapabilityGrants, DeviceId, PublicIdentity, Revocation, RevocationReason, SoftwareSigner,
     TransportCertificate, TrustRecord,
 };
-use nodavo_local_ipc::MAX_TRUSTED_PEERS;
+use nodavo_local_ipc::{MAX_TRUSTED_PEERS, PeerPlacement};
 use nodavo_protocol::GrantEpoch;
 use nodavo_transport::quinn_backend::CertificateCredentials;
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 const IDENTITY_FORMAT_VERSION: u16 = 1;
 const LEGACY_TRUST_FORMAT_VERSION: u16 = 1;
-const TRUST_FORMAT_VERSION: u16 = 2;
+const NAMED_TRUST_FORMAT_VERSION: u16 = 2;
+const TRUST_FORMAT_VERSION: u16 = 3;
 #[cfg(unix)]
 const IDENTITY_FILE: &str = "development-identity-v1.json";
 #[cfg(unix)]
@@ -70,6 +71,7 @@ pub(crate) struct PeerRecord {
     pub(crate) grants: CapabilityGrants,
     pub(crate) grant_epoch: GrantEpoch,
     pub(crate) display_name: String,
+    pub(crate) placement: PeerPlacement,
     pub(crate) established_at_unix_ms: u64,
     pub(crate) revoked_at_unix_ms: Option<u64>,
     pub(crate) server_name: String,
@@ -238,6 +240,8 @@ struct PeerDisk {
     grant_epoch: Option<u64>,
     #[serde(default)]
     display_name: Option<String>,
+    #[serde(default)]
+    placement: Option<PeerPlacement>,
     established_at_unix_ms: u64,
     revoked_at_unix_ms: Option<u64>,
     server_name: String,
@@ -252,6 +256,7 @@ impl PeerDisk {
             grants: record.grants.bits(),
             grant_epoch: Some(record.grant_epoch.get()),
             display_name: Some(record.display_name.clone()),
+            placement: Some(record.placement),
             established_at_unix_ms: record.established_at_unix_ms,
             revoked_at_unix_ms: record.revoked_at_unix_ms,
             server_name: record.server_name.clone(),
@@ -266,16 +271,28 @@ impl PeerDisk {
             .map_err(|_| StorageError::InvalidData)?;
         let grants =
             CapabilityGrants::from_bits(self.grants).map_err(|_| StorageError::InvalidData)?;
-        let (grant_epoch, display_name) = match format_version {
+        let (grant_epoch, display_name, placement) = match format_version {
             LEGACY_TRUST_FORMAT_VERSION
-                if self.grant_epoch.is_none() && self.display_name.is_none() =>
+                if self.grant_epoch.is_none()
+                    && self.display_name.is_none()
+                    && self.placement.is_none() =>
             {
-                (GrantEpoch::new(1), MIGRATED_DISPLAY_NAME.to_owned())
+                (
+                    GrantEpoch::new(1),
+                    MIGRATED_DISPLAY_NAME.to_owned(),
+                    PeerPlacement::Disabled,
+                )
+            }
+            NAMED_TRUST_FORMAT_VERSION if self.placement.is_none() => {
+                let epoch = GrantEpoch::new(self.grant_epoch.ok_or(StorageError::InvalidData)?);
+                let display_name = self.display_name.ok_or(StorageError::InvalidData)?;
+                (epoch, display_name, PeerPlacement::Disabled)
             }
             TRUST_FORMAT_VERSION => {
                 let epoch = GrantEpoch::new(self.grant_epoch.ok_or(StorageError::InvalidData)?);
                 let display_name = self.display_name.ok_or(StorageError::InvalidData)?;
-                (epoch, display_name)
+                let placement = self.placement.ok_or(StorageError::InvalidData)?;
+                (epoch, display_name, placement)
             }
             _ => return Err(StorageError::InvalidData),
         };
@@ -300,6 +317,7 @@ impl PeerDisk {
             grants,
             grant_epoch,
             display_name,
+            placement,
             established_at_unix_ms: self.established_at_unix_ms,
             revoked_at_unix_ms: self.revoked_at_unix_ms,
             server_name: self.server_name,
@@ -477,7 +495,7 @@ pub(crate) fn decode_peers(bytes: &[u8]) -> Result<Vec<PeerRecord>, StorageError
     let disk: TrustDisk = serde_json::from_slice(bytes).map_err(|_| StorageError::InvalidData)?;
     if !matches!(
         disk.format_version,
-        LEGACY_TRUST_FORMAT_VERSION | TRUST_FORMAT_VERSION
+        LEGACY_TRUST_FORMAT_VERSION | NAMED_TRUST_FORMAT_VERSION | TRUST_FORMAT_VERSION
     ) || disk.peers.len() > MAX_PEERS
     {
         return Err(StorageError::InvalidData);
@@ -698,6 +716,7 @@ mod tests {
             grants: CapabilityGrants::NONE,
             grant_epoch: GrantEpoch::new(1),
             display_name: "Test peer".to_owned(),
+            placement: PeerPlacement::Disabled,
             established_at_unix_ms: 10,
             revoked_at_unix_ms: Some(11),
             server_name: "peer.nodavo.invalid".to_owned(),
@@ -718,6 +737,7 @@ mod tests {
             grants: CapabilityGrants::NONE.with(nodavo_identity::Capability::RemoteInput),
             grant_epoch: GrantEpoch::new(7),
             display_name: "Current peer name".to_owned(),
+            placement: PeerPlacement::Right,
             established_at_unix_ms: 10,
             revoked_at_unix_ms: None,
             server_name: "peer.nodavo.invalid".to_owned(),
@@ -734,11 +754,16 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("display_name");
+        legacy["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("placement");
 
         let migrated = decode_peers(&serde_json::to_vec(&legacy).unwrap()).unwrap();
         assert_eq!(migrated[0].grants, record.grants);
         assert_eq!(migrated[0].grant_epoch, GrantEpoch::new(1));
         assert_eq!(migrated[0].display_name, MIGRATED_DISPLAY_NAME);
+        assert_eq!(migrated[0].placement, PeerPlacement::Disabled);
 
         let persisted = encode_peers(&migrated).unwrap();
         let round_trip = decode_peers(&persisted).unwrap();
@@ -747,5 +772,53 @@ mod tests {
         assert_eq!(encoded["format_version"], TRUST_FORMAT_VERSION);
         assert_eq!(encoded["peers"][0]["grant_epoch"], 1);
         assert_eq!(encoded["peers"][0]["display_name"], MIGRATED_DISPLAY_NAME);
+        assert_eq!(encoded["peers"][0]["placement"], "disabled");
+    }
+
+    #[test]
+    fn v2_trust_migrates_to_disabled_placement_and_v3_requires_known_placement() {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
+        let record = PeerRecord {
+            public_key: [9_u8; 32],
+            certificate_der: generated.cert.der().to_vec(),
+            grants: CapabilityGrants::NONE,
+            grant_epoch: GrantEpoch::new(4),
+            display_name: "Placed peer".to_owned(),
+            placement: PeerPlacement::Below,
+            established_at_unix_ms: 10,
+            revoked_at_unix_ms: None,
+            server_name: "peer.nodavo.invalid".to_owned(),
+            last_endpoint: None,
+        };
+        let encoded = encode_peers(std::slice::from_ref(&record)).unwrap();
+        let encoded_text = std::str::from_utf8(&encoded).unwrap();
+        assert!(!encoded_text.contains("native_id"));
+        assert!(!encoded_text.contains("display_id"));
+        assert!(!encoded_text.contains("session_id"));
+        let mut v2: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        v2["format_version"] = NAMED_TRUST_FORMAT_VERSION.into();
+        v2["peers"][0].as_object_mut().unwrap().remove("placement");
+        let migrated = decode_peers(&serde_json::to_vec(&v2).unwrap()).unwrap();
+        assert_eq!(migrated[0].placement, PeerPlacement::Disabled);
+        assert_eq!(migrated[0].grant_epoch, record.grant_epoch);
+        assert_eq!(migrated[0].display_name, record.display_name);
+
+        let mut missing: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        missing["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("placement");
+        assert!(matches!(
+            decode_peers(&serde_json::to_vec(&missing).unwrap()),
+            Err(StorageError::InvalidData)
+        ));
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        unknown["peers"][0]["placement"] = "diagonal".into();
+        assert!(matches!(
+            decode_peers(&serde_json::to_vec(&unknown).unwrap()),
+            Err(StorageError::InvalidData)
+        ));
     }
 }

@@ -12,8 +12,8 @@ use nodavo_identity::{
 };
 use nodavo_local_ipc::{
     AgentPhase, AgentStatus, CapabilityName, FocusState, InputOwner, MAX_SELECTED_PATH_BYTES,
-    MAX_SELECTED_PATHS, ReadinessSnapshot, SessionTopologyReadiness, TrustedPeerState,
-    TrustedPeerSummary,
+    MAX_SELECTED_PATHS, PeerPlacement, ReadinessSnapshot, SessionTopologyReadiness,
+    TrustedPeerState, TrustedPeerSummary,
 };
 use nodavo_protocol::{Capability as ProtocolCapability, GrantEpoch};
 use nodavo_transfer::{FileSystemStagingArea, TransferId};
@@ -86,6 +86,8 @@ pub(crate) enum AgentError {
     Storage,
     #[error("the local capability grant epoch is exhausted")]
     GrantEpochExhausted,
+    #[error("the persisted peer placement could not be applied to the active session")]
+    PlacementApplyFailed,
     #[error("no authenticated peer session is connected")]
     NotConnected,
     #[error("the focus request is not authorized or valid")]
@@ -146,6 +148,12 @@ struct PreparedPairing {
     remote_endpoint: SocketAddr,
 }
 
+#[derive(Clone)]
+struct BoundSessionSender {
+    peer: nodavo_protocol::DeviceId,
+    sender: mpsc::Sender<LocalSessionCommand>,
+}
+
 pub(crate) struct AgentRuntime {
     status: RwLock<AgentStatus>,
     readiness_probe_gate: Mutex<()>,
@@ -160,7 +168,7 @@ pub(crate) struct AgentRuntime {
     inbound_waiter: Mutex<Option<oneshot::Sender<TcpStream>>>,
     busy: AtomicBool,
     disconnect: watch::Sender<u64>,
-    session_commands: Mutex<Option<mpsc::Sender<LocalSessionCommand>>>,
+    session_commands: Mutex<Option<BoundSessionSender>>,
     transfer_store: TransferStore,
     quic_bind_address: SocketAddr,
     device_name: String,
@@ -312,6 +320,7 @@ impl AgentRuntime {
                     TrustedPeerState::Revoked
                 },
                 local_grants: capability_names(record.grants),
+                placement: record.placement,
             })
             .collect()
     }
@@ -357,7 +366,14 @@ impl AgentRuntime {
             self.transfer_store
                 .require_peer_inbound_discard(peer_device);
         }
-        if let Some(sender) = self.session_commands.lock().await.clone() {
+        let sender = self
+            .session_commands
+            .lock()
+            .await
+            .as_ref()
+            .filter(|bound| bound.peer == peer_device)
+            .map(|bound| bound.sender.clone());
+        if let Some(sender) = sender {
             let (acknowledgement, received) = oneshot::channel();
             let command = LocalSessionCommand::UpdateLocalGrant {
                 grants,
@@ -389,6 +405,65 @@ impl AgentRuntime {
         Ok(())
     }
 
+    pub(crate) async fn set_peer_placement(
+        &self,
+        peer_id: &str,
+        placement: PeerPlacement,
+    ) -> Result<(), AgentError> {
+        let sender = {
+            // `peers` then `session_commands` is the single lock order used by
+            // both mutation and session publication. A mutation therefore
+            // either lands in the session's initial config or is queued on the
+            // exact peer-bound sender; it cannot disappear between the two.
+            let mut peers = self.peers.lock().await;
+            let previous = peers.clone();
+            let record = peers
+                .iter_mut()
+                .find(|record| device_id_text(record.device_id()) == peer_id && record.is_active())
+                .ok_or(AgentError::PeerNotFound)?;
+            let peer_device = protocol_device_id(record.device_id());
+            if record.placement != placement {
+                record.placement = placement;
+                if self.storage.store_peers(&peers).is_err() {
+                    *peers = previous;
+                    return Err(AgentError::Storage);
+                }
+            }
+            self.session_commands
+                .lock()
+                .await
+                .as_ref()
+                .filter(|bound| bound.peer == peer_device)
+                .map(|bound| bound.sender.clone())
+        };
+
+        let Some(sender) = sender else {
+            return Ok(());
+        };
+        let (acknowledgement, received) = oneshot::channel();
+        let delivered = timeout(
+            SAFETY_RECOVERY_DEADLINE,
+            sender.send(LocalSessionCommand::UpdatePeerPlacement {
+                placement,
+                acknowledgement,
+            }),
+        )
+        .await;
+        let applied = if let Ok(Ok(())) = delivered {
+            timeout(SAFETY_RECOVERY_DEADLINE, received).await
+        } else {
+            self.disconnect_all();
+            return Err(AgentError::PlacementApplyFailed);
+        };
+        if !matches!(applied, Ok(Ok(Ok(())))) {
+            // Persistence is already authoritative. The old in-memory route is
+            // no longer allowed to survive an uncertain or failed apply.
+            self.disconnect_all();
+            return Err(AgentError::PlacementApplyFailed);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn send_files(&self, paths: Vec<String>) -> Result<TransferId, AgentError> {
         if paths.is_empty() || paths.len() > MAX_SELECTED_PATHS {
             return Err(AgentError::TransferFailed);
@@ -408,12 +483,7 @@ impl AgentRuntime {
                     .ok_or(AgentError::TransferFailed)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let sender = self
-            .session_commands
-            .lock()
-            .await
-            .clone()
-            .ok_or(AgentError::NotConnected)?;
+        let sender = self.session_sender().await?;
         let (acknowledgement, received) = oneshot::channel();
         timeout(
             SAFETY_RECOVERY_DEADLINE,
@@ -453,7 +523,13 @@ impl AgentRuntime {
                     | TransferRegistryError::WireIdCollision => AgentError::TransferFailed,
                 })?;
         if let Some(target) = outcome.target {
-            if let Some(sender) = self.session_commands.lock().await.clone() {
+            if let Some(sender) = self
+                .session_commands
+                .lock()
+                .await
+                .as_ref()
+                .map(|bound| bound.sender.clone())
+            {
                 let _ = sender.try_send(LocalSessionCommand::WakeTransferCancellation);
             }
             let store = self.transfer_store.clone();
@@ -466,6 +542,10 @@ impl AgentRuntime {
         endpoint.starts_with("reconnect:") || endpoint.starts_with("reconnect-listen:")
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one authenticated reconnect path keeps sender publication ordering auditable"
+    )]
     pub(crate) async fn reconnect(
         self: &Arc<Self>,
         request: &str,
@@ -521,14 +601,26 @@ impl AgentRuntime {
             }
         };
 
+        let peer_device = protocol_device_id(peer.device_id());
+        let (session_tx, session_rx) = command_channel();
+        let peer = match self
+            .install_peer_bound_session_sender(peer_device, session_tx)
+            .await
+        {
+            Ok(peer) => peer,
+            Err(error) => {
+                close_emergency(connection.as_mut()).await;
+                self.busy.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
         if let Err(error) = self.publish_connected_if_safety_allows(peer_id).await {
+            self.clear_peer_bound_session_sender(peer_device).await;
             close_emergency(connection.as_mut()).await;
             self.busy.store(false, Ordering::Release);
             return Err(error);
         }
         let result = self.status().await;
-        let (session_tx, session_rx) = command_channel();
-        *self.session_commands.lock().await = Some(session_tx);
         let config = SessionConfig {
             role,
             local_device: protocol_device_id(self.material.signer.public_identity().device_id()),
@@ -537,6 +629,7 @@ impl AgentRuntime {
             local_grant_epoch: peer.grant_epoch,
             peer_grants_to_local: None,
             peer_grant_epoch: None,
+            peer_placement: peer.placement,
             existing_control: None,
         };
         let runtime = Arc::clone(self);
@@ -551,7 +644,9 @@ impl AgentRuntime {
                 runtime.transfer_store.clone(),
             )
             .await;
-            runtime.session_commands.lock().await.take();
+            runtime
+                .clear_peer_bound_session_sender(config.peer_device)
+                .await;
             runtime
                 .publish_session_finished_status(matches!(
                     result,
@@ -703,7 +798,13 @@ impl AgentRuntime {
         drop(peers);
         self.transfer_store.mark_peer_revoked(revoked_peer);
 
-        if self.session_commands.lock().await.is_some() {
+        if self
+            .session_commands
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|bound| bound.peer == revoked_peer)
+        {
             self.disconnect_all();
             self.status.write().await.readiness.session_topology =
                 SessionTopologyReadiness::NotConnected;
@@ -819,7 +920,8 @@ impl AgentRuntime {
         self.session_commands
             .lock()
             .await
-            .clone()
+            .as_ref()
+            .map(|bound| bound.sender.clone())
             .ok_or(AgentError::NotConnected)
     }
 
@@ -1379,6 +1481,7 @@ impl AgentRuntime {
             grants: committed.record().grants(),
             grant_epoch: nodavo_protocol::GrantEpoch::new(1),
             display_name: prepared.peer.name.clone(),
+            placement: PeerPlacement::Disabled,
             established_at_unix_ms,
             revoked_at_unix_ms: None,
             server_name: prepared.peer.server_name.clone(),
@@ -1398,13 +1501,24 @@ impl AgentRuntime {
             None => return Ok(()),
         }
 
+        let peer_device = protocol_device_id(record.device_id());
+        let (session_tx, session_rx) = command_channel();
+        let record = match self
+            .install_peer_bound_session_sender(peer_device, session_tx)
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                close_emergency(prepared.connection.as_mut()).await;
+                return Err(error);
+            }
+        };
         if let Err(error) = self.publish_connected_if_safety_allows(peer_id).await {
+            self.clear_peer_bound_session_sender(peer_device).await;
             close_emergency(prepared.connection.as_mut()).await;
             return Err(error);
         }
         let _ = outcome.send(PairingOutcome::Finished(true));
-        let (session_tx, session_rx) = command_channel();
-        *self.session_commands.lock().await = Some(session_tx);
         let config = SessionConfig {
             role: match prepared.role {
                 PairingRole::Initiator => SessionRole::Opener,
@@ -1416,6 +1530,7 @@ impl AgentRuntime {
             local_grant_epoch: record.grant_epoch,
             peer_grants_to_local: Some(prepared.peer.grants),
             peer_grant_epoch: Some(nodavo_protocol::GrantEpoch::new(1)),
+            peer_placement: record.placement,
             existing_control: Some(prepared.channel),
         };
         let session_result = run_platform_session(
@@ -1428,7 +1543,7 @@ impl AgentRuntime {
             self.transfer_store.clone(),
         )
         .await;
-        self.session_commands.lock().await.take();
+        self.clear_peer_bound_session_sender(peer_device).await;
         session_result.map_err(map_session_error)?;
         Ok(())
     }
@@ -1449,6 +1564,32 @@ impl AgentRuntime {
             return Err(AgentError::Storage);
         }
         Ok(())
+    }
+
+    async fn install_peer_bound_session_sender(
+        &self,
+        peer: nodavo_protocol::DeviceId,
+        sender: mpsc::Sender<LocalSessionCommand>,
+    ) -> Result<PeerRecord, AgentError> {
+        let peers = self.peers.lock().await;
+        let record = peers
+            .iter()
+            .find(|record| protocol_device_id(record.device_id()) == peer && record.is_active())
+            .cloned()
+            .ok_or(AgentError::PeerNotFound)?;
+        let mut active = self.session_commands.lock().await;
+        if active.is_some() {
+            return Err(AgentError::Busy);
+        }
+        *active = Some(BoundSessionSender { peer, sender });
+        Ok(record)
+    }
+
+    async fn clear_peer_bound_session_sender(&self, peer: nodavo_protocol::DeviceId) {
+        let mut active = self.session_commands.lock().await;
+        if active.as_ref().is_some_and(|bound| bound.peer == peer) {
+            active.take();
+        }
     }
 
     async fn active_peer(&self, peer_id: &str) -> Result<PeerRecord, AgentError> {
@@ -1841,6 +1982,38 @@ mod tests {
         )
     }
 
+    fn placement_peer(key_byte: u8, name: &str) -> PeerRecord {
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
+        PeerRecord {
+            public_key: [key_byte; 32],
+            certificate_der: generated.cert.der().to_vec(),
+            grants: CapabilityGrants::NONE,
+            grant_epoch: GrantEpoch::new(1),
+            display_name: name.to_owned(),
+            placement: PeerPlacement::Disabled,
+            established_at_unix_ms: 1,
+            revoked_at_unix_ms: None,
+            server_name: "peer.nodavo.invalid".to_owned(),
+            last_endpoint: None,
+        }
+    }
+
+    fn placement_runtime(peers: Vec<PeerRecord>) -> (Arc<AgentRuntime>, Arc<MemoryStorage>) {
+        let storage = Arc::new(MemoryStorage {
+            peers: StdMutex::new(peers.clone()),
+            fail_store: AtomicBool::new(false),
+        });
+        let runtime = AgentRuntime::new(
+            Arc::clone(&storage) as Arc<dyn DevelopmentStorage>,
+            create_identity().unwrap().0,
+            peers,
+            "127.0.0.1:0".parse().unwrap(),
+            "Placement test".to_owned(),
+        );
+        (runtime, storage)
+    }
+
     async fn publish_synchronizing_test_session(runtime: &AgentRuntime) {
         {
             let mut status = runtime.status.write().await;
@@ -2036,7 +2209,10 @@ mod tests {
             status.readiness.session_topology = SessionTopologyReadiness::Ready;
         }
         let (commands, _unserviced_commands) = command_channel();
-        *runtime.session_commands.lock().await = Some(commands);
+        *runtime.session_commands.lock().await = Some(BoundSessionSender {
+            peer: nodavo_protocol::DeviceId::new([1; 32]),
+            sender: commands,
+        });
         let disconnect_observer = runtime.disconnect.subscribe();
         let disconnect_before = *disconnect_observer.borrow();
 
@@ -2177,6 +2353,7 @@ mod tests {
             grants: CapabilityGrants::NONE,
             grant_epoch: GrantEpoch::new(1),
             display_name: "Office PC".to_owned(),
+            placement: PeerPlacement::Disabled,
             established_at_unix_ms: 1,
             revoked_at_unix_ms: None,
             server_name: "peer.nodavo.invalid".to_owned(),
@@ -2210,6 +2387,7 @@ mod tests {
                 display_name: "Office PC".to_owned(),
                 state: TrustedPeerState::Active,
                 local_grants: vec![CapabilityName::Input],
+                placement: PeerPlacement::Disabled,
             }]
         );
 
@@ -2229,6 +2407,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placement_mutation_cannot_miss_or_cross_the_peer_bound_session_cut() {
+        let peer_a = placement_peer(10, "Peer A");
+        let peer_b = placement_peer(11, "Peer B");
+        let active_peer_id = device_id_text(peer_a.device_id());
+        let other_peer_id = device_id_text(peer_b.device_id());
+        let peer_a_device = protocol_device_id(peer_a.device_id());
+        let (runtime, storage) = placement_runtime(vec![peer_a, peer_b]);
+
+        // A mutation that wins before sender publication must be captured by
+        // the initial session config returned from the same serialized cut.
+        runtime
+            .set_peer_placement(&active_peer_id, PeerPlacement::Left)
+            .await
+            .unwrap();
+        let (sender, mut receiver) = command_channel();
+        let initial = runtime
+            .install_peer_bound_session_sender(peer_a_device, sender)
+            .await
+            .unwrap();
+        assert_eq!(initial.placement, PeerPlacement::Left);
+
+        // An unrelated peer mutation must never enter A's authenticated
+        // command stream.
+        runtime
+            .set_peer_placement(&other_peer_id, PeerPlacement::Below)
+            .await
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let apply = tokio::spawn(async move {
+            let command = receiver.recv().await.expect("placement command");
+            let LocalSessionCommand::UpdatePeerPlacement {
+                placement,
+                acknowledgement,
+            } = command
+            else {
+                panic!("unexpected command")
+            };
+            assert_eq!(placement, PeerPlacement::Right);
+            acknowledgement.send(Ok(())).unwrap();
+        });
+        runtime
+            .set_peer_placement(&active_peer_id, PeerPlacement::Right)
+            .await
+            .unwrap();
+        apply.await.unwrap();
+
+        {
+            let stored = storage.peers.lock().unwrap();
+            assert_eq!(stored[0].placement, PeerPlacement::Right);
+            assert_eq!(stored[1].placement, PeerPlacement::Below);
+        }
+        let summaries = runtime.trusted_peers().await;
+        assert_eq!(summaries[0].placement, PeerPlacement::Right);
+        assert_eq!(summaries[1].placement, PeerPlacement::Below);
+
+        runtime.revoke_peer(&other_peer_id).await.unwrap();
+        assert!(matches!(
+            runtime
+                .set_peer_placement(&other_peer_id, PeerPlacement::Above)
+                .await,
+            Err(AgentError::PeerNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_persist_placement_apply_failure_disconnects_and_keeps_new_authority() {
+        let peer = placement_peer(12, "Peer");
+        let peer_id = device_id_text(peer.device_id());
+        let peer_device = protocol_device_id(peer.device_id());
+        let (runtime, storage) = placement_runtime(vec![peer]);
+        let (sender, receiver) = command_channel();
+        runtime
+            .install_peer_bound_session_sender(peer_device, sender)
+            .await
+            .unwrap();
+        drop(receiver);
+        let disconnect = runtime.disconnect.subscribe();
+        let before = *disconnect.borrow();
+
+        assert!(matches!(
+            runtime
+                .set_peer_placement(&peer_id, PeerPlacement::Above)
+                .await,
+            Err(AgentError::PlacementApplyFailed)
+        ));
+        assert_eq!(
+            storage.peers.lock().unwrap()[0].placement,
+            PeerPlacement::Above
+        );
+        assert_ne!(*disconnect.borrow(), before);
+    }
+
+    #[tokio::test]
     async fn offline_file_grant_revoke_discards_only_authenticated_peer_staging() {
         let generated =
             rcgen::generate_simple_self_signed(vec!["peer.nodavo.invalid".to_owned()]).unwrap();
@@ -2238,6 +2513,7 @@ mod tests {
             grants: CapabilityGrants::NONE.with(TrustedCapability::FileTransfer),
             grant_epoch: GrantEpoch::new(1),
             display_name: "Offline peer".to_owned(),
+            placement: PeerPlacement::Disabled,
             established_at_unix_ms: 1,
             revoked_at_unix_ms: None,
             server_name: "peer.nodavo.invalid".to_owned(),
